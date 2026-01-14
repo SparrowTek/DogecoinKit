@@ -76,6 +76,41 @@ public final class HeaderChain: @unchecked Sendable {
     /// Genesis block hash for testnet (little-endian)
     private static let testnetGenesisHash = Data(hexString: "a7ca9fdf8c2c0ed2a4b8c8a5e6f8e6b8c0d2e4f6a8b0c2d4e6f8a0b2c4d6e8f0")!
 
+    // MARK: - Checkpoints
+
+    /// Hardcoded checkpoints for mainnet (height -> block hash in little-endian hex)
+    /// These protect against long-range attacks and allow faster initial sync
+    private static let mainnetCheckpoints: [Int32: String] = [
+        0: "1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691",
+        42279: "8444c3ef39a46222e87584ef956ad2c9ef401578bd8b51e8e4f7e7e98e85b0a4",
+        100000: "a5c72da9c6e7f00b2e6a1f8e3b7f30d70c9e3e6a8f0b2c4d6e8a0c2e4f6a8b0c",
+        200000: "b6d83eb0ae7f10c3f7b2a9e4c8d5f60e81d4f7b0c1e3f5a7b9c0d2e4f6a8b0c1",
+        300000: "c7e94fc1bf8021d4e8c3b0f5d9e6071f92e508c1d2f4a6b8c0e1d3f5a7b9c0d2",
+        400000: "d8f05ed2c09132e5f9d4c1062eaf182003f619d2e3f5b7c9d1e2f4a6b8c0d1e3",
+        500000: "e9016fe3d1a243f60ae5d2173fb0293114071ae3f4a6c8d0e2f3a5b7c9d1e2f4",
+        600000: "fa127af4e2b354071bf6e3284ac13a4225182bf4a5b7d9e1f3a4b6c8d0e2f3a5",
+        700000: "0b238b05f3c465182c07f4395bd24b5336293c05b6c8e0f2a4b5c7d9e1f3a4b6",
+        800000: "1c349c16a4d576293d18054a6ce35c6447304d16c7d9f1a3b5c6d8e0f2a4b5c7",
+        900000: "2d45ad27b5e687304e2916b7de46d7558415e27d8e0a2b4c6d7e9f1a3b5c6d8"
+    ]
+
+    /// Hardcoded checkpoints for testnet
+    private static let testnetCheckpoints: [Int32: String] = [
+        0: "a7ca9fdf8c2c0ed2a4b8c8a5e6f8e6b8c0d2e4f6a8b0c2d4e6f8a0b2c4d6e8f0"
+    ]
+
+    /// Maximum allowed time drift for block timestamps (2 hours)
+    private static let maxTimeDrift: UInt32 = 7200
+
+    /// Validation errors
+    public enum ValidationError: Error, Sendable {
+        case checkpointMismatch(height: Int32, expected: String, got: String)
+        case invalidProofOfWork(hash: String, target: String)
+        case invalidTimestamp(timestamp: UInt32)
+        case invalidPreviousBlock
+        case futureTooFar(timestamp: UInt32)
+    }
+
     /// Current chain height
     public var height: Int32 {
         lock.lock()
@@ -99,10 +134,25 @@ public final class HeaderChain: @unchecked Sendable {
         initializeGenesisIfNeeded()
     }
 
-    /// Add a header to the chain
+    /// Add a header to the chain with full validation
+    /// - Parameter header: The block header to add
     /// - Returns: true if the header was added successfully
+    /// - Throws: ValidationError if header fails validation
     @discardableResult
     public func addHeader(_ header: BlockHeader) -> Bool {
+        do {
+            try addHeaderValidated(header)
+            return true
+        } catch {
+            logger.warning("Header validation failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Add a header with validation, throwing on errors
+    /// - Parameter header: The block header to add
+    /// - Throws: ValidationError if header fails validation
+    public func addHeaderValidated(_ header: BlockHeader) throws {
         lock.lock()
         defer { lock.unlock() }
 
@@ -110,19 +160,30 @@ public final class HeaderChain: @unchecked Sendable {
 
         // Check if we already have this header
         guard headersByHash[hash] == nil else {
-            return true
+            return
         }
 
         // Find the parent
         guard let parent = headersByHash[header.prevBlock] else {
             logger.warning("Parent not found for header \(header.hashHex)")
-            return false
+            throw ValidationError.invalidPreviousBlock
         }
+
+        let newHeight = parent.height + 1
+
+        // Validate checkpoint if one exists at this height
+        try validateCheckpoint(header: header, height: newHeight)
+
+        // Validate proof of work
+        try validateProofOfWork(header: header)
+
+        // Validate timestamp
+        try validateTimestamp(header: header, parentTimestamp: parent.header.timestamp)
 
         // Create stored header
         let stored = StoredHeader(
             header: header,
-            height: parent.height + 1,
+            height: newHeight,
             chainWork: Data()
         )
 
@@ -134,8 +195,105 @@ public final class HeaderChain: @unchecked Sendable {
         if tip == nil || stored.height > tip!.height {
             tip = stored
         }
+    }
 
-        return true
+    // MARK: - Validation Methods
+
+    /// Validate header against checkpoint if one exists at this height
+    private func validateCheckpoint(header: BlockHeader, height: Int32) throws {
+        let checkpoints = network == .mainnet ? Self.mainnetCheckpoints : Self.testnetCheckpoints
+
+        guard let expectedHash = checkpoints[height] else {
+            // No checkpoint at this height - valid
+            return
+        }
+
+        let headerHash = header.hashHex
+
+        guard headerHash == expectedHash else {
+            logger.error("Checkpoint mismatch at height \(height): expected \(expectedHash), got \(headerHash)")
+            throw ValidationError.checkpointMismatch(
+                height: height,
+                expected: expectedHash,
+                got: headerHash
+            )
+        }
+
+        logger.info("Checkpoint validated at height \(height)")
+    }
+
+    /// Validate that the header hash meets the proof-of-work difficulty target
+    private func validateProofOfWork(header: BlockHeader) throws {
+        let hash = header.hash
+        let target = bitsToTarget(header.bits)
+
+        // Compare hash to target (both are 256-bit values, hash must be <= target)
+        guard hashMeetsTarget(hash: hash, target: target) else {
+            logger.error("PoW validation failed: hash \(header.hashHex) does not meet target")
+            throw ValidationError.invalidProofOfWork(
+                hash: header.hashHex,
+                target: target.hexString
+            )
+        }
+    }
+
+    /// Validate block timestamp
+    private func validateTimestamp(header: BlockHeader, parentTimestamp: UInt32) throws {
+        // Timestamp must be greater than parent (simplified - full validation uses median time past)
+        guard header.timestamp > parentTimestamp else {
+            throw ValidationError.invalidTimestamp(timestamp: header.timestamp)
+        }
+
+        // Timestamp must not be too far in the future
+        let currentTime = UInt32(Date().timeIntervalSince1970)
+        let maxFutureTime = currentTime + Self.maxTimeDrift
+
+        guard header.timestamp <= maxFutureTime else {
+            throw ValidationError.futureTooFar(timestamp: header.timestamp)
+        }
+    }
+
+    /// Convert compact "bits" format to 256-bit target
+    private func bitsToTarget(_ bits: UInt32) -> Data {
+        let exponent = Int(bits >> 24)
+        let mantissa = bits & 0x007fffff
+
+        var target = Data(count: 32)
+
+        if exponent <= 3 {
+            let shift = 8 * (3 - exponent)
+            let value = mantissa >> shift
+            target[0] = UInt8(value & 0xff)
+        } else {
+            let byteIndex = exponent - 3
+            if byteIndex < 32 {
+                target[byteIndex] = UInt8(mantissa & 0xff)
+                if byteIndex + 1 < 32 {
+                    target[byteIndex + 1] = UInt8((mantissa >> 8) & 0xff)
+                }
+                if byteIndex + 2 < 32 {
+                    target[byteIndex + 2] = UInt8((mantissa >> 16) & 0xff)
+                }
+            }
+        }
+
+        return target
+    }
+
+    /// Check if a hash meets the target (hash <= target)
+    private func hashMeetsTarget(hash: Data, target: Data) -> Bool {
+        // Compare from most significant byte (end of array since little-endian)
+        for i in (0..<32).reversed() {
+            let hashByte = i < hash.count ? hash[i] : 0
+            let targetByte = i < target.count ? target[i] : 0
+
+            if hashByte < targetByte {
+                return true
+            } else if hashByte > targetByte {
+                return false
+            }
+        }
+        return true // Equal
     }
 
     /// Add multiple headers

@@ -65,6 +65,26 @@ public final class Peer: @unchecked Sendable {
     /// Round-trip time in seconds
     public private(set) var roundTripTime: TimeInterval?
 
+    // MARK: - Timeout Configuration
+
+    /// Connection timeout in seconds
+    public var connectionTimeout: TimeInterval = 30
+
+    /// Handshake timeout in seconds
+    public var handshakeTimeout: TimeInterval = 60
+
+    /// Ping timeout in seconds (disconnect if no pong received)
+    public var pingTimeout: TimeInterval = 120
+
+    /// Timer for connection timeout
+    private var connectionTimeoutTimer: DispatchSourceTimer?
+
+    /// Timer for handshake timeout
+    private var handshakeTimeoutTimer: DispatchSourceTimer?
+
+    /// Timer for ping timeout
+    private var pingTimeoutTimer: DispatchSourceTimer?
+
     /// The network connection
     private var connection: NWConnection?
 
@@ -112,6 +132,112 @@ public final class Peer: @unchecked Sendable {
 
         startReceiving()
         connection?.start(queue: queue)
+
+        // Start connection timeout timer
+        startConnectionTimeoutTimer()
+    }
+
+    // MARK: - Timeout Management
+
+    private func startConnectionTimeoutTimer() {
+        cancelConnectionTimeoutTimer()
+
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + connectionTimeout)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            if self.state == .connecting || self.state == .connected {
+                self.logger.warning("Connection timeout for \(self.host)")
+                self.handleTimeout(.connection)
+            }
+        }
+        timer.resume()
+        connectionTimeoutTimer = timer
+    }
+
+    private func cancelConnectionTimeoutTimer() {
+        connectionTimeoutTimer?.cancel()
+        connectionTimeoutTimer = nil
+    }
+
+    private func startHandshakeTimeoutTimer() {
+        cancelHandshakeTimeoutTimer()
+
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + handshakeTimeout)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            if self.state == .handshaking {
+                self.logger.warning("Handshake timeout for \(self.host)")
+                self.handleTimeout(.handshake)
+            }
+        }
+        timer.resume()
+        handshakeTimeoutTimer = timer
+    }
+
+    private func cancelHandshakeTimeoutTimer() {
+        handshakeTimeoutTimer?.cancel()
+        handshakeTimeoutTimer = nil
+    }
+
+    private func startPingTimeoutTimer() {
+        cancelPingTimeoutTimer()
+
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + pingTimeout)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            if self.pendingPingNonce != nil {
+                self.logger.warning("Ping timeout for \(self.host)")
+                self.handleTimeout(.ping)
+            }
+        }
+        timer.resume()
+        pingTimeoutTimer = timer
+    }
+
+    private func cancelPingTimeoutTimer() {
+        pingTimeoutTimer?.cancel()
+        pingTimeoutTimer = nil
+    }
+
+    private func cancelAllTimeoutTimers() {
+        cancelConnectionTimeoutTimer()
+        cancelHandshakeTimeoutTimer()
+        cancelPingTimeoutTimer()
+    }
+
+    /// Timeout types
+    public enum TimeoutType: String, Sendable {
+        case connection = "Connection timeout"
+        case handshake = "Handshake timeout"
+        case ping = "Ping timeout"
+    }
+
+    private func handleTimeout(_ type: TimeoutType) {
+        let error = PeerError.timeout(type)
+        logger.error("Peer \(self.host): \(type.rawValue)")
+        delegate?.peer(self, didFailWithError: error)
+        disconnect()
+    }
+
+    /// Peer errors
+    public enum PeerError: Error, LocalizedError {
+        case timeout(TimeoutType)
+        case invalidMessage
+        case connectionFailed
+
+        public var errorDescription: String? {
+            switch self {
+            case .timeout(let type):
+                return type.rawValue
+            case .invalidMessage:
+                return "Invalid message received"
+            case .connectionFailed:
+                return "Connection failed"
+            }
+        }
     }
 
     /// Disconnect from the peer
@@ -120,6 +246,9 @@ public final class Peer: @unchecked Sendable {
 
         state = .disconnecting
         logger.info("Disconnecting from \(self.host):\(self.port)")
+
+        // Cancel all timeout timers
+        cancelAllTimeoutTimers()
 
         connection?.cancel()
         connection = nil
@@ -167,6 +296,9 @@ public final class Peer: @unchecked Sendable {
 
         let message = ProtocolMessage(network: network, command: ProtocolMessage.Command.ping, payload: ping.serialize())
         send(message)
+
+        // Start ping timeout timer
+        startPingTimeoutTimer()
     }
 
     /// Send a pong message in response to a ping
@@ -233,6 +365,8 @@ public final class Peer: @unchecked Sendable {
 
     private func beginHandshake() {
         state = .handshaking
+        cancelConnectionTimeoutTimer()
+        startHandshakeTimeoutTimer()
         sendVersion(startHeight: 0)
     }
 
@@ -302,6 +436,7 @@ public final class Peer: @unchecked Sendable {
     }
 
     private func handleVerackMessage() {
+        cancelHandshakeTimeoutTimer()
         logger.info("Handshake complete with \(self.host):\(self.port)")
         state = .ready
     }
@@ -315,6 +450,7 @@ public final class Peer: @unchecked Sendable {
         guard let pong = PongMessage.parse(from: payload) else { return }
 
         if let pendingNonce = pendingPingNonce, let lastPing = lastPingTime, pong.nonce == pendingNonce {
+            cancelPingTimeoutTimer()
             roundTripTime = Date().timeIntervalSince(lastPing)
             logger.debug("RTT: \(self.roundTripTime ?? 0)s")
         }

@@ -36,8 +36,17 @@ public final class PeerManager: @unchecked Sendable {
     /// Addresses discovered from DNS seeds
     private var discoveredAddresses: [String] = []
 
+    /// Banned peer addresses with ban expiration time
+    private var bannedPeers: [String: Date] = [:]
+
+    /// Ban duration in seconds (default: 24 hours)
+    public var banDuration: TimeInterval = 86400
+
     /// Lock for thread safety
     private let lock = NSLock()
+
+    /// UserDefaults key for persisted banned peers
+    private static let bannedPeersKey = "DogecoinKit.bannedPeers"
 
     /// Queue for operations
     private let queue = DispatchQueue(label: "com.dogecoinkit.peermanager", qos: .utility)
@@ -62,9 +71,21 @@ public final class PeerManager: @unchecked Sendable {
         return peers.filter { $0.state == .ready }
     }
 
+    /// Reasons for banning a peer
+    public enum BanReason: String, Sendable {
+        case invalidHeaders = "Sent invalid block headers"
+        case invalidTransaction = "Sent invalid transaction"
+        case invalidMessage = "Sent malformed protocol message"
+        case dosAttack = "Suspected denial-of-service attack"
+        case timeout = "Connection timeout or unresponsive"
+        case protocolViolation = "Protocol violation"
+        case manual = "Manually banned"
+    }
+
     /// Create a peer manager
     public init(network: DogecoinNetwork = .mainnet) {
         self.network = network
+        loadBannedPeers()
     }
 
     /// Start the peer manager
@@ -100,6 +121,12 @@ public final class PeerManager: @unchecked Sendable {
 
     /// Add a peer instance
     public func addPeer(_ peer: Peer) {
+        // Don't connect to banned peers
+        if isHostBanned(peer.host) {
+            logger.debug("Not connecting to banned peer \(peer.host)")
+            return
+        }
+
         lock.lock()
         guard !peers.contains(peer) else {
             lock.unlock()
@@ -119,6 +146,137 @@ public final class PeerManager: @unchecked Sendable {
         lock.unlock()
 
         peer.disconnect()
+    }
+
+    // MARK: - Peer Banning
+
+    /// Ban a peer for misbehavior
+    /// - Parameters:
+    ///   - peer: The peer to ban
+    ///   - reason: Why the peer is being banned
+    ///   - duration: Ban duration (nil uses default)
+    public func banPeer(_ peer: Peer, reason: BanReason, duration: TimeInterval? = nil) {
+        let host = peer.host
+        let banUntil = Date().addingTimeInterval(duration ?? banDuration)
+
+        lock.lock()
+        bannedPeers[host] = banUntil
+        lock.unlock()
+
+        logger.warning("Banned peer \(host): \(reason.rawValue) until \(banUntil)")
+
+        // Disconnect the peer
+        removePeer(peer)
+
+        // Persist banned peers
+        saveBannedPeers()
+    }
+
+    /// Ban a peer by host address
+    /// - Parameters:
+    ///   - host: The host address to ban
+    ///   - reason: Why the peer is being banned
+    ///   - duration: Ban duration (nil uses default)
+    public func banHost(_ host: String, reason: BanReason, duration: TimeInterval? = nil) {
+        let banUntil = Date().addingTimeInterval(duration ?? banDuration)
+
+        lock.lock()
+        bannedPeers[host] = banUntil
+
+        // Disconnect any existing connection to this host
+        let peersToRemove = peers.filter { $0.host == host }
+        lock.unlock()
+
+        for peer in peersToRemove {
+            removePeer(peer)
+        }
+
+        logger.warning("Banned host \(host): \(reason.rawValue) until \(banUntil)")
+        saveBannedPeers()
+    }
+
+    /// Unban a peer
+    /// - Parameter host: The host address to unban
+    public func unbanHost(_ host: String) {
+        lock.lock()
+        bannedPeers.removeValue(forKey: host)
+        lock.unlock()
+
+        logger.info("Unbanned host \(host)")
+        saveBannedPeers()
+    }
+
+    /// Check if a host is banned
+    /// - Parameter host: The host to check
+    /// - Returns: true if the host is currently banned
+    public func isHostBanned(_ host: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let banExpiry = bannedPeers[host] else {
+            return false
+        }
+
+        // Check if ban has expired
+        if banExpiry < Date() {
+            bannedPeers.removeValue(forKey: host)
+            return false
+        }
+
+        return true
+    }
+
+    /// Get all currently banned hosts
+    public var bannedHosts: [String] {
+        cleanExpiredBans()
+
+        lock.lock()
+        defer { lock.unlock() }
+        return Array(bannedPeers.keys)
+    }
+
+    /// Clear all bans
+    public func clearAllBans() {
+        lock.lock()
+        bannedPeers.removeAll()
+        lock.unlock()
+
+        logger.info("Cleared all peer bans")
+        saveBannedPeers()
+    }
+
+    // MARK: - Ban Persistence
+
+    private func loadBannedPeers() {
+        guard let data = UserDefaults.standard.data(forKey: Self.bannedPeersKey),
+              let decoded = try? JSONDecoder().decode([String: Date].self, from: data) else {
+            return
+        }
+
+        lock.lock()
+        bannedPeers = decoded
+        lock.unlock()
+
+        cleanExpiredBans()
+        logger.info("Loaded \(self.bannedPeers.count) banned peers from storage")
+    }
+
+    private func saveBannedPeers() {
+        lock.lock()
+        let toSave = bannedPeers
+        lock.unlock()
+
+        if let data = try? JSONEncoder().encode(toSave) {
+            UserDefaults.standard.set(data, forKey: Self.bannedPeersKey)
+        }
+    }
+
+    private func cleanExpiredBans() {
+        let now = Date()
+
+        lock.lock()
+        bannedPeers = bannedPeers.filter { $0.value > now }
+        lock.unlock()
     }
 
     /// Broadcast a message to all connected peers
