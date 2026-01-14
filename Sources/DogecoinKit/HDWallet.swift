@@ -229,6 +229,87 @@ public final class HDWallet: Sendable {
 
         return addresses
     }
+
+    /// Derive a private key in WIF format at the given BIP44 path
+    /// - Parameters:
+    ///   - account: The account index (hardened)
+    ///   - index: The address index
+    ///   - change: Whether this is a change address (internal) or external
+    /// - Returns: The derived private key in WIF format
+    /// - Throws: `DogecoinError.derivationFailed` if derivation fails
+    public func derivePrivateKey(account: UInt32 = 0, index: UInt32 = 0, change: Bool = false) throws -> String {
+        try Dogecoin.ensureInitialized()
+
+        // Build BIP44 derivation path: m/44'/3'/account'/change/index
+        // For Dogecoin: coin type is 3 (mainnet) or 1 (testnet)
+        let coinType = network == .mainnet ? "3" : "1"
+        let changePath = change ? "1" : "0"
+        let path = "m/44'/\(coinType)'/\(account)'/\(changePath)/\(index)"
+
+        var masterKeyBuffer = Array(masterKey.utf8CString)
+        while masterKeyBuffer.count < Int(HDKEYLEN) { masterKeyBuffer.append(0) }
+
+        var pathBuffer = Array(path.utf8CString)
+        while pathBuffer.count < Int(KEYPATHMAXLEN) { pathBuffer.append(0) }
+
+        var addressBuffer = [CChar](repeating: 0, count: Int(P2PKHLEN))
+
+        // Use getHDNodePrivateKeyWIFByPath to get the private key
+        guard let privateKeyPtr = getHDNodePrivateKeyWIFByPath(
+            &masterKeyBuffer,
+            &pathBuffer,
+            &addressBuffer,
+            true  // Output private key
+        ) else {
+            throw DogecoinError.derivationFailed
+        }
+
+        let privateKeyWIF = String(cString: privateKeyPtr)
+
+        // Free the allocated memory from the C function
+        dogecoin_free(UnsafeMutableRawPointer(mutating: privateKeyPtr))
+
+        guard !privateKeyWIF.isEmpty else {
+            throw DogecoinError.derivationFailed
+        }
+
+        return privateKeyWIF
+    }
+
+    /// Derive a private key in WIF format at a custom derivation path
+    /// - Parameters:
+    ///   - path: The derivation path (e.g., "m/44'/3'/0'/0/0")
+    /// - Returns: The derived private key in WIF format
+    /// - Throws: `DogecoinError.derivationFailed` if derivation fails
+    public func derivePrivateKey(path: String) throws -> String {
+        try Dogecoin.ensureInitialized()
+
+        var masterKeyBuffer = Array(masterKey.utf8CString)
+        while masterKeyBuffer.count < Int(HDKEYLEN) { masterKeyBuffer.append(0) }
+
+        var pathBuffer = Array(path.utf8CString)
+        while pathBuffer.count < Int(KEYPATHMAXLEN) { pathBuffer.append(0) }
+
+        var addressBuffer = [CChar](repeating: 0, count: Int(P2PKHLEN))
+
+        guard let privateKeyPtr = getHDNodePrivateKeyWIFByPath(
+            &masterKeyBuffer,
+            &pathBuffer,
+            &addressBuffer,
+            true
+        ) else {
+            throw DogecoinError.derivationFailed
+        }
+
+        let privateKeyWIF = String(cString: privateKeyPtr)
+        dogecoin_free(UnsafeMutableRawPointer(mutating: privateKeyPtr))
+
+        guard !privateKeyWIF.isEmpty else {
+            throw DogecoinError.derivationFailed
+        }
+
+        return privateKeyWIF
+    }
 }
 
 // MARK: - Mnemonic Generation
@@ -278,31 +359,9 @@ public func generateMnemonic(strength: MnemonicStrength = .words12) throws -> St
     return String(cString: mnemonic)
 }
 
-/// Validate a BIP39 mnemonic phrase
+/// Validate a BIP39 mnemonic phrase using full BIP39 checksum validation
 /// - Parameter mnemonic: The mnemonic phrase to validate
-/// - Returns: `true` if the mnemonic is valid
+/// - Returns: `true` if the mnemonic is valid with correct checksum
 public func validateMnemonic(_ mnemonic: String) -> Bool {
-    // Basic validation: check word count
-    let words = mnemonic.split(separator: " ")
-    let validCounts = [12, 15, 18, 21, 24]
-    guard validCounts.contains(words.count) else {
-        return false
-    }
-
-    // Try to derive an address to verify the mnemonic is valid
-    Dogecoin.initialize()
-
-    var addressBuffer = [CChar](repeating: 0, count: Int(P2PKHLEN))
-    var changeLevel: [CChar] = [0x30, 0]  // "0"
-
-    var mnemonicBuffer = Array(mnemonic.utf8CString)
-    while mnemonicBuffer.count < Int(MAX_MNEMONIC_SIZE) { mnemonicBuffer.append(0) }
-
-    var passBuffer: [CChar] = [0]
-
-    let result = getDerivedHDAddressFromMnemonic(
-        0, 0, &changeLevel, &mnemonicBuffer, &passBuffer, &addressBuffer, false
-    )
-
-    return result == 0
+    verifyMnemonic(mnemonic)
 }
