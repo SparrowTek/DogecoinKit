@@ -16,13 +16,16 @@ let package = Package(
     ],
     dependencies: [
         // Local dependency on libdogecoin C library
-        .package(path: "../libdogecoin")
+        .package(path: "../libdogecoin"),
+        // Secure keychain storage
+        .package(url: "https://github.com/SparrowTek/Vault", from: "1.2.0")
     ],
     targets: [
         .target(
             name: "DogecoinKit",
             dependencies: [
-                .product(name: "clibdogecoin", package: "libdogecoin")
+                .product(name: "clibdogecoin", package: "libdogecoin"),
+                .product(name: "Vault", package: "Vault")
             ],
             swiftSettings: [
                 .swiftLanguageMode(.v6)

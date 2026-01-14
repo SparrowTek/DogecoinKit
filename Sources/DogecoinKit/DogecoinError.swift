@@ -56,6 +56,23 @@ public enum DogecoinError: Error, LocalizedError, Sendable {
     /// An internal error occurred
     case internalError(String)
 
+    // MARK: - Secure Storage Errors
+
+    /// Keychain storage operation failed
+    case keychainStorageFailed(String)
+
+    /// Keychain retrieval operation failed
+    case keychainRetrievalFailed(String)
+
+    /// Keychain deletion operation failed
+    case keychainDeletionFailed(String)
+
+    /// The requested key was not found in secure storage
+    case keyNotFound(String)
+
+    /// Secure storage is not available on this device
+    case secureStorageUnavailable
+
     public var errorDescription: String? {
         switch self {
         case .initializationFailed:
@@ -94,6 +111,16 @@ public enum DogecoinError: Error, LocalizedError, Sendable {
             return "Memory allocation failed"
         case .internalError(let message):
             return "Internal error: \(message)"
+        case .keychainStorageFailed(let reason):
+            return "Failed to store key in Keychain: \(reason)"
+        case .keychainRetrievalFailed(let reason):
+            return "Failed to retrieve key from Keychain: \(reason)"
+        case .keychainDeletionFailed(let reason):
+            return "Failed to delete key from Keychain: \(reason)"
+        case .keyNotFound(let identifier):
+            return "Key not found in secure storage: \(identifier)"
+        case .secureStorageUnavailable:
+            return "Secure storage is not available on this device"
         }
     }
 }

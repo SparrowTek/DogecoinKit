@@ -1,0 +1,15 @@
+{
+  "originHash" : "c8c0ff68951fb054ec0f841def12398cc915114e71e286f1e50db54fb2ccbb46",
+  "pins" : [
+    {
+      "identity" : "vault",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/SparrowTek/Vault",
+      "state" : {
+        "revision" : "25df48f62a5382c217cfe67f2a12e6efe8f60ec4",
+        "version" : "1.2.0"
+      }
+    }
+  ],
+  "version" : 3
+}
