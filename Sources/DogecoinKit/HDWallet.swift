@@ -1,0 +1,308 @@
+import Foundation
+import clibdogecoin
+
+/// A hierarchical deterministic (HD) wallet supporting BIP32/39/44 standards
+public final class HDWallet: Sendable {
+
+    /// The HD master private key (serialized)
+    public let masterKey: String
+
+    /// The mnemonic phrase used to generate this wallet (if available)
+    public let mnemonic: String?
+
+    /// The network this wallet belongs to
+    public let network: DogecoinNetwork
+
+    /// Create an HD wallet from a mnemonic phrase
+    /// - Parameters:
+    ///   - mnemonic: The BIP39 mnemonic phrase (12-24 words)
+    ///   - passphrase: Optional BIP39 passphrase (default: empty)
+    ///   - network: The network to use
+    /// - Throws: `DogecoinError.invalidMnemonic` if the mnemonic is invalid
+    public init(mnemonic: String, passphrase: String = "", network: DogecoinNetwork = .mainnet) throws {
+        try Dogecoin.ensureInitialized()
+
+        // First, generate a master key for this network
+        var masterKeyBuffer = [CChar](repeating: 0, count: Int(HDKEYLEN))
+        var addressBuffer = [CChar](repeating: 0, count: Int(P2PKHLEN))
+
+        let genResult = generateHDMasterPubKeypair(&masterKeyBuffer, &addressBuffer, network.isTestnet)
+
+        guard genResult == 1 else {
+            throw DogecoinError.keyGenerationFailed
+        }
+
+        // Verify we can derive an address from the mnemonic (validates the mnemonic)
+        var testAddress = [CChar](repeating: 0, count: Int(P2PKHLEN))
+        var changeLevel: [CChar] = [0x30, 0]  // "0"
+
+        var mnemonicBuffer = Array(mnemonic.utf8CString)
+        while mnemonicBuffer.count < Int(MAX_MNEMONIC_SIZE) { mnemonicBuffer.append(0) }
+
+        var passBuffer = Array(passphrase.utf8CString)
+        while passBuffer.count < 256 { passBuffer.append(0) }
+
+        let result = getDerivedHDAddressFromMnemonic(
+            0,      // account
+            0,      // index
+            &changeLevel,
+            &mnemonicBuffer,
+            &passBuffer,
+            &testAddress,
+            network.isTestnetBool
+        )
+
+        guard result == 0 else {
+            throw DogecoinError.invalidMnemonic
+        }
+
+        self.masterKey = String(cString: masterKeyBuffer)
+        self.mnemonic = mnemonic
+        self.network = network
+    }
+
+    /// Create a new random HD wallet with a generated mnemonic
+    /// - Parameters:
+    ///   - strength: The entropy strength in bits (128, 160, 192, 224, or 256)
+    ///   - passphrase: Optional BIP39 passphrase
+    ///   - network: The network to use
+    /// - Returns: A new HDWallet with generated mnemonic
+    /// - Throws: `DogecoinError` if generation fails
+    public static func create(
+        strength: MnemonicStrength = .words12,
+        passphrase: String = "",
+        network: DogecoinNetwork = .mainnet
+    ) throws -> HDWallet {
+        let mnemonic = try generateMnemonic(strength: strength)
+        return try HDWallet(mnemonic: mnemonic, passphrase: passphrase, network: network)
+    }
+
+    /// Generate a new HD master key without mnemonic
+    /// - Parameter network: The network to use
+    /// - Returns: A new HDWallet
+    /// - Throws: `DogecoinError.keyGenerationFailed` if generation fails
+    public static func generateMasterKey(network: DogecoinNetwork = .mainnet) throws -> HDWallet {
+        try Dogecoin.ensureInitialized()
+
+        var masterKeyBuffer = [CChar](repeating: 0, count: Int(HDKEYLEN))
+        var addressBuffer = [CChar](repeating: 0, count: Int(P2PKHLEN))
+
+        let result = generateHDMasterPubKeypair(&masterKeyBuffer, &addressBuffer, network.isTestnet)
+
+        guard result == 1 else {
+            throw DogecoinError.keyGenerationFailed
+        }
+
+        let wallet = HDWallet(
+            masterKey: String(cString: masterKeyBuffer),
+            mnemonic: nil,
+            network: network
+        )
+
+        return wallet
+    }
+
+    /// Internal initializer
+    private init(masterKey: String, mnemonic: String?, network: DogecoinNetwork) {
+        self.masterKey = masterKey
+        self.mnemonic = mnemonic
+        self.network = network
+    }
+
+    /// Derive an address at the given BIP44 path
+    /// - Parameters:
+    ///   - account: The account index (hardened)
+    ///   - index: The address index
+    ///   - change: Whether this is a change address (internal) or external
+    /// - Returns: The derived P2PKH address
+    /// - Throws: `DogecoinError.derivationFailed` if derivation fails
+    public func deriveAddress(account: UInt32 = 0, index: UInt32 = 0, change: Bool = false) throws -> String {
+        try Dogecoin.ensureInitialized()
+
+        if let mnemonic = self.mnemonic {
+            return try deriveAddressFromMnemonic(mnemonic: mnemonic, account: account, index: index, change: change)
+        } else {
+            return try deriveAddressFromMasterKey(account: account, index: index, change: change)
+        }
+    }
+
+    /// Derive an address using the mnemonic
+    private func deriveAddressFromMnemonic(mnemonic: String, account: UInt32, index: UInt32, change: Bool) throws -> String {
+        var addressBuffer = [CChar](repeating: 0, count: Int(P2PKHLEN))
+        var changeLevel: [CChar] = change ? [0x31, 0] : [0x30, 0]  // "1" or "0"
+
+        var mnemonicBuffer = Array(mnemonic.utf8CString)
+        while mnemonicBuffer.count < Int(MAX_MNEMONIC_SIZE) { mnemonicBuffer.append(0) }
+
+        var passBuffer: [CChar] = [0]  // empty passphrase
+
+        let result = getDerivedHDAddressFromMnemonic(
+            account,
+            index,
+            &changeLevel,
+            &mnemonicBuffer,
+            &passBuffer,
+            &addressBuffer,
+            network.isTestnetBool
+        )
+
+        guard result == 0 else {
+            throw DogecoinError.derivationFailed
+        }
+
+        return String(cString: addressBuffer)
+    }
+
+    /// Derive an address using the master key directly
+    private func deriveAddressFromMasterKey(account: UInt32, index: UInt32, change: Bool) throws -> String {
+        var masterKeyBuffer = Array(masterKey.utf8CString)
+        while masterKeyBuffer.count < Int(HDKEYLEN) { masterKeyBuffer.append(0) }
+
+        var addressBuffer = [CChar](repeating: 0, count: Int(P2PKHLEN))
+
+        let result = getDerivedHDAddress(
+            &masterKeyBuffer,
+            account,
+            change ? 1 : 0,
+            index,
+            &addressBuffer,
+            0  // Don't output private key
+        )
+
+        guard result == 0 else {
+            throw DogecoinError.derivationFailed
+        }
+
+        return String(cString: addressBuffer)
+    }
+
+    /// Derive an address at a custom derivation path
+    /// - Parameters:
+    ///   - path: The derivation path (e.g., "m/44'/3'/0'/0/0")
+    /// - Returns: The derived P2PKH address
+    /// - Throws: `DogecoinError.derivationFailed` if derivation fails
+    public func deriveAddress(path: String) throws -> String {
+        try Dogecoin.ensureInitialized()
+
+        var masterKeyBuffer = Array(masterKey.utf8CString)
+        while masterKeyBuffer.count < Int(HDKEYLEN) { masterKeyBuffer.append(0) }
+
+        var pathBuffer = Array(path.utf8CString)
+        while pathBuffer.count < Int(KEYPATHMAXLEN) { pathBuffer.append(0) }
+
+        var addressBuffer = [CChar](repeating: 0, count: Int(P2PKHLEN))
+
+        let result = getDerivedHDAddressByPath(
+            &masterKeyBuffer,
+            &pathBuffer,
+            &addressBuffer,
+            0  // Don't output private key
+        )
+
+        guard result == 0 else {
+            throw DogecoinError.derivationFailed
+        }
+
+        return String(cString: addressBuffer)
+    }
+
+    /// Generate multiple addresses for this wallet
+    /// - Parameters:
+    ///   - count: Number of addresses to generate
+    ///   - account: The account index
+    ///   - change: Whether to generate change addresses
+    ///   - startIndex: The starting index
+    /// - Returns: An array of addresses
+    public func deriveAddresses(
+        count: Int,
+        account: UInt32 = 0,
+        change: Bool = false,
+        startIndex: UInt32 = 0
+    ) throws -> [String] {
+        var addresses: [String] = []
+        addresses.reserveCapacity(count)
+
+        for i in 0..<UInt32(count) {
+            let address = try deriveAddress(account: account, index: startIndex + i, change: change)
+            addresses.append(address)
+        }
+
+        return addresses
+    }
+}
+
+// MARK: - Mnemonic Generation
+
+/// Mnemonic phrase strength options
+public enum MnemonicStrength: Int, Sendable, CaseIterable {
+    /// 12 words (128 bits of entropy)
+    case words12 = 128
+    /// 15 words (160 bits of entropy)
+    case words15 = 160
+    /// 18 words (192 bits of entropy)
+    case words18 = 192
+    /// 21 words (224 bits of entropy)
+    case words21 = 224
+    /// 24 words (256 bits of entropy)
+    case words24 = 256
+
+    /// The number of words in the mnemonic
+    public var wordCount: Int {
+        switch self {
+        case .words12: return 12
+        case .words15: return 15
+        case .words18: return 18
+        case .words21: return 21
+        case .words24: return 24
+        }
+    }
+}
+
+/// Generate a random BIP39 mnemonic phrase
+/// - Parameter strength: The entropy strength
+/// - Returns: The mnemonic phrase as a string
+/// - Throws: `DogecoinError.keyGenerationFailed` if generation fails
+public func generateMnemonic(strength: MnemonicStrength = .words12) throws -> String {
+    try Dogecoin.ensureInitialized()
+
+    var mnemonic = [CChar](repeating: 0, count: Int(MAX_MNEMONIC_SIZE))
+    var strengthBuffer = Array("\(strength.rawValue)".utf8CString)
+    while strengthBuffer.count < 4 { strengthBuffer.append(0) }
+
+    let result = generateRandomEnglishMnemonic(&strengthBuffer, &mnemonic)
+
+    guard result == 0 else {
+        throw DogecoinError.keyGenerationFailed
+    }
+
+    return String(cString: mnemonic)
+}
+
+/// Validate a BIP39 mnemonic phrase
+/// - Parameter mnemonic: The mnemonic phrase to validate
+/// - Returns: `true` if the mnemonic is valid
+public func validateMnemonic(_ mnemonic: String) -> Bool {
+    // Basic validation: check word count
+    let words = mnemonic.split(separator: " ")
+    let validCounts = [12, 15, 18, 21, 24]
+    guard validCounts.contains(words.count) else {
+        return false
+    }
+
+    // Try to derive an address to verify the mnemonic is valid
+    Dogecoin.initialize()
+
+    var addressBuffer = [CChar](repeating: 0, count: Int(P2PKHLEN))
+    var changeLevel: [CChar] = [0x30, 0]  // "0"
+
+    var mnemonicBuffer = Array(mnemonic.utf8CString)
+    while mnemonicBuffer.count < Int(MAX_MNEMONIC_SIZE) { mnemonicBuffer.append(0) }
+
+    var passBuffer: [CChar] = [0]
+
+    let result = getDerivedHDAddressFromMnemonic(
+        0, 0, &changeLevel, &mnemonicBuffer, &passBuffer, &addressBuffer, false
+    )
+
+    return result == 0
+}
