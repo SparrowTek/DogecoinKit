@@ -56,6 +56,20 @@ public enum DogecoinError: Error, LocalizedError, Sendable {
     /// An internal error occurred
     case internalError(String)
 
+    // MARK: - Networking Errors
+
+    /// No peers available for the operation
+    case noPeersAvailable
+
+    /// Transaction broadcast failed
+    case broadcastFailed(String)
+
+    /// Connection to peers failed
+    case connectionFailed(String)
+
+    /// Sync operation failed
+    case syncFailed(String)
+
     // MARK: - Secure Storage Errors
 
     /// Keychain storage operation failed
@@ -111,6 +125,14 @@ public enum DogecoinError: Error, LocalizedError, Sendable {
             return "Memory allocation failed"
         case .internalError(let message):
             return "Internal error: \(message)"
+        case .noPeersAvailable:
+            return "No peers available for the operation"
+        case .broadcastFailed(let reason):
+            return "Transaction broadcast failed: \(reason)"
+        case .connectionFailed(let reason):
+            return "Connection failed: \(reason)"
+        case .syncFailed(let reason):
+            return "Sync operation failed: \(reason)"
         case .keychainStorageFailed(let reason):
             return "Failed to store key in Keychain: \(reason)"
         case .keychainRetrievalFailed(let reason):

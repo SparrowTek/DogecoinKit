@@ -190,6 +190,19 @@ public final class Peer: @unchecked Sendable {
         send(message)
     }
 
+    /// Send a transaction message
+    public func sendTransaction(_ txMessage: TxMessage) {
+        let message = ProtocolMessage(network: network, command: ProtocolMessage.Command.tx, payload: txMessage.serialize())
+        send(message)
+    }
+
+    /// Send an inv message announcing a transaction
+    public func sendInv(inventory: [InventoryVector]) {
+        let inv = InvMessage(inventory: inventory)
+        let message = ProtocolMessage(network: network, command: ProtocolMessage.Command.inv, payload: inv.serialize())
+        send(message)
+    }
+
     // MARK: - Private Methods
 
     private func handleConnectionState(_ state: NWConnection.State) {

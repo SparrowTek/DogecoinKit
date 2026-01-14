@@ -128,6 +128,86 @@ public final class PeerManager: @unchecked Sendable {
         }
     }
 
+    // MARK: - Transaction Broadcasting
+
+    /// Pending transactions waiting to be requested by peers
+    private var pendingTransactions: [Data: TxMessage] = [:]
+
+    /// Lock for pending transactions
+    private let txLock = NSLock()
+
+    /// Broadcast a transaction to the network
+    /// - Parameter rawHex: The raw transaction hex
+    /// - Returns: The transaction ID (txid) as a hex string
+    /// - Throws: DogecoinError if broadcast fails
+    public func broadcastTransaction(_ rawHex: String) throws -> String {
+        guard let txMessage = TxMessage(rawHex: rawHex) else {
+            throw DogecoinError.internalError("Invalid transaction hex")
+        }
+
+        return try broadcastTransaction(txMessage)
+    }
+
+    /// Broadcast a transaction to the network
+    /// - Parameter txMessage: The transaction message
+    /// - Returns: The transaction ID (txid) as a hex string
+    /// - Throws: DogecoinError if broadcast fails
+    public func broadcastTransaction(_ txMessage: TxMessage) throws -> String {
+        let peers = connectedPeers
+        guard !peers.isEmpty else {
+            throw DogecoinError.noPeersAvailable
+        }
+
+        let txid = txMessage.txid
+        let txidHex = txMessage.txidHex
+
+        // Store transaction for when peers request it
+        txLock.lock()
+        pendingTransactions[txid] = txMessage
+        txLock.unlock()
+
+        logger.info("Broadcasting transaction: \(txidHex)")
+
+        // Create inventory vector for this transaction
+        let inv = InventoryVector(type: .transaction, hash: txid)
+
+        // Announce to all connected peers
+        for peer in peers {
+            peer.sendInv(inventory: [inv])
+        }
+
+        // Schedule cleanup of pending transaction after 60 seconds
+        queue.asyncAfter(deadline: .now() + 60) { [weak self] in
+            self?.txLock.lock()
+            self?.pendingTransactions.removeValue(forKey: txid)
+            self?.txLock.unlock()
+        }
+
+        return txidHex
+    }
+
+    /// Handle a getdata request from a peer
+    /// - Parameters:
+    ///   - inventory: The requested inventory items
+    ///   - peer: The requesting peer
+    internal func handleGetData(_ inventory: [InventoryVector], from peer: Peer) {
+        for item in inventory {
+            switch item.type {
+            case .transaction:
+                txLock.lock()
+                let tx = pendingTransactions[item.hash]
+                txLock.unlock()
+
+                if let tx = tx {
+                    logger.info("Sending transaction \(tx.txidHex) to peer \(peer.host)")
+                    peer.sendTransaction(tx)
+                }
+            default:
+                break
+            }
+        }
+    }
+
     // MARK: - Private Methods
 
     private func discoverPeers() {
@@ -248,6 +328,14 @@ extension PeerManager: PeerDelegate {
     }
 
     public func peer(_ peer: Peer, didReceiveMessage message: ProtocolMessage) {
+        // Handle getdata messages internally for transaction broadcasting
+        if message.command == ProtocolMessage.Command.getdata {
+            if let getData = GetDataMessage.parse(from: message.payload) {
+                handleGetData(getData.inventory, from: peer)
+            }
+        }
+
+        // Forward to delegate for other handling
         delegate?.peerManager(self, peer: peer, didReceiveMessage: message)
     }
 

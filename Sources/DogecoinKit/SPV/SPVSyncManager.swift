@@ -99,6 +99,24 @@ public final class SPVSyncManager: @unchecked Sendable {
         state = .idle
     }
 
+    // MARK: - Transaction Broadcasting
+
+    /// Broadcast a signed transaction to the network
+    /// - Parameter rawHex: The raw transaction hex string
+    /// - Returns: The transaction ID (txid) as a hex string
+    /// - Throws: DogecoinError if broadcast fails
+    public func broadcastTransaction(_ rawHex: String) throws -> String {
+        try peerManager.broadcastTransaction(rawHex)
+    }
+
+    /// Broadcast a signed transaction to the network
+    /// - Parameter signedTransaction: The signed transaction
+    /// - Returns: The transaction ID (txid) as a hex string
+    /// - Throws: DogecoinError if broadcast fails
+    public func broadcastTransaction(_ signedTransaction: SignedTransaction) throws -> String {
+        try peerManager.broadcastTransaction(signedTransaction.rawHex)
+    }
+
     /// Request headers from a peer
     private func requestHeaders(from peer: Peer) {
         guard !waitingForHeaders else { return }
