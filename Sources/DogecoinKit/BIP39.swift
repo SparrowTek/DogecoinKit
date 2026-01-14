@@ -22,100 +22,61 @@ public func verifyMnemonic(_ mnemonic: String, language: String = "eng") -> Bool
     return result == 0
 }
 
-// MARK: - BIP39 Wordlist Access
+// MARK: - BIP39 Wordlist
 
 /// The number of words in the BIP39 English wordlist
 public let bip39WordCount = 2048
 
-/// Returns the BIP39 English wordlist (2048 words)
-/// Useful for autocomplete and word-by-word validation
-/// - Returns: Array of all 2048 BIP39 English words
-public func getBIP39Wordlist() -> [String] {
-    var words: [String] = []
-    words.reserveCapacity(bip39WordCount)
+/// NOTE: Direct wordlist access is temporarily disabled due to Swift 6 compiler crash
+/// with the C array. Use verifyMnemonic() for full validation instead.
+/// The wordlist functions below use a simple validation approach.
 
-    for i in 0..<bip39WordCount {
-        if let wordPtr = wordlist_eng[i] {
-            words.append(String(cString: wordPtr))
-        }
-    }
-
-    return words
-}
-
-/// Checks if a single word is a valid BIP39 English word
+/// Checks if a word could be a valid BIP39 word based on basic criteria
+/// For full validation, use verifyMnemonic() on the complete phrase
 /// - Parameter word: The word to validate
-/// - Returns: true if the word is in the BIP39 English wordlist
+/// - Returns: true if the word meets basic BIP39 criteria
 public func isValidBIP39Word(_ word: String) -> Bool {
     let lowercased = word.lowercased().trimmingCharacters(in: .whitespaces)
     guard !lowercased.isEmpty else { return false }
 
-    for i in 0..<bip39WordCount {
-        if let wordPtr = wordlist_eng[i] {
-            if String(cString: wordPtr) == lowercased {
-                return true
-            }
-        }
-    }
+    // BIP39 words are 3-8 characters, lowercase letters only
+    guard lowercased.count >= 3, lowercased.count <= 8 else { return false }
 
-    return false
+    // Must be all lowercase letters
+    let letters = CharacterSet.lowercaseLetters
+    return lowercased.unicodeScalars.allSatisfy { letters.contains($0) }
+}
+
+/// Returns the BIP39 English wordlist
+/// NOTE: Currently returns empty array due to Swift 6 compiler issue with C array access
+/// - Returns: Empty array (wordlist access disabled)
+public func getBIP39Wordlist() -> [String] {
+    // Disabled due to Swift 6 compiler crash with wordlist_eng C array
+    []
 }
 
 /// Returns BIP39 words matching a prefix (for autocomplete)
-/// - Parameters:
-///   - prefix: The prefix to match
-///   - limit: Maximum number of suggestions to return (default: 5)
-/// - Returns: Array of matching words, sorted alphabetically
+/// NOTE: Currently returns empty array due to Swift 6 compiler issue
+/// - Returns: Empty array (wordlist access disabled)
 public func bip39WordsMatching(prefix: String, limit: Int = 5) -> [String] {
-    let lowercased = prefix.lowercased().trimmingCharacters(in: .whitespaces)
-    guard !lowercased.isEmpty else { return [] }
-
-    var matches: [String] = []
-
-    for i in 0..<bip39WordCount {
-        if let wordPtr = wordlist_eng[i] {
-            let word = String(cString: wordPtr)
-            if word.hasPrefix(lowercased) {
-                matches.append(word)
-                if matches.count >= limit {
-                    break
-                }
-            }
-        }
-    }
-
-    return matches
+    // Disabled due to Swift 6 compiler crash with wordlist_eng C array
+    []
 }
 
 /// Returns the index of a BIP39 word in the wordlist
-/// - Parameter word: The word to find
-/// - Returns: The index (0-2047) or nil if not found
+/// NOTE: Currently returns nil due to Swift 6 compiler issue
+/// - Returns: nil (wordlist access disabled)
 public func bip39WordIndex(_ word: String) -> Int? {
-    let lowercased = word.lowercased().trimmingCharacters(in: .whitespaces)
-    guard !lowercased.isEmpty else { return nil }
-
-    for i in 0..<bip39WordCount {
-        if let wordPtr = wordlist_eng[i] {
-            if String(cString: wordPtr) == lowercased {
-                return i
-            }
-        }
-    }
-
-    return nil
+    // Disabled due to Swift 6 compiler crash with wordlist_eng C array
+    nil
 }
 
 /// Returns the BIP39 word at a specific index
-/// - Parameter index: The index (0-2047)
-/// - Returns: The word at that index, or nil if index is out of range
+/// NOTE: Currently returns nil due to Swift 6 compiler issue
+/// - Returns: nil (wordlist access disabled)
 public func bip39Word(at index: Int) -> String? {
-    guard index >= 0, index < bip39WordCount else { return nil }
-
-    if let wordPtr = wordlist_eng[index] {
-        return String(cString: wordPtr)
-    }
-
-    return nil
+    // Disabled due to Swift 6 compiler crash with wordlist_eng C array
+    nil
 }
 
 // MARK: - Mnemonic Validation Result
@@ -143,7 +104,7 @@ public struct MnemonicValidationResult: Sendable {
 }
 
 /// Errors that can occur during mnemonic validation
-public enum MnemonicValidationError: Error, Sendable {
+public enum MnemonicValidationError: Error, Sendable, Equatable {
     case emptyMnemonic
     case invalidWordCount
     case invalidWords([Int])
@@ -175,26 +136,12 @@ public func validateMnemonicDetailed(_ mnemonic: String) -> MnemonicValidationRe
         )
     }
 
-    // Check each word
-    var invalidIndices: [Int] = []
-    for (index, word) in words.enumerated() {
-        if !isValidBIP39Word(word) {
-            invalidIndices.append(index)
-        }
-    }
+    // Use libdogecoin's full validation (includes word and checksum validation)
+    let isValid = verifyMnemonic(trimmed)
 
-    if !invalidIndices.isEmpty {
-        return MnemonicValidationResult(
-            isValid: false,
-            invalidWordIndices: invalidIndices,
-            error: .invalidWords(invalidIndices)
-        )
-    }
-
-    // All words valid, now check checksum using libdogecoin
-    let isChecksumValid = verifyMnemonic(trimmed)
-
-    if !isChecksumValid {
+    if !isValid {
+        // Cannot determine specific invalid words without wordlist access
+        // Return generic checksum error
         return MnemonicValidationResult(
             isValid: false,
             invalidWordIndices: [],

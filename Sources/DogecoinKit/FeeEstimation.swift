@@ -182,7 +182,9 @@ public enum FeeEstimation {
         priority: Priority = .standard
     ) -> (utxos: [UTXO], fee: DogecoinAmount)? {
         // Sort UTXOs by amount (largest first)
-        let sorted = utxos.sorted { $0.amount > $1.amount }
+        let sorted = utxos.sorted { (lhs: UTXO, rhs: UTXO) -> Bool in
+            lhs.amount > rhs.amount
+        }
 
         var selected: [UTXO] = []
         var totalInput = DogecoinAmount.zero
