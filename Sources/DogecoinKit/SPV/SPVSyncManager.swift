@@ -39,11 +39,24 @@ public final class SPVSyncManager: @unchecked Sendable {
     /// Delegate for events
     public weak var delegate: SPVSyncDelegate?
 
+    private struct SyncState {
+        var state: SPVSyncState = .idle
+        var targetHeight: Int32 = 0
+        var syncPeer: Peer?
+        var waitingForHeaders = false
+    }
+
+    private var syncState = SyncState()
+
     /// Current sync state
-    public private(set) var state: SPVSyncState = .idle
+    public var state: SPVSyncState {
+        withLock { $0.state }
+    }
 
     /// Target height (best height from peers)
-    public private(set) var targetHeight: Int32 = 0
+    public var targetHeight: Int32 {
+        withLock { $0.targetHeight }
+    }
 
     /// Current synced height
     public var currentHeight: Int32 {
@@ -62,11 +75,15 @@ public final class SPVSyncManager: @unchecked Sendable {
     /// Logger
     private let logger = Logger(subsystem: "DogecoinKit", category: "SPVSyncManager")
 
-    /// Peer currently syncing from
-    private var syncPeer: Peer?
+    private func withLock<T>(_ body: (inout SyncState) -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body(&syncState)
+    }
 
-    /// Whether we're waiting for headers
-    private var waitingForHeaders = false
+    private func setState(_ newState: SPVSyncState) {
+        withLock { $0.state = newState }
+    }
 
     /// Create an SPV sync manager
     public init(network: DogecoinNetwork = .mainnet, storageDirectory: URL? = nil) {
@@ -77,13 +94,18 @@ public final class SPVSyncManager: @unchecked Sendable {
 
     /// Start synchronization
     public func start() {
-        guard state == .idle else {
+        let canStart = withLock { state in
+            guard state.state == .idle else { return false }
+            state.state = .connecting
+            return true
+        }
+
+        guard canStart else {
             logger.warning("Cannot start: already running")
             return
         }
 
         logger.info("Starting SPV sync")
-        state = .connecting
 
         peerManager.delegate = self
         peerManager.start()
@@ -94,9 +116,11 @@ public final class SPVSyncManager: @unchecked Sendable {
         logger.info("Stopping SPV sync")
 
         peerManager.stop()
-        syncPeer = nil
-        waitingForHeaders = false
-        state = .idle
+        withLock { state in
+            state.syncPeer = nil
+            state.waitingForHeaders = false
+            state.state = .idle
+        }
     }
 
     // MARK: - Transaction Broadcasting
@@ -119,24 +143,29 @@ public final class SPVSyncManager: @unchecked Sendable {
 
     /// Request headers from a peer
     private func requestHeaders(from peer: Peer) {
-        guard !waitingForHeaders else { return }
+        let canRequest = withLock { state in
+            guard !state.waitingForHeaders else { return false }
+            state.waitingForHeaders = true
+            return true
+        }
+
+        guard canRequest else { return }
 
         let locator = headerChain.getBlockLocator()
         logger.info("Requesting headers from \(peer.host), locator has \(locator.count) hashes")
 
-        waitingForHeaders = true
         peer.sendGetHeaders(locatorHashes: locator)
     }
 
     /// Handle received headers
     private func handleHeaders(_ headers: [BlockHeader], from peer: Peer) {
-        waitingForHeaders = false
+        withLock { $0.waitingForHeaders = false }
 
         guard !headers.isEmpty else {
             logger.info("No more headers from \(peer.host)")
 
             if currentHeight >= targetHeight {
-                state = .synchronized
+                setState(.synchronized)
                 delegate?.spvSyncDidComplete(self)
             }
             return
@@ -161,7 +190,7 @@ public final class SPVSyncManager: @unchecked Sendable {
         if headers.count >= 2000 {
             requestHeaders(from: peer)
         } else if currentHeight >= targetHeight {
-            state = .synchronized
+            setState(.synchronized)
             delegate?.spvSyncDidComplete(self)
         }
     }
@@ -175,15 +204,22 @@ extension SPVSyncManager: PeerManagerDelegate {
 
         // Update target height from peer version
         if let version = peer.peerVersion {
-            if version.startHeight > targetHeight {
-                targetHeight = version.startHeight
+            withLock { state in
+                if version.startHeight > state.targetHeight {
+                    state.targetHeight = version.startHeight
+                }
             }
         }
 
         // Start syncing if we don't have a sync peer
-        if syncPeer == nil && state == .connecting {
-            syncPeer = peer
-            state = .syncing
+        let shouldStart = withLock { state in
+            guard state.syncPeer == nil, state.state == .connecting else { return false }
+            state.syncPeer = peer
+            state.state = .syncing
+            return true
+        }
+
+        if shouldStart {
             requestHeaders(from: peer)
         }
     }
@@ -191,15 +227,19 @@ extension SPVSyncManager: PeerManagerDelegate {
     public func peerManager(_ manager: PeerManager, peerDidDisconnect peer: Peer) {
         logger.info("Peer disconnected: \(peer.host)")
 
-        if peer == syncPeer {
-            syncPeer = nil
-            waitingForHeaders = false
+        let shouldReconnect = withLock { state in
+            guard peer == state.syncPeer else { return false }
+            state.syncPeer = nil
+            state.waitingForHeaders = false
+            return true
+        }
 
-            // Try another peer
-            if let nextPeer = manager.connectedPeers.first {
-                syncPeer = nextPeer
-                requestHeaders(from: nextPeer)
-            }
+        guard shouldReconnect else { return }
+
+        // Try another peer
+        if let nextPeer = manager.connectedPeers.first {
+            withLock { $0.syncPeer = nextPeer }
+            requestHeaders(from: nextPeer)
         }
     }
 
@@ -234,7 +274,8 @@ extension SPVSyncManager: PeerManagerDelegate {
             logger.debug("Received inventory with \(blockInv.count) blocks")
 
             // Request headers for new blocks
-            if peer == syncPeer {
+            let isSyncPeer = withLock { $0.syncPeer == peer }
+            if isSyncPeer {
                 requestHeaders(from: peer)
             }
         }
