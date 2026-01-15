@@ -75,6 +75,8 @@ public final class SPVSyncManager: @unchecked Sendable {
         var matchedTxToBlock: [Data: Data] = [:]
         var pendingTransactions: [Data: TxMessage] = [:]
         var verifiedTransactions: [Data: VerifiedTransaction] = [:]
+        var nextFilteredHeight: Int32?
+        var filteredBlocksInFlight: Int = 0
     }
 
     private var syncState = SyncState()
@@ -107,6 +109,9 @@ public final class SPVSyncManager: @unchecked Sendable {
 
     /// Logger
     private let logger = Logger(subsystem: "DogecoinKit", category: "SPVSyncManager")
+
+    private let filteredBlockBatchSize = 32
+    private let maxFilteredBlocksInFlight = 128
 
     private func withLock<T>(_ body: (inout SyncState) -> T) -> T {
         lock.lock()
@@ -187,7 +192,8 @@ public final class SPVSyncManager: @unchecked Sendable {
         elements: [Data],
         falsePositiveRate: Double = 0.001,
         tweak: UInt32 = UInt32.random(in: 0...UInt32.max),
-        flags: UInt8 = 0
+        flags: UInt8 = 0,
+        startHeight: Int32 = 0
     ) {
         var filter = BloomFilter(
             elementCount: max(1, elements.count),
@@ -200,8 +206,14 @@ public final class SPVSyncManager: @unchecked Sendable {
             filter.insert(element)
         }
 
-        withTxLock { $0.bloomFilter = filter }
+        let clampedStart = min(max(0, startHeight), headerChain.height)
+        withTxLock { state in
+            state.bloomFilter = filter
+            state.nextFilteredHeight = clampedStart
+            state.filteredBlocksInFlight = 0
+        }
         sendFilterLoadToPeers()
+        requestFilteredBlocksIfNeeded()
     }
 
     /// Add an element to the active bloom filter
@@ -224,6 +236,8 @@ public final class SPVSyncManager: @unchecked Sendable {
         let hadFilter = withTxLock { state -> Bool in
             let hasFilter = state.bloomFilter != nil
             state.bloomFilter = nil
+            state.nextFilteredHeight = nil
+            state.filteredBlocksInFlight = 0
             return hasFilter
         }
 
@@ -238,6 +252,43 @@ public final class SPVSyncManager: @unchecked Sendable {
         for peer in peerManager.connectedPeers {
             peer.sendFilterLoad(filter)
         }
+    }
+
+    private func requestFilteredBlocksIfNeeded() {
+        guard let nextHeight = withTxLock({ $0.nextFilteredHeight }),
+              withTxLock({ $0.bloomFilter }) != nil else {
+            return
+        }
+
+        let inFlight = withTxLock { $0.filteredBlocksInFlight }
+        guard inFlight < maxFilteredBlocksInFlight else { return }
+
+        let currentHeight = headerChain.height
+        guard nextHeight <= currentHeight else { return }
+
+        let peer = withLock { $0.syncPeer } ?? peerManager.connectedPeers.first
+        guard let peer else { return }
+
+        var inventory: [InventoryVector] = []
+        var height = nextHeight
+
+        while height <= currentHeight,
+              inventory.count < filteredBlockBatchSize,
+              inFlight + inventory.count < maxFilteredBlocksInFlight {
+            if let stored = headerChain.getHeader(height: height) {
+                inventory.append(InventoryVector(type: .filteredBlock, hash: stored.header.hash))
+            }
+            height += 1
+        }
+
+        guard !inventory.isEmpty else { return }
+
+        withTxLock { state in
+            state.nextFilteredHeight = height
+            state.filteredBlocksInFlight += inventory.count
+        }
+
+        peer.sendGetData(inventory: inventory)
     }
 
     /// Request headers from a peer
@@ -278,6 +329,7 @@ public final class SPVSyncManager: @unchecked Sendable {
         if added > 0 {
             refreshPendingMerkleBlocks()
             refreshVerifiedTransactionsForReorg()
+            requestFilteredBlocksIfNeeded()
         }
 
         // Notify delegate
@@ -329,6 +381,7 @@ extension SPVSyncManager: PeerManagerDelegate {
 
         if let filter = withTxLock({ $0.bloomFilter }) {
             peer.sendFilterLoad(filter)
+            requestFilteredBlocksIfNeeded()
         }
     }
 
@@ -507,6 +560,11 @@ extension SPVSyncManager: PeerManagerDelegate {
         for event in events {
             delegate?.spvSync(self, didUpdateTransaction: event.0, state: event.1)
         }
+
+        withTxLock { state in
+            state.filteredBlocksInFlight = max(0, state.filteredBlocksInFlight - 1)
+        }
+        requestFilteredBlocksIfNeeded()
     }
 
     private func handleTransaction(_ txMessage: TxMessage, from peer: Peer) {
