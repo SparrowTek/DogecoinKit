@@ -65,6 +65,9 @@ public final class Peer: @unchecked Sendable {
     /// Round-trip time in seconds
     public private(set) var roundTripTime: TimeInterval?
 
+    /// Track if we've requested peer addresses
+    private var didRequestAddresses = false
+
     // MARK: - Timeout Configuration
 
     /// Connection timeout in seconds
@@ -225,15 +228,18 @@ public final class Peer: @unchecked Sendable {
     /// Peer errors
     public enum PeerError: Error, LocalizedError {
         case timeout(TimeoutType)
-        case invalidMessage
+        case invalidMessage(ProtocolMessage.ParseError)
+        case invalidMagic(expected: UInt32, got: UInt32)
         case connectionFailed
 
         public var errorDescription: String? {
             switch self {
             case .timeout(let type):
                 return type.rawValue
-            case .invalidMessage:
-                return "Invalid message received"
+            case .invalidMessage(let reason):
+                return "Invalid message received: \(reason)"
+            case .invalidMagic(let expected, let got):
+                return "Invalid network magic (expected \(expected), got \(got))"
             case .connectionFailed:
                 return "Connection failed"
             }
@@ -395,10 +401,34 @@ public final class Peer: @unchecked Sendable {
     }
 
     private func processReceiveBuffer() {
-        while let (message, remaining) = ProtocolMessage.parse(from: receiveBuffer) {
-            receiveBuffer = remaining
-            handleMessage(message)
+        let expectedMagic = NetworkConstants.magic(for: network)
+
+        while true {
+            switch ProtocolMessage.parseDetailed(from: receiveBuffer) {
+            case .message(let message, let remaining):
+                receiveBuffer = remaining
+
+                guard message.magic == expectedMagic else {
+                    handleProtocolError(.invalidMagic(expected: expectedMagic, got: message.magic))
+                    return
+                }
+
+                handleMessage(message)
+
+            case .incomplete:
+                return
+
+            case .invalid(let error):
+                handleProtocolError(.invalidMessage(error))
+                return
+            }
         }
+    }
+
+    private func handleProtocolError(_ error: PeerError) {
+        logger.error("Protocol error from \(self.host): \(error.localizedDescription)")
+        delegate?.peer(self, didFailWithError: error)
+        disconnect()
     }
 
     private func handleMessage(_ message: ProtocolMessage) {
@@ -416,6 +446,10 @@ public final class Peer: @unchecked Sendable {
 
         case ProtocolMessage.Command.pong:
             handlePongMessage(message.payload)
+
+        case ProtocolMessage.Command.addr,
+             ProtocolMessage.Command.getaddr:
+            delegate?.peer(self, didReceiveMessage: message)
 
         default:
             // Forward other messages to delegate
@@ -439,6 +473,11 @@ public final class Peer: @unchecked Sendable {
         cancelHandshakeTimeoutTimer()
         logger.info("Handshake complete with \(self.host):\(self.port)")
         state = .ready
+
+        if !didRequestAddresses {
+            sendGetAddr()
+            didRequestAddresses = true
+        }
     }
 
     private func handlePingMessage(_ payload: Data) {
@@ -456,6 +495,12 @@ public final class Peer: @unchecked Sendable {
         }
 
         pendingPingNonce = nil
+    }
+
+    /// Request peer addresses
+    public func sendGetAddr() {
+        let message = ProtocolMessage(network: network, command: ProtocolMessage.Command.getaddr, payload: Data())
+        send(message)
     }
 }
 

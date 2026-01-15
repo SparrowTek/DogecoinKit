@@ -2,6 +2,9 @@ import Foundation
 import os.log
 import clibdogecoin
 
+@_silgen_name("scrypt_1024_1_1_256")
+private func scrypt_1024_1_1_256(_ input: UnsafePointer<UInt8>?, _ output: UnsafeMutablePointer<UInt8>?)
+
 /// Stored block header with additional metadata
 public struct StoredHeader: Sendable, Codable {
     /// The block header
@@ -70,9 +73,6 @@ public final class HeaderChain: @unchecked Sendable {
 
     /// Logger
     private let logger = Logger(subsystem: "DogecoinKit", category: "HeaderChain")
-
-    /// Chain parameters from libdogecoin
-    private let chainParams: dogecoin_chainparams
 
     /// Cached warning state for auxpow handling
     private var didLogAuxpowWarning = false
@@ -153,7 +153,6 @@ public final class HeaderChain: @unchecked Sendable {
     /// Create a header chain
     public init(network: DogecoinNetwork = .mainnet, storageDirectory: URL? = nil) {
         self.network = network
-        self.chainParams = network == .mainnet ? dogecoin_chainparams_main : dogecoin_chainparams_test
 
         if let url = storageDirectory {
             self.storageURL = url
@@ -418,7 +417,8 @@ public final class HeaderChain: @unchecked Sendable {
             )
         }
 
-        let stored = StoredHeader(header: genesis, height: 0, chainWork: genesisChainWork)
+        let genesisWork = (try? calculateBlockWork(for: genesis, validatePoW: true)) ?? Data(repeating: 0, count: 32)
+        let stored = StoredHeader(header: genesis, height: 0, chainWork: genesisWork)
         headersByHash[genesis.hash] = stored
         headersByHeight[0] = stored
         tip = stored
@@ -432,40 +432,29 @@ public final class HeaderChain: @unchecked Sendable {
         (version & 0x100) == 0x100
     }
 
-    private var powLimit: Data {
-        withUnsafeBytes(of: chainParams.pow_limit) { Data($0) }
-    }
-
-    private var genesisChainWork: Data {
-        withUnsafeBytes(of: chainParams.genesisblockchainwork) { Data($0) }
-    }
-
     private func calculateBlockWork(for header: BlockHeader, validatePoW: Bool) throws -> Data {
-        var hash = validatePoW ? scryptHash(for: header) : Data(repeating: 0, count: 32)
-        var work = Data(repeating: 0, count: 32)
-        let success = withUnsafePointer(to: chainParams) { paramsPtr in
-            hash.withUnsafeMutableBytes { hashBytes in
-                work.withUnsafeMutableBytes { workBytes in
-                    guard let hashPtr = hashBytes.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                          let workPtr = workBytes.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                        return false
-                    }
-                    return check_pow(hashPtr, header.bits, paramsPtr, workPtr) != 0
-                }
-            }
+        guard let target = targetFromBits(header.bits) else {
+            throw ValidationError.invalidDifficulty(bits: header.bits)
         }
 
-        guard success else {
-            if validatePoW {
+        if validatePoW {
+            let hash = scryptHash(for: header)
+            let powHash = Data(hash.reversed())
+
+            guard compareChainWork(powHash, target) != .orderedDescending else {
                 let targetHex = targetHexString(bits: header.bits)
                 logger.error("PoW validation failed: hash \(header.hashHex) does not meet target")
                 throw ValidationError.invalidProofOfWork(hash: header.hashHex, target: targetHex)
             }
-
-            throw ValidationError.invalidDifficulty(bits: header.bits)
         }
 
-        return work
+        let targetValue = UInt256(data: target)
+        let targetPlusOne = targetValue.adding(UInt256.one)
+        let negTarget = targetValue.bitwiseNot()
+        let hashes = negTarget.divided(by: targetPlusOne)
+        let work = hashes.adding(UInt256.one)
+
+        return work.data
     }
 
     private func scryptHash(for header: BlockHeader) -> Data {
@@ -473,13 +462,12 @@ public final class HeaderChain: @unchecked Sendable {
         var hash = Data(repeating: 0, count: 32)
 
         headerData.withUnsafeBytes { headerBytes in
-            guard let baseAddress = headerBytes.baseAddress else { return }
-            guard let cstr = cstr_new_buf(baseAddress, headerData.count) else { return }
-            defer { cstr_free(cstr, 1) }
-
             hash.withUnsafeMutableBytes { hashBytes in
-                guard let hashPtr = hashBytes.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-                dogecoin_block_header_scrypt_hash(cstr, hashPtr)
+                guard let headerPtr = headerBytes.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                      let hashPtr = hashBytes.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    return
+                }
+                scrypt_1024_1_1_256(headerPtr, hashPtr)
             }
         }
 
@@ -605,7 +593,7 @@ public final class HeaderChain: @unchecked Sendable {
 
         headersByHeight = [:]
 
-        let bestTip = headersByHash.values.reduce(nil) { currentBest, candidate in
+        let bestTip: StoredHeader? = headersByHash.values.reduce(nil as StoredHeader?) { currentBest, candidate in
             guard let currentBest else { return candidate }
             return shouldReorganize(currentTip: currentBest, candidateTip: candidate) ? candidate : currentBest
         }
@@ -630,7 +618,8 @@ public final class HeaderChain: @unchecked Sendable {
         let sortedHeaders = headersByHash.values.sorted { $0.height < $1.height }
         for stored in sortedHeaders {
             if stored.height == 0 {
-                let updated = StoredHeader(header: stored.header, height: 0, chainWork: genesisChainWork)
+                let genesisWork = (try? calculateBlockWork(for: stored.header, validatePoW: false)) ?? Data(repeating: 0, count: 32)
+                let updated = StoredHeader(header: stored.header, height: 0, chainWork: genesisWork)
                 headersByHash[stored.header.hash] = updated
                 continue
             }
@@ -677,7 +666,6 @@ public final class HeaderChain: @unchecked Sendable {
             target[offset + 2] = UInt8((word >> 16) & 0xff)
         }
 
-        guard compareChainWork(target, powLimit) != .orderedDescending else { return nil }
         return target
     }
 
@@ -685,6 +673,141 @@ public final class HeaderChain: @unchecked Sendable {
         guard !didLogAuxpowWarning else { return }
         didLogAuxpowWarning = true
         logger.notice("AuxPoW headers detected; PoW validation is skipped without auxpow data")
+    }
+}
+
+// MARK: - UInt256
+
+private struct UInt256: Sendable, Equatable {
+    static let zero = UInt256(words: Array(repeating: 0, count: 8))
+    static let one = UInt256(words: [1, 0, 0, 0, 0, 0, 0, 0])
+
+    var words: [UInt32]
+
+    init(words: [UInt32]) {
+        var padded = words
+        if padded.count < 8 {
+            padded.append(contentsOf: Array(repeating: 0, count: 8 - padded.count))
+        }
+        self.words = Array(padded.prefix(8))
+    }
+
+    init(data: Data) {
+        var values = Array(repeating: UInt32(0), count: 8)
+        let bytes = [UInt8](data.prefix(32))
+        for index in 0..<8 {
+            let base = index * 4
+            if base + 3 < bytes.count {
+                let word = UInt32(bytes[base])
+                    | (UInt32(bytes[base + 1]) << 8)
+                    | (UInt32(bytes[base + 2]) << 16)
+                    | (UInt32(bytes[base + 3]) << 24)
+                values[index] = word
+            }
+        }
+        self.words = values
+    }
+
+    var data: Data {
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(32)
+        for word in words {
+            bytes.append(UInt8(word & 0xff))
+            bytes.append(UInt8((word >> 8) & 0xff))
+            bytes.append(UInt8((word >> 16) & 0xff))
+            bytes.append(UInt8((word >> 24) & 0xff))
+        }
+        return Data(bytes)
+    }
+
+    func bitwiseNot() -> UInt256 {
+        UInt256(words: words.map { ~$0 })
+    }
+
+    func adding(_ other: UInt256) -> UInt256 {
+        var result = Array(repeating: UInt32(0), count: 8)
+        var carry: UInt64 = 0
+
+        for index in 0..<8 {
+            let sum = UInt64(words[index]) + UInt64(other.words[index]) + carry
+            result[index] = UInt32(sum & 0xffffffff)
+            carry = sum >> 32
+        }
+
+        return UInt256(words: result)
+    }
+
+    func subtracting(_ other: UInt256) -> UInt256 {
+        var result = Array(repeating: UInt32(0), count: 8)
+        var borrow: UInt64 = 0
+
+        for index in 0..<8 {
+            let lhs = UInt64(words[index])
+            let rhs = UInt64(other.words[index]) + borrow
+            if lhs >= rhs {
+                result[index] = UInt32(lhs - rhs)
+                borrow = 0
+            } else {
+                result[index] = UInt32((1 << 32) + lhs - rhs)
+                borrow = 1
+            }
+        }
+
+        return UInt256(words: result)
+    }
+
+    func divided(by divisor: UInt256) -> UInt256 {
+        var quotient = UInt256.zero
+        var remainder = UInt256.zero
+
+        for bit in stride(from: 255, through: 0, by: -1) {
+            remainder = remainder.shiftedLeftBy1()
+            if bitValue(at: bit) == 1 {
+                remainder.words[0] |= 1
+            }
+
+            if remainder.compare(to: divisor) != .orderedAscending {
+                remainder = remainder.subtracting(divisor)
+                quotient.setBit(bit)
+            }
+        }
+
+        return quotient
+    }
+
+    private func compare(to other: UInt256) -> ComparisonResult {
+        for index in stride(from: 7, through: 0, by: -1) {
+            let left = words[index]
+            let right = other.words[index]
+            if left == right { continue }
+            return left < right ? .orderedAscending : .orderedDescending
+        }
+        return .orderedSame
+    }
+
+    private func bitValue(at index: Int) -> UInt32 {
+        let wordIndex = index / 32
+        let bitIndex = index % 32
+        guard wordIndex < words.count else { return 0 }
+        return (words[wordIndex] >> bitIndex) & 1
+    }
+
+    private mutating func setBit(_ index: Int) {
+        let wordIndex = index / 32
+        let bitIndex = index % 32
+        guard wordIndex < words.count else { return }
+        words[wordIndex] |= (1 << bitIndex)
+    }
+
+    private func shiftedLeftBy1() -> UInt256 {
+        var result = Array(repeating: UInt32(0), count: 8)
+        var carry: UInt32 = 0
+        for index in 0..<8 {
+            let newCarry = (words[index] >> 31) & 1
+            result[index] = (words[index] << 1) | carry
+            carry = newCarry
+        }
+        return UInt256(words: result)
     }
 }
 

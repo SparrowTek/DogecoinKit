@@ -66,48 +66,103 @@ public struct ProtocolMessage: Sendable {
     /// - Parameter data: The raw message data
     /// - Returns: A tuple of the parsed message and remaining data, or nil if incomplete
     public static func parse(from data: Data) -> (message: ProtocolMessage, remaining: Data)? {
-        guard data.count >= NetworkConstants.headerSize else {
+        switch parseDetailed(from: data) {
+        case .message(let message, let remaining):
+            return (message, remaining)
+        case .incomplete, .invalid:
             return nil
         }
+    }
+}
 
-        // Parse header
-        guard let magicRaw: UInt32 = data.readInteger(at: 0) else { return nil }
+// MARK: - Parsing
+
+public extension ProtocolMessage {
+    enum ParseError: Error, Sendable {
+        case invalidCommandPadding
+        case invalidCommand
+        case invalidPayloadLength
+        case invalidChecksum
+    }
+
+    enum ParseOutcome: Sendable {
+        case message(ProtocolMessage, Data)
+        case incomplete
+        case invalid(ParseError)
+    }
+
+    static func parseDetailed(from data: Data) -> ParseOutcome {
+        guard data.count >= NetworkConstants.headerSize else {
+            return .incomplete
+        }
+
+        guard let magicRaw: UInt32 = data.readInteger(at: 0) else { return .invalid(.invalidPayloadLength) }
         let magic = UInt32(littleEndian: magicRaw)
 
-        var commandBytes = [UInt8](data[4..<16])
-        // Remove null padding
-        if let nullIndex = commandBytes.firstIndex(of: 0) {
-            commandBytes = Array(commandBytes[..<nullIndex])
+        let commandBytes = [UInt8](data[4..<16])
+        let commandResult = parseCommand(from: commandBytes)
+        if case .failure(let error) = commandResult {
+            return .invalid(error)
         }
-        let command = String(bytes: commandBytes, encoding: .utf8) ?? ""
 
-        guard let lengthRaw: UInt32 = data.readInteger(at: 16) else { return nil }
+        guard let lengthRaw: UInt32 = data.readInteger(at: 16) else { return .invalid(.invalidPayloadLength) }
         let length = UInt32(littleEndian: lengthRaw)
-        let checksum = Data(data[20..<24])
 
-        // Validate length
         guard length <= NetworkConstants.maxPayloadSize else {
-            return nil
+            return .invalid(.invalidPayloadLength)
         }
 
         let totalSize = NetworkConstants.headerSize + Int(length)
         guard data.count >= totalSize else {
-            return nil
+            return .incomplete
         }
 
-        // Extract payload
+        let checksum = Data(data[20..<24])
         let payload = Data(data[NetworkConstants.headerSize..<totalSize])
 
-        // Verify checksum
         let computedChecksum = computeChecksum(payload)
         guard checksum == computedChecksum else {
-            return nil
+            return .invalid(.invalidChecksum)
         }
 
+        guard case .success(let command) = commandResult else {
+            return .invalid(.invalidCommand)
+        }
         let message = ProtocolMessage(magic: magic, command: command, payload: payload)
         let remaining = Data(data[totalSize...])
 
-        return (message, remaining)
+        return .message(message, remaining)
+    }
+
+    static func isValidCommand(_ command: String) -> Bool {
+        guard !command.isEmpty, command.count <= NetworkConstants.commandLength else { return false }
+        for scalar in command.unicodeScalars {
+            let value = scalar.value
+            let isLowercase = value >= 0x61 && value <= 0x7a
+            let isDigit = value >= 0x30 && value <= 0x39
+            if !(isLowercase || isDigit) {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func parseCommand(from bytes: [UInt8]) -> Result<String, ParseError> {
+        if let nullIndex = bytes.firstIndex(of: 0) {
+            if bytes[(nullIndex + 1)...].contains(where: { $0 != 0 }) {
+                return .failure(.invalidCommandPadding)
+            }
+            let trimmed = Array(bytes[..<nullIndex])
+            guard let command = String(bytes: trimmed, encoding: .utf8), isValidCommand(command) else {
+                return .failure(.invalidCommand)
+            }
+            return .success(command)
+        }
+
+        guard let command = String(bytes: bytes, encoding: .utf8), isValidCommand(command) else {
+            return .failure(.invalidCommand)
+        }
+        return .success(command)
     }
 }
 

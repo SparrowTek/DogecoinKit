@@ -33,14 +33,31 @@ public final class PeerManager: @unchecked Sendable {
     /// All known peers
     private var peers: [Peer] = []
 
-    /// Addresses discovered from DNS seeds
-    private var discoveredAddresses: [String] = []
+    /// Addresses discovered from DNS seeds and peers
+    private var discoveredAddresses: [String: UInt16] = [:]
+
+    private struct PeerHistory: Sendable {
+        var score: Int = 0
+        var consecutiveFailures: Int = 0
+        var backoffUntil: Date?
+    }
+
+    private var peerHistory: [String: PeerHistory] = [:]
 
     /// Banned peer addresses with ban expiration time
     private var bannedPeers: [String: Date] = [:]
 
     /// Ban duration in seconds (default: 24 hours)
     public var banDuration: TimeInterval = 86400
+
+    /// Misbehavior score that triggers a ban
+    public var misbehaviorBanThreshold: Int = 100
+
+    /// Base backoff delay after failures
+    public var baseBackoff: TimeInterval = 30
+
+    /// Maximum backoff delay
+    public var maxBackoff: TimeInterval = 3600
 
     /// Lock for thread safety
     private let lock = NSLock()
@@ -127,8 +144,13 @@ public final class PeerManager: @unchecked Sendable {
             return
         }
 
+        guard !isHostBackedOff(peer.host) else {
+            logger.debug("Backoff active for peer \(peer.host)")
+            return
+        }
+
         lock.lock()
-        guard !peers.contains(peer) else {
+        guard !peers.contains(where: { $0.host == peer.host && $0.port == peer.port }) else {
             lock.unlock()
             return
         }
@@ -381,6 +403,49 @@ public final class PeerManager: @unchecked Sendable {
         }
     }
 
+    private func handleAddrMessage(_ message: AddrMessage, from peer: Peer) {
+        guard !message.entries.isEmpty else { return }
+
+        var added = 0
+        for entry in message.entries {
+            guard entry.address.isRoutable,
+                  let host = entry.address.addressString,
+                  entry.address.port > 0 else {
+                continue
+            }
+
+            addDiscoveredAddress(host: host, port: entry.address.port)
+            added += 1
+        }
+
+        if added > 0 {
+            logger.info("Added \(added) addresses from \(peer.host)")
+            if connectedPeerCount < minPeerConnections {
+                connectToDiscoveredPeers()
+            }
+        }
+    }
+
+    private func handleGetAddr(from peer: Peer) {
+        lock.lock()
+        let candidates = Array(discoveredAddresses.prefix(100))
+        lock.unlock()
+
+        guard !candidates.isEmpty else { return }
+
+        let now = UInt32(Date().timeIntervalSince1970)
+        let entries: [AddrMessage.Entry] = candidates.compactMap { host, port in
+            guard let address = NetworkAddress.from(host: host, port: port) else { return nil }
+            guard address.isRoutable else { return nil }
+            return AddrMessage.Entry(timestamp: now, address: address)
+        }
+
+        let addrMessage = AddrMessage(entries: entries)
+        let payload = addrMessage.serialize()
+        let message = ProtocolMessage(network: network, command: ProtocolMessage.Command.addr, payload: payload)
+        peer.send(message)
+    }
+
     private func resolveHost(_ hostname: String) {
         let host = CFHostCreateWithName(nil, hostname as CFString).takeRetainedValue()
         CFHostStartInfoResolution(host, .addresses, nil)
@@ -393,11 +458,9 @@ public final class PeerManager: @unchecked Sendable {
 
         for addressData in addresses {
             if let address = parseIPv4Address(addressData) {
-                lock.lock()
-                if !discoveredAddresses.contains(address) {
-                    discoveredAddresses.append(address)
-                }
-                lock.unlock()
+                addDiscoveredAddress(host: address, port: NetworkConstants.port(for: network))
+            } else if let address = parseIPv6Address(addressData) {
+                addDiscoveredAddress(host: address, port: NetworkConstants.port(for: network))
             }
         }
 
@@ -422,6 +485,23 @@ public final class PeerManager: @unchecked Sendable {
         }
     }
 
+    private func parseIPv6Address(_ data: Data) -> String? {
+        guard data.count >= MemoryLayout<sockaddr_in6>.size else { return nil }
+
+        return data.withUnsafeBytes { bytes -> String? in
+            guard let baseAddress = bytes.baseAddress else { return nil }
+            let sockaddr = baseAddress.assumingMemoryBound(to: sockaddr_in6.self).pointee
+
+            guard sockaddr.sin6_family == AF_INET6 else { return nil }
+
+            var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+            var addr = sockaddr.sin6_addr
+            inet_ntop(AF_INET6, &addr, &buffer, socklen_t(INET6_ADDRSTRLEN))
+
+            return String(cString: buffer)
+        }
+    }
+
     private func connectToDiscoveredPeers() {
         lock.lock()
         let currentPeerCount = peers.count
@@ -431,8 +511,9 @@ public final class PeerManager: @unchecked Sendable {
         let needed = maxPeerConnections - currentPeerCount
         guard needed > 0 else { return }
 
-        for address in addressesToTry.prefix(needed) {
-            addPeer(host: address)
+        let candidates = addressesToTry.prefix(needed)
+        for (address, port) in candidates {
+            addPeer(host: address, port: port)
         }
     }
 
@@ -463,6 +544,71 @@ public final class PeerManager: @unchecked Sendable {
         peers.removeAll { $0.state == .disconnected }
         lock.unlock()
     }
+
+    private func addDiscoveredAddress(host: String, port: UInt16) {
+        guard !isHostBanned(host), !isHostBackedOff(host) else { return }
+
+        lock.lock()
+        discoveredAddresses[host] = port
+        lock.unlock()
+    }
+
+    private func isHostBackedOff(_ host: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let history = peerHistory[host], let backoff = history.backoffUntil else {
+            return false
+        }
+
+        if backoff < Date() {
+            var updated = history
+            updated.backoffUntil = nil
+            peerHistory[host] = updated
+            return false
+        }
+
+        return true
+    }
+
+    private func recordMisbehavior(for peer: Peer, score: Int, reason: BanReason) {
+        let host = peer.host
+
+        lock.lock()
+        var history = peerHistory[host, default: PeerHistory()]
+        history.score += score
+        peerHistory[host] = history
+        let totalScore = history.score
+        lock.unlock()
+
+        if totalScore >= misbehaviorBanThreshold {
+            banPeer(peer, reason: reason)
+        }
+    }
+
+    private func recordConnectionFailure(for peer: Peer, reason: BanReason) {
+        let host = peer.host
+        let now = Date()
+
+        lock.lock()
+        var history = peerHistory[host, default: PeerHistory()]
+        history.consecutiveFailures += 1
+        let delay = min(maxBackoff, baseBackoff * pow(2.0, Double(max(0, history.consecutiveFailures - 1))))
+        history.backoffUntil = now.addingTimeInterval(delay)
+        peerHistory[host] = history
+        lock.unlock()
+
+        logger.warning("Backoff for \(host) set to \(Int(delay))s (\(reason.rawValue))")
+    }
+
+    private func recordSuccessfulConnection(for peer: Peer) {
+        lock.lock()
+        var history = peerHistory[peer.host, default: PeerHistory()]
+        history.consecutiveFailures = 0
+        history.backoffUntil = nil
+        peerHistory[peer.host] = history
+        lock.unlock()
+    }
 }
 
 // MARK: - PeerDelegate
@@ -473,6 +619,7 @@ extension PeerManager: PeerDelegate {
 
         switch state {
         case .ready:
+            recordSuccessfulConnection(for: peer)
             delegate?.peerManager(self, peerDidBecomeReady: peer)
             delegate?.peerManager(self, connectedPeerCountChanged: connectedPeerCount)
 
@@ -493,12 +640,45 @@ extension PeerManager: PeerDelegate {
             }
         }
 
+        if message.command == ProtocolMessage.Command.addr {
+            guard let addrMessage = AddrMessage.parse(from: message.payload) else {
+                recordMisbehavior(for: peer, score: 25, reason: .invalidMessage)
+                return
+            }
+            handleAddrMessage(addrMessage, from: peer)
+        }
+
+        if message.command == ProtocolMessage.Command.getaddr {
+            handleGetAddr(from: peer)
+        }
+
         // Forward to delegate for other handling
         delegate?.peerManager(self, peer: peer, didReceiveMessage: message)
     }
 
     public func peer(_ peer: Peer, didFailWithError error: Error) {
         logger.error("Peer \(peer.host) error: \(error.localizedDescription)")
+        if let peerError = error as? Peer.PeerError {
+            switch peerError {
+            case .invalidMagic:
+                recordMisbehavior(for: peer, score: 100, reason: .protocolViolation)
+            case .invalidMessage(let reason):
+                let score: Int
+                switch reason {
+                case .invalidChecksum, .invalidPayloadLength, .invalidCommandPadding:
+                    score = 50
+                case .invalidCommand:
+                    score = 25
+                }
+                recordMisbehavior(for: peer, score: score, reason: .invalidMessage)
+            case .timeout:
+                recordConnectionFailure(for: peer, reason: .timeout)
+            case .connectionFailed:
+                recordConnectionFailure(for: peer, reason: .timeout)
+            }
+        } else {
+            recordConnectionFailure(for: peer, reason: .timeout)
+        }
         removePeer(peer)
     }
 }

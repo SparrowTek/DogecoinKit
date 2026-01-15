@@ -189,6 +189,93 @@ public struct NetworkAddress: Sendable {
         return NetworkAddress(services: services, address: address, port: port)
     }
 
+    /// Create a network address from IPv6
+    public static func ipv6(_ ip: String, port: UInt16, services: UInt64 = 0) -> NetworkAddress? {
+        var addr = in6_addr()
+        let result = ip.withCString { inet_pton(AF_INET6, $0, &addr) }
+        guard result == 1 else { return nil }
+
+        let data = Data(bytes: &addr, count: MemoryLayout<in6_addr>.size)
+        return NetworkAddress(services: services, address: data, port: port)
+    }
+
+    /// Create a network address from a host string
+    public static func from(host: String, port: UInt16, services: UInt64 = 0) -> NetworkAddress? {
+        if host.contains(":") {
+            return ipv6(host, port: port, services: services)
+        }
+
+        return ipv4(host, port: port, services: services)
+    }
+
+    /// Whether this address is IPv4-mapped
+    public var isIPv4Mapped: Bool {
+        guard address.count == 16 else { return false }
+        let prefix = address.prefix(12)
+        var mappedPrefix = Data(repeating: 0, count: 10)
+        mappedPrefix.append(0xFF)
+        mappedPrefix.append(0xFF)
+        return prefix == mappedPrefix
+    }
+
+    /// String representation of the address
+    public var addressString: String? {
+        if isIPv4Mapped {
+            let octets = address.suffix(4).map { String($0) }
+            return octets.joined(separator: ".")
+        }
+
+        guard address.count == 16 else { return nil }
+        var addr = in6_addr()
+        _ = withUnsafeMutableBytes(of: &addr) { buffer in
+            address.copyBytes(to: buffer)
+        }
+        var output = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+        guard inet_ntop(AF_INET6, &addr, &output, socklen_t(INET6_ADDRSTRLEN)) != nil else {
+            return nil
+        }
+        return String(cString: output)
+    }
+
+    /// Basic routability check (filters local/invalid addresses)
+    public var isRoutable: Bool {
+        if isIPv4Mapped {
+            let bytes = Array(address.suffix(4))
+            guard bytes.count == 4 else { return false }
+            let a = bytes[0]
+            let b = bytes[1]
+            if a == 0 || a == 10 || a == 127 || a >= 224 {
+                return false
+            }
+            if a == 192 && b == 168 {
+                return false
+            }
+            if a == 172 && (16...31).contains(b) {
+                return false
+            }
+            if a == 169 && b == 254 {
+                return false
+            }
+            return true
+        }
+
+        guard address.count == 16 else { return false }
+        let bytes = [UInt8](address)
+        if bytes.allSatisfy({ $0 == 0 }) {
+            return false
+        }
+        if bytes.dropFirst(15).first == 1 && bytes.prefix(15).allSatisfy({ $0 == 0 }) {
+            return false
+        }
+        if bytes[0] == 0xff {
+            return false
+        }
+        if bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80 {
+            return false
+        }
+        return true
+    }
+
     /// Serialize to Data (26 bytes - without timestamp)
     public func serialize() -> Data {
         var data = Data()
