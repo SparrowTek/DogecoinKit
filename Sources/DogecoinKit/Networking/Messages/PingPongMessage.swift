@@ -21,7 +21,8 @@ public struct PingMessage: Sendable {
     /// Parse from Data
     public static func parse(from data: Data) -> PingMessage? {
         guard data.count >= 8 else { return nil }
-        let nonce = data.withUnsafeBytes { $0.load(as: UInt64.self).littleEndian }
+        guard let nonceRaw: UInt64 = data.readInteger(at: 0) else { return nil }
+        let nonce = UInt64(littleEndian: nonceRaw)
         return PingMessage(nonce: nonce)
     }
 }
@@ -52,7 +53,8 @@ public struct PongMessage: Sendable {
     /// Parse from Data
     public static func parse(from data: Data) -> PongMessage? {
         guard data.count >= 8 else { return nil }
-        let nonce = data.withUnsafeBytes { $0.load(as: UInt64.self).littleEndian }
+        guard let nonceRaw: UInt64 = data.readInteger(at: 0) else { return nil }
+        let nonce = UInt64(littleEndian: nonceRaw)
         return PongMessage(nonce: nonce)
     }
 }

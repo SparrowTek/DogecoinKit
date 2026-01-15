@@ -49,8 +49,8 @@ public struct InventoryVector: Sendable, Equatable, Hashable {
     public static func parse(from data: Data) -> InventoryVector? {
         guard data.count >= 36 else { return nil }
 
-        let typeRaw = data.withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
-        let type = InventoryType(rawValue: typeRaw) ?? .error
+        guard let typeRaw: UInt32 = data.readInteger(at: 0) else { return nil }
+        let type = InventoryType(rawValue: UInt32(littleEndian: typeRaw)) ?? .error
         let hash = Data(data[4..<36])
 
         return InventoryVector(type: type, hash: hash)

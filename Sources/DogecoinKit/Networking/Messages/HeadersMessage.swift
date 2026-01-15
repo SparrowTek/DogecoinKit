@@ -87,12 +87,16 @@ public struct BlockHeader: Sendable, Equatable {
     public static func parse(from data: Data) -> BlockHeader? {
         guard data.count >= Self.size else { return nil }
 
-        let version = data.withUnsafeBytes { $0.load(fromByteOffset: 0, as: Int32.self).littleEndian }
+        guard let versionRaw: Int32 = data.readInteger(at: 0) else { return nil }
+        let version = Int32(littleEndian: versionRaw)
         let prevBlock = Data(data[4..<36])
         let merkleRoot = Data(data[36..<68])
-        let timestamp = data.withUnsafeBytes { $0.load(fromByteOffset: 68, as: UInt32.self).littleEndian }
-        let bits = data.withUnsafeBytes { $0.load(fromByteOffset: 72, as: UInt32.self).littleEndian }
-        let nonce = data.withUnsafeBytes { $0.load(fromByteOffset: 76, as: UInt32.self).littleEndian }
+        guard let timestampRaw: UInt32 = data.readInteger(at: 68) else { return nil }
+        guard let bitsRaw: UInt32 = data.readInteger(at: 72) else { return nil }
+        guard let nonceRaw: UInt32 = data.readInteger(at: 76) else { return nil }
+        let timestamp = UInt32(littleEndian: timestampRaw)
+        let bits = UInt32(littleEndian: bitsRaw)
+        let nonce = UInt32(littleEndian: nonceRaw)
 
         return BlockHeader(
             version: version,

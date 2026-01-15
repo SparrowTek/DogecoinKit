@@ -71,7 +71,8 @@ public struct ProtocolMessage: Sendable {
         }
 
         // Parse header
-        let magic = data.withUnsafeBytes { $0.load(fromByteOffset: 0, as: UInt32.self).littleEndian }
+        guard let magicRaw: UInt32 = data.readInteger(at: 0) else { return nil }
+        let magic = UInt32(littleEndian: magicRaw)
 
         var commandBytes = [UInt8](data[4..<16])
         // Remove null padding
@@ -80,7 +81,8 @@ public struct ProtocolMessage: Sendable {
         }
         let command = String(bytes: commandBytes, encoding: .utf8) ?? ""
 
-        let length = data.withUnsafeBytes { $0.load(fromByteOffset: 16, as: UInt32.self).littleEndian }
+        guard let lengthRaw: UInt32 = data.readInteger(at: 16) else { return nil }
+        let length = UInt32(littleEndian: lengthRaw)
         let checksum = Data(data[20..<24])
 
         // Validate length

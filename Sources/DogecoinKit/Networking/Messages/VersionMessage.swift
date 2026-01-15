@@ -98,13 +98,16 @@ public struct VersionMessage: Sendable {
 
         var offset = 0
 
-        let version = data.withUnsafeBytes { $0.load(fromByteOffset: offset, as: UInt32.self).littleEndian }
+        guard let versionRaw: UInt32 = data.readInteger(at: offset) else { return nil }
+        let version = UInt32(littleEndian: versionRaw)
         offset += 4
 
-        let services = data.withUnsafeBytes { $0.load(fromByteOffset: offset, as: UInt64.self).littleEndian }
+        guard let servicesRaw: UInt64 = data.readInteger(at: offset) else { return nil }
+        let services = UInt64(littleEndian: servicesRaw)
         offset += 8
 
-        let timestamp = data.withUnsafeBytes { $0.load(fromByteOffset: offset, as: Int64.self).littleEndian }
+        guard let timestampRaw: Int64 = data.readInteger(at: offset) else { return nil }
+        let timestamp = Int64(littleEndian: timestampRaw)
         offset += 8
 
         guard let addrRecv = NetworkAddress.parse(from: Data(data[offset..<offset+26])) else { return nil }
@@ -113,7 +116,8 @@ public struct VersionMessage: Sendable {
         guard let addrFrom = NetworkAddress.parse(from: Data(data[offset..<offset+26])) else { return nil }
         offset += 26
 
-        let nonce = data.withUnsafeBytes { $0.load(fromByteOffset: offset, as: UInt64.self).littleEndian }
+        guard let nonceRaw: UInt64 = data.readInteger(at: offset) else { return nil }
+        let nonce = UInt64(littleEndian: nonceRaw)
         offset += 8
 
         // Parse var_str for user agent
@@ -126,7 +130,8 @@ public struct VersionMessage: Sendable {
         offset = userAgentEnd
 
         guard data.count >= offset + 4 else { return nil }
-        let startHeight = data.withUnsafeBytes { $0.load(fromByteOffset: offset, as: Int32.self).littleEndian }
+        guard let startHeightRaw: Int32 = data.readInteger(at: offset) else { return nil }
+        let startHeight = Int32(littleEndian: startHeightRaw)
         offset += 4
 
         let relay: Bool
@@ -203,9 +208,11 @@ public struct NetworkAddress: Sendable {
     public static func parse(from data: Data) -> NetworkAddress? {
         guard data.count >= 26 else { return nil }
 
-        let services = data.withUnsafeBytes { $0.load(fromByteOffset: 0, as: UInt64.self).littleEndian }
+        guard let servicesRaw: UInt64 = data.readInteger(at: 0) else { return nil }
+        let services = UInt64(littleEndian: servicesRaw)
         let address = Data(data[8..<24])
-        let port = data.withUnsafeBytes { $0.load(fromByteOffset: 24, as: UInt16.self).bigEndian }
+        guard let portRaw: UInt16 = data.readInteger(at: 24) else { return nil }
+        let port = UInt16(bigEndian: portRaw)
 
         return NetworkAddress(services: services, address: address, port: port)
     }
@@ -254,15 +261,18 @@ public struct VarInt: Sendable {
             return (UInt64(first), 1)
         } else if first == 0xFD {
             guard data.count >= 3 else { return nil }
-            let value = data.withUnsafeBytes { $0.load(fromByteOffset: 1, as: UInt16.self).littleEndian }
+            guard let valueRaw: UInt16 = data.readInteger(at: 1) else { return nil }
+            let value = UInt16(littleEndian: valueRaw)
             return (UInt64(value), 3)
         } else if first == 0xFE {
             guard data.count >= 5 else { return nil }
-            let value = data.withUnsafeBytes { $0.load(fromByteOffset: 1, as: UInt32.self).littleEndian }
+            guard let valueRaw: UInt32 = data.readInteger(at: 1) else { return nil }
+            let value = UInt32(littleEndian: valueRaw)
             return (UInt64(value), 5)
         } else {
             guard data.count >= 9 else { return nil }
-            let value = data.withUnsafeBytes { $0.load(fromByteOffset: 1, as: UInt64.self).littleEndian }
+            guard let valueRaw: UInt64 = data.readInteger(at: 1) else { return nil }
+            let value = UInt64(littleEndian: valueRaw)
             return (value, 9)
         }
     }
