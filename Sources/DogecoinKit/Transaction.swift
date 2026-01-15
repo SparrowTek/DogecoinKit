@@ -245,6 +245,9 @@ public struct SignedTransaction: Sendable, Equatable, Hashable {
     /// The raw transaction hex
     public let rawHex: String
 
+    /// The effective fee used when building the transaction, if known
+    public let fee: DogecoinAmount?
+
     /// The transaction ID (computed from the raw hex)
     public var txid: String {
         // Transaction ID is the double SHA256 of the raw tx, reversed
@@ -254,9 +257,20 @@ public struct SignedTransaction: Sendable, Equatable, Hashable {
     }
 
     /// Create from raw hex
-    public init(rawHex: String) {
+    public init(rawHex: String, fee: DogecoinAmount? = nil) {
         self.rawHex = rawHex
+        self.fee = fee
     }
+}
+
+// MARK: - Internal Planning
+
+struct TransactionPlan: Sendable, Equatable {
+    let fee: DogecoinAmount
+    let change: DogecoinAmount
+    let changeAddress: String?
+    let outputCount: Int
+    let estimatedSize: Int
 }
 
 // MARK: - Convenience Functions
@@ -307,7 +321,12 @@ public func createTransaction(
     changeAddress: String? = nil,
     fee: DogecoinAmount
 ) throws -> SignedTransaction {
-    try validateTransaction(inputs: inputs, outputs: outputs, fee: fee)
+    let plan = try planTransaction(
+        inputs: inputs,
+        outputs: outputs,
+        fee: fee,
+        changeAddress: changeAddress
+    )
 
     let builder = try TransactionBuilder()
 
@@ -327,9 +346,9 @@ public func createTransaction(
 
     _ = try builder.finalize(
         destinationAddress: firstOutput.address,
-        fee: fee,
+        fee: plan.fee,
         totalAmount: totalInput,
-        changeAddress: changeAddress ?? inputs.first?.address
+        changeAddress: plan.changeAddress
     )
 
     for (index, input) in inputs.enumerated() {
@@ -340,14 +359,15 @@ public func createTransaction(
     }
 
     let rawHex = try builder.getRawTransaction()
-    return SignedTransaction(rawHex: rawHex)
+    return SignedTransaction(rawHex: rawHex, fee: plan.fee)
 }
 
-private func validateTransaction(
+func planTransaction(
     inputs: [UTXO],
     outputs: [(address: String, amount: DogecoinAmount)],
-    fee: DogecoinAmount
-) throws {
+    fee: DogecoinAmount,
+    changeAddress: String?
+) throws -> TransactionPlan {
     guard !inputs.isEmpty else {
         throw DogecoinError.transactionValidationFailed("Transaction requires at least one input")
     }
@@ -363,11 +383,52 @@ private func validateTransaction(
         throw DogecoinError.transactionValidationFailed("Output amount must be greater than zero")
     }
 
+    var feeToUse = fee
+    if feeToUse < FeeEstimation.minimumFee {
+        feeToUse = FeeEstimation.minimumFee
+    }
+
     let totalInput = inputs.reduce(DogecoinAmount.zero) { $0 + $1.amount }
     let totalOutput = outputs.reduce(DogecoinAmount.zero) { $0 + $1.amount }
-    let required = totalOutput + fee
+    let required = totalOutput + feeToUse
 
     guard totalInput >= required else {
         throw DogecoinError.transactionValidationFailed("Inputs do not cover outputs and fee")
     }
+
+    var change = totalInput - required
+
+    if change.koinu > 0 && change < FeeEstimation.dustThreshold {
+        feeToUse += change
+        change = .zero
+    }
+
+    let shouldIncludeChange = change.koinu > 0
+    let outputCount = outputs.count + (shouldIncludeChange ? 1 : 0)
+    let estimatedSize = FeeEstimation.estimateTransactionSize(
+        inputCount: inputs.count,
+        outputCount: outputCount
+    )
+
+    guard estimatedSize <= FeeEstimation.maxStandardTxSize else {
+        throw DogecoinError.transactionValidationFailed("Transaction exceeds standard size limit")
+    }
+
+    let effectiveChangeAddress: String?
+    if shouldIncludeChange {
+        effectiveChangeAddress = changeAddress ?? inputs.first?.address
+        guard effectiveChangeAddress != nil else {
+            throw DogecoinError.transactionValidationFailed("Missing change address")
+        }
+    } else {
+        effectiveChangeAddress = nil
+    }
+
+    return TransactionPlan(
+        fee: feeToUse,
+        change: change,
+        changeAddress: effectiveChangeAddress,
+        outputCount: outputCount,
+        estimatedSize: estimatedSize
+    )
 }

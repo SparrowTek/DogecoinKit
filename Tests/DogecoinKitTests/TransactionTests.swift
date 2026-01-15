@@ -104,4 +104,58 @@ struct TransactionTests {
         #expect(!signedTx.rawHex.isEmpty)
         #expect(signedTx.txid.count == 64)
     }
+
+    @Test("Planning folds dust change into fee")
+    func testPlanDropsDustChange() throws {
+        let mnemonic = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote"
+        let wallet = try HDWallet(mnemonic: mnemonic, passphrase: "", network: .mainnet)
+        let address = try wallet.deriveAddress(account: 0, index: 0, change: false)
+
+        let input = UTXO(
+            txid: String(repeating: "e", count: 64),
+            vout: 0,
+            address: address,
+            amount: DogecoinAmount(doge: 1),
+            scriptPubKey: nil,
+            confirmations: 6
+        )
+
+        let plan = try planTransaction(
+            inputs: [input],
+            outputs: [(address: address, amount: DogecoinAmount(doge: 0.985))],
+            fee: DogecoinAmount(doge: 0.01),
+            changeAddress: address
+        )
+
+        #expect(plan.change.koinu == 0)
+        #expect(plan.fee > DogecoinAmount(doge: 0.01))
+        #expect(plan.outputCount == 1)
+    }
+
+    @Test("Planning enforces standard size limits")
+    func testPlanRejectsOversizedTransaction() throws {
+        let mnemonic = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote"
+        let wallet = try HDWallet(mnemonic: mnemonic, passphrase: "", network: .mainnet)
+        let address = try wallet.deriveAddress(account: 0, index: 0, change: false)
+
+        let utxos = (0..<700).map { index in
+            UTXO(
+                txid: String(repeating: "f", count: 64),
+                vout: index,
+                address: address,
+                amount: DogecoinAmount(doge: 1),
+                scriptPubKey: nil,
+                confirmations: 6
+            )
+        }
+
+        #expect(throws: DogecoinError.self) {
+            _ = try planTransaction(
+                inputs: utxos,
+                outputs: [(address: address, amount: DogecoinAmount(doge: 10))],
+                fee: DogecoinAmount(doge: 1),
+                changeAddress: address
+            )
+        }
+    }
 }

@@ -18,6 +18,12 @@ public enum FeeEstimation {
     /// Minimum recommended fee: 0.01 DOGE (dust threshold)
     public static let minimumFee = DogecoinAmount(koinu: 1_000_000)
 
+    /// Dust threshold for change outputs
+    public static let dustThreshold = minimumFee
+
+    /// Maximum standard transaction size in bytes
+    public static let maxStandardTxSize = 100_000
+
     // MARK: - Size Constants
 
     /// Base transaction size in bytes (version 4 + locktime 4 + varint overhead ~2)
