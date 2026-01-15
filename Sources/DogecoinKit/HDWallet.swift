@@ -12,6 +12,7 @@ public final class HDWallet: Sendable {
 
     /// The network this wallet belongs to
     public let network: DogecoinNetwork
+    
 
     /// Create an HD wallet from a mnemonic phrase
     /// - Parameters:
@@ -22,41 +23,35 @@ public final class HDWallet: Sendable {
     public init(mnemonic: String, passphrase: String = "", network: DogecoinNetwork = .mainnet) throws {
         try Dogecoin.ensureInitialized()
 
-        // First, generate a master key for this network
-        var masterKeyBuffer = [CChar](repeating: 0, count: Int(HDKEYLEN))
-        var addressBuffer = [CChar](repeating: 0, count: Int(P2PKHLEN))
-
-        let genResult = generateHDMasterPubKeypair(&masterKeyBuffer, &addressBuffer, network.isTestnet)
-
-        guard genResult == 1 else {
-            throw DogecoinError.keyGenerationFailed
+        var seed = [UInt8](repeating: 0, count: Int(MAX_SEED_SIZE))
+        let seedResult = mnemonic.withCString { mnemonicPtr in
+            passphrase.withCString { passPtr in
+                seed.withUnsafeMutableBufferPointer { seedBuffer in
+                    dogecoin_seed_from_mnemonic(mnemonicPtr, passPtr, seedBuffer.baseAddress)
+                }
+            }
         }
 
-        // Verify we can derive an address from the mnemonic (validates the mnemonic)
-        var testAddress = [CChar](repeating: 0, count: Int(P2PKHLEN))
-        var changeLevel: [CChar] = [0x30, 0]  // "0"
-
-        var mnemonicBuffer = Array(mnemonic.utf8CString)
-        while mnemonicBuffer.count < Int(MAX_MNEMONIC_SIZE) { mnemonicBuffer.append(0) }
-
-        var passBuffer = Array(passphrase.utf8CString)
-        while passBuffer.count < 256 { passBuffer.append(0) }
-
-        let result = getDerivedHDAddressFromMnemonic(
-            0,      // account
-            0,      // index
-            &changeLevel,
-            &mnemonicBuffer,
-            &passBuffer,
-            &testAddress,
-            network.isTestnetBool
-        )
-
-        guard result == 0 else {
+        guard seedResult == 0 else {
             throw DogecoinError.invalidMnemonic
         }
 
-        self.masterKey = String(cString: masterKeyBuffer)
+        var masterKeyBuffer = [CChar](repeating: 0, count: Int(HDKEYLEN))
+        let masterResult: dogecoin_bool = seed.withUnsafeBufferPointer { seedBuffer in
+            guard let seedPtr = seedBuffer.baseAddress else { return dogecoin_bool(0) }
+            return getHDRootKeyFromSeed(seedPtr, Int32(MAX_SEED_SIZE), network.isTestnet, &masterKeyBuffer)
+        }
+
+        guard masterResult == dogecoin_bool(1) else {
+            throw DogecoinError.keyGenerationFailed
+        }
+
+        let masterKey = Self.stringFromCStringBuffer(masterKeyBuffer)
+        guard !masterKey.isEmpty else {
+            throw DogecoinError.keyGenerationFailed
+        }
+
+        self.masterKey = masterKey
         self.mnemonic = mnemonic
         self.network = network
     }
@@ -94,7 +89,7 @@ public final class HDWallet: Sendable {
         }
 
         let wallet = HDWallet(
-            masterKey: String(cString: masterKeyBuffer),
+            masterKey: Self.stringFromCStringBuffer(masterKeyBuffer),
             mnemonic: nil,
             network: network
         )
@@ -118,39 +113,7 @@ public final class HDWallet: Sendable {
     /// - Throws: `DogecoinError.derivationFailed` if derivation fails
     public func deriveAddress(account: UInt32 = 0, index: UInt32 = 0, change: Bool = false) throws -> String {
         try Dogecoin.ensureInitialized()
-
-        if let mnemonic = self.mnemonic {
-            return try deriveAddressFromMnemonic(mnemonic: mnemonic, account: account, index: index, change: change)
-        } else {
-            return try deriveAddressFromMasterKey(account: account, index: index, change: change)
-        }
-    }
-
-    /// Derive an address using the mnemonic
-    private func deriveAddressFromMnemonic(mnemonic: String, account: UInt32, index: UInt32, change: Bool) throws -> String {
-        var addressBuffer = [CChar](repeating: 0, count: Int(P2PKHLEN))
-        var changeLevel: [CChar] = change ? [0x31, 0] : [0x30, 0]  // "1" or "0"
-
-        var mnemonicBuffer = Array(mnemonic.utf8CString)
-        while mnemonicBuffer.count < Int(MAX_MNEMONIC_SIZE) { mnemonicBuffer.append(0) }
-
-        var passBuffer: [CChar] = [0]  // empty passphrase
-
-        let result = getDerivedHDAddressFromMnemonic(
-            account,
-            index,
-            &changeLevel,
-            &mnemonicBuffer,
-            &passBuffer,
-            &addressBuffer,
-            network.isTestnetBool
-        )
-
-        guard result == 0 else {
-            throw DogecoinError.derivationFailed
-        }
-
-        return String(cString: addressBuffer)
+        return try deriveAddressFromMasterKey(account: account, index: index, change: change)
     }
 
     /// Derive an address using the master key directly
@@ -158,22 +121,26 @@ public final class HDWallet: Sendable {
         var masterKeyBuffer = Array(masterKey.utf8CString)
         while masterKeyBuffer.count < Int(HDKEYLEN) { masterKeyBuffer.append(0) }
 
+        let coinType = network == .mainnet ? "3" : "1"
+        let path = "m/44'/\(coinType)'/\(account)'/\(change ? 1 : 0)/\(index)"
+
+        var pathBuffer = Array(path.utf8CString)
+        while pathBuffer.count < Int(KEYPATHMAXLEN) { pathBuffer.append(0) }
+
         var addressBuffer = [CChar](repeating: 0, count: Int(P2PKHLEN))
 
-        let result = getDerivedHDAddress(
+        let result = getDerivedHDAddressByPath(
             &masterKeyBuffer,
-            account,
-            change ? 1 : 0,
-            index,
+            &pathBuffer,
             &addressBuffer,
-            0  // Don't output private key
+            0
         )
 
-        guard result == 0 else {
+        guard result == 1 else {
             throw DogecoinError.derivationFailed
         }
 
-        return String(cString: addressBuffer)
+        return Self.stringFromCStringBuffer(addressBuffer)
     }
 
     /// Derive an address at a custom derivation path
@@ -199,11 +166,11 @@ public final class HDWallet: Sendable {
             0  // Don't output private key
         )
 
-        guard result == 0 else {
+        guard result == 1 else {
             throw DogecoinError.derivationFailed
         }
 
-        return String(cString: addressBuffer)
+        return Self.stringFromCStringBuffer(addressBuffer)
     }
 
     /// Generate multiple addresses for this wallet
@@ -357,6 +324,13 @@ public func generateMnemonic(strength: MnemonicStrength = .words12) throws -> St
     }
 
     return String(cString: mnemonic)
+}
+
+private extension HDWallet {
+    static func stringFromCStringBuffer(_ buffer: [CChar]) -> String {
+        let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        return String(bytes: bytes, encoding: .utf8) ?? ""
+    }
 }
 
 /// Validate a BIP39 mnemonic phrase using full BIP39 checksum validation

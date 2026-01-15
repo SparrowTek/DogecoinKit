@@ -8,6 +8,8 @@ import Foundation
 @Suite("Secure Key Storage Tests")
 struct SecureKeyStorageTests {
 
+    private static let keychainAvailable = SecureKeyStorageTests.checkKeychainAvailability()
+
     let storage: SecureKeyStorage
 
     init() {
@@ -15,10 +17,26 @@ struct SecureKeyStorageTests {
         storage = SecureKeyStorage(serviceName: "com.dogecoinkit.tests")
     }
 
+    private static func checkKeychainAvailability() -> Bool {
+        let probe = SecureKeyStorage(serviceName: "com.dogecoinkit.tests.availability")
+        do {
+            let id = try probe.storeMasterKey("availability", network: .testnet)
+            try probe.deleteMasterKey(id: id)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func requireKeychain() -> Bool {
+        Self.keychainAvailable
+    }
+
     // MARK: - Wallet Credentials Tests
 
     @Test("Store and retrieve wallet credentials")
     func testStoreAndRetrieveCredentials() throws {
+        guard requireKeychain() else { return }
         let mnemonic = try generateMnemonic(strength: .words12)
         let passphrase = "testpassphrase"
         let network = DogecoinNetwork.testnet
@@ -45,6 +63,7 @@ struct SecureKeyStorageTests {
 
     @Test("Wallet credentials with empty passphrase")
     func testCredentialsEmptyPassphrase() throws {
+        guard requireKeychain() else { return }
         let mnemonic = try generateMnemonic(strength: .words12)
 
         let id = try storage.storeWalletCredentials(
@@ -62,6 +81,7 @@ struct SecureKeyStorageTests {
 
     @Test("Delete wallet credentials")
     func testDeleteCredentials() throws {
+        guard requireKeychain() else { return }
         let mnemonic = try generateMnemonic(strength: .words12)
 
         let id = try storage.storeWalletCredentials(
@@ -81,6 +101,7 @@ struct SecureKeyStorageTests {
 
     @Test("Retrieve non-existent credentials throws error")
     func testRetrieveNonExistent() throws {
+        guard requireKeychain() else { return }
         let fakeID = UUID().uuidString
 
         #expect(throws: DogecoinError.self) {
@@ -92,6 +113,7 @@ struct SecureKeyStorageTests {
 
     @Test("Store and retrieve master key")
     func testMasterKeyStorage() throws {
+        guard requireKeychain() else { return }
         let wallet = try HDWallet.create(strength: .words12, network: .testnet)
 
         let id = try storage.storeMasterKey(wallet.masterKey, network: .testnet)
@@ -108,6 +130,7 @@ struct SecureKeyStorageTests {
 
     @Test("Store and retrieve private key")
     func testPrivateKeyStorage() throws {
+        guard requireKeychain() else { return }
         let keyPair = try KeyPair.generate(network: .testnet)
 
         let id = try storage.storePrivateKey(keyPair.privateKeyWIF, address: keyPair.address)
@@ -124,6 +147,7 @@ struct SecureKeyStorageTests {
 
     @Test("Create and store wallet")
     func testCreateAndStoreWallet() throws {
+        guard requireKeychain() else { return }
         let (wallet, keychainID) = try storage.createAndStoreWallet(
             strength: .words12,
             network: .testnet
@@ -144,6 +168,7 @@ struct SecureKeyStorageTests {
 
     @Test("Import and store wallet")
     func testImportAndStoreWallet() throws {
+        guard requireKeychain() else { return }
         let mnemonic = try generateMnemonic(strength: .words12)
 
         let (wallet, keychainID) = try storage.importAndStoreWallet(
@@ -166,6 +191,7 @@ struct SecureKeyStorageTests {
 
     @Test("Restore wallet from stored credentials")
     func testRestoreWallet() throws {
+        guard requireKeychain() else { return }
         // First create and store
         let originalMnemonic = try generateMnemonic(strength: .words12)
         let keychainID = try storage.storeWalletCredentials(
@@ -192,6 +218,7 @@ struct SecureKeyStorageTests {
 
     @Test("Store multiple wallets with unique IDs")
     func testMultipleWallets() throws {
+        guard requireKeychain() else { return }
         let mnemonic1 = try generateMnemonic(strength: .words12)
         let mnemonic2 = try generateMnemonic(strength: .words12)
 
