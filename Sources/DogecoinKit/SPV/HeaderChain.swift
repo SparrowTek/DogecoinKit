@@ -1,5 +1,6 @@
 import Foundation
 import os.log
+import clibdogecoin
 
 /// Stored block header with additional metadata
 public struct StoredHeader: Sendable, Codable {
@@ -9,11 +10,11 @@ public struct StoredHeader: Sendable, Codable {
     /// The block height
     public let height: Int32
 
-    /// Cumulative chain work (simplified)
+    /// Cumulative chain work
     public let chainWork: Data
 
     /// Create a stored header
-    public init(header: BlockHeader, height: Int32, chainWork: Data = Data()) {
+    public init(header: BlockHeader, height: Int32, chainWork: Data = Data(repeating: 0, count: 32)) {
         self.header = header
         self.height = height
         self.chainWork = chainWork
@@ -58,7 +59,7 @@ public final class HeaderChain: @unchecked Sendable {
     /// Headers indexed by hash
     private var headersByHash: [Data: StoredHeader] = [:]
 
-    /// Headers indexed by height
+    /// Headers indexed by height for the best chain
     private var headersByHeight: [Int32: StoredHeader] = [:]
 
     /// The tip (highest) header
@@ -70,33 +71,63 @@ public final class HeaderChain: @unchecked Sendable {
     /// Logger
     private let logger = Logger(subsystem: "DogecoinKit", category: "HeaderChain")
 
-    /// Genesis block hash for mainnet (little-endian)
-    private static let mainnetGenesisHash = Data(hexString: "1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691")!
+    /// Chain parameters from libdogecoin
+    private let chainParams: dogecoin_chainparams
 
-    /// Genesis block hash for testnet (little-endian)
-    private static let testnetGenesisHash = Data(hexString: "a7ca9fdf8c2c0ed2a4b8c8a5e6f8e6b8c0d2e4f6a8b0c2d4e6f8a0b2c4d6e8f0")!
+    /// Cached warning state for auxpow handling
+    private var didLogAuxpowWarning = false
 
     // MARK: - Checkpoints
 
-    /// Hardcoded checkpoints for mainnet (height -> block hash in little-endian hex)
-    /// These protect against long-range attacks and allow faster initial sync
+    /// Checkpoints from libdogecoin chainparams (height -> block hash)
     private static let mainnetCheckpoints: [Int32: String] = [
         0: "1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691",
-        42279: "8444c3ef39a46222e87584ef956ad2c9ef401578bd8b51e8e4f7e7e98e85b0a4",
-        100000: "a5c72da9c6e7f00b2e6a1f8e3b7f30d70c9e3e6a8f0b2c4d6e8a0c2e4f6a8b0c",
-        200000: "b6d83eb0ae7f10c3f7b2a9e4c8d5f60e81d4f7b0c1e3f5a7b9c0d2e4f6a8b0c1",
-        300000: "c7e94fc1bf8021d4e8c3b0f5d9e6071f92e508c1d2f4a6b8c0e1d3f5a7b9c0d2",
-        400000: "d8f05ed2c09132e5f9d4c1062eaf182003f619d2e3f5b7c9d1e2f4a6b8c0d1e3",
-        500000: "e9016fe3d1a243f60ae5d2173fb0293114071ae3f4a6c8d0e2f3a5b7c9d1e2f4",
-        600000: "fa127af4e2b354071bf6e3284ac13a4225182bf4a5b7d9e1f3a4b6c8d0e2f3a5",
-        700000: "0b238b05f3c465182c07f4395bd24b5336293c05b6c8e0f2a4b5c7d9e1f3a4b6",
-        800000: "1c349c16a4d576293d18054a6ce35c6447304d16c7d9f1a3b5c6d8e0f2a4b5c7",
-        900000: "2d45ad27b5e687304e2916b7de46d7558415e27d8e0a2b4c6d7e9f1a3b5c6d8"
+        104679: "35eb87ae90d44b98898fec8c39577b76cb1eb08e1261cfc10706c8ce9a1d01cf",
+        145000: "cc47cae70d7c5c92828d3214a266331dde59087d4a39071fa76ddfff9b7bde72",
+        371337: "60323982f9c5ff1b5a954eac9dc1269352835f47c2c5222691d80f0d50dcf053",
+        450000: "d279277f8f846a224d776450aa04da3cf978991a182c6f3075db4c48b173bbd7",
+        771275: "1b7d789ed82cbdc640952e7e7a54966c6488a32eaad54fc39dff83f310dbaaed",
+        1000000: "6aae55bea74235f0c80bd066349d4440c31f2d0f27d54265ecd484d8c1d11b47",
+        1250000: "00c7a442055c1a990e11eea5371ca5c1c02a0677b33cc88ec728c45edc4ec060",
+        1500000: "f1d32d6920de7b617d51e74bdf4e58adccaa582ffdc8657464454f16a952fca6",
+        1750000: "5c8e7327984f0d6f59447d89d143e5f6eafc524c82ad95d176c5cec082ae2001",
+        2000000: "9914f0e82e39bbf21950792e8816620d71b9965bdbbc14e72a95e3ab9618fea8",
+        2031142: "893297d89afb7599a3c571ca31a3b80e8353f4cf39872400ad0f57d26c4c5d42",
+        2250000: "0a87a8d4e40dca52763f93812a288741806380cd569537039ee927045c6bc338",
+        2510150: "77e3f4a4bcb4a2c15e8015525e3d15b466f6c022f6ca82698f329edef7d9777e",
+        2750000: "d4f8abb835930d3c4f92ca718aaa09bef545076bd872354e0b2b85deefacf2e3",
+        3000000: "195a83b091fb3ee7ecb56f2e63d01709293f57f971ccf373d93890c8dc1033db",
+        3250000: "7f3e28bf9e309c4b57a4b70aa64d3b2ea5250ae797af84976ddc420d49684034",
+        3500000: "eaa303b93c1c64d2b3a2cdcf6ccf21b10cc36626965cc2619661e8e1879abdfb",
+        3606083: "954c7c66dee51f0a3fb1edb26200b735f5275fe54d9505c76ebd2bcabac36f1e",
+        3854173: "e4b4ecda4c022406c502a247c0525480268ce7abbbef632796e8ca1646425e75",
+        3963597: "2b6927cfaa5e82353d45f02be8aadd3bfd165ece5ce24b9bfa4db20432befb5d",
+        4303965: "ed7d266dcbd8bb8af80f9ccb8deb3e18f9cc3f6972912680feeb37b090f8cee0",
+        5050000: "e7d4577405223918491477db725a393bcfc349d8ee63b0a4fde23cbfbfd81dea",
+        5400000: "cbb1f4ae807da83e13bdf9c28188982938c9ee6bf560c1023f51adac229eef87"
     ]
 
-    /// Hardcoded checkpoints for testnet
+    /// Checkpoints from libdogecoin chainparams (height -> block hash)
     private static let testnetCheckpoints: [Int32: String] = [
-        0: "a7ca9fdf8c2c0ed2a4b8c8a5e6f8e6b8c0d2e4f6a8b0c2d4e6f8a0b2c4d6e8f0"
+        0: "bb0a78264637406b6360aad926284d544d7049f45189db5664f3c4d07350559e",
+        483173: "a804201ca0aceb7e937ef7a3c613a9b7589245b10cc095148c4ce4965b0b73b5",
+        591117: "5f6b93b2c28cedf32467d900369b8be6700f0649388a7dbfd3ebd4a01b1ffad8",
+        658924: "ed6c8324d9a77195ee080f225a0fca6346495e08ded99bcda47a8eea5a8a620b",
+        703635: "839fa54617adcd582d53030a37455c14a87a806f6615aa8213f13e196230ff7f",
+        1000000: "1fe4d44ea4d1edb031f52f0d7c635db8190dc871a190654c41d2450086b8ef0e",
+        1202214: "a2179767a87ee4e95944703976fee63578ec04fa3ac2fc1c9c2c83587d096977",
+        1250000: "b46affb421872ca8efa30366b09694e2f9bf077f7258213be14adb05a9f41883",
+        1500000: "0caa041b47b4d18a4f44bdc05cef1a96d5196ce7b2e32ad3e4eb9ba505144917",
+        1750000: "8042462366d854ad39b8b95ed2ca12e89a526ceee5a90042d55ebb24d5aab7e9",
+        2000000: "d6acde73e1b42fc17f29dcc76f63946d378ae1bd4eafab44d801a25be784103c",
+        2250000: "c4342ae6d9a522a02e5607411df1b00e9329563ef844a758d762d601d42c86dc",
+        2500000: "3a66ec4933fbb348c9b1889aaf2f732fe429fd9a8f74fee6895eae061ac897e2",
+        2750000: "473ea9f625d59f534ffcc9738ffc58f7b7b1e0e993078614f5484a9505885563",
+        3062910: "113c41c00934f940a41f99d18b2ad9aefd183a4b7fe80527e1e6c12779bd0246",
+        3286675: "07fef07a255d510297c9189dc96da5f4e41a8184bc979df8294487f07fee1cf3",
+        3445426: "70574db7856bd685abe7b0a8a3e79b29882620645bd763b01459176bceb58cd1",
+        3976284: "af23c3e750bb4f2ce091235f006e7e4e2af453d4c866282e7870471dcfeb4382",
+        5900000: "199bea6a442310589cbb50a193a30b097c228bd5a0f21af21e4e53dd57c382d3"
     ]
 
     /// Maximum allowed time drift for block timestamps (2 hours)
@@ -106,6 +137,7 @@ public final class HeaderChain: @unchecked Sendable {
     public enum ValidationError: Error, Sendable {
         case checkpointMismatch(height: Int32, expected: String, got: String)
         case invalidProofOfWork(hash: String, target: String)
+        case invalidDifficulty(bits: UInt32)
         case invalidTimestamp(timestamp: UInt32)
         case invalidPreviousBlock
         case futureTooFar(timestamp: UInt32)
@@ -121,6 +153,7 @@ public final class HeaderChain: @unchecked Sendable {
     /// Create a header chain
     public init(network: DogecoinNetwork = .mainnet, storageDirectory: URL? = nil) {
         self.network = network
+        self.chainParams = network == .mainnet ? dogecoin_chainparams_main : dogecoin_chainparams_test
 
         if let url = storageDirectory {
             self.storageURL = url
@@ -174,26 +207,40 @@ public final class HeaderChain: @unchecked Sendable {
         // Validate checkpoint if one exists at this height
         try validateCheckpoint(header: header, height: newHeight)
 
-        // Validate proof of work
-        try validateProofOfWork(header: header)
+        let requiresPoW = !Self.isAuxpow(version: header.version)
+        let blockWork = try calculateBlockWork(for: header, validatePoW: requiresPoW)
+        if !requiresPoW {
+            logAuxpowSkipIfNeeded()
+        }
 
         // Validate timestamp
-        try validateTimestamp(header: header, parentTimestamp: parent.header.timestamp)
+        try validateTimestamp(header: header, parent: parent)
 
         // Create stored header
+        let chainWork = addChainWork(normalizedChainWork(parent.chainWork), blockWork)
         let stored = StoredHeader(
             header: header,
             height: newHeight,
-            chainWork: Data()
+            chainWork: chainWork
         )
 
         // Store it
         headersByHash[hash] = stored
-        headersByHeight[stored.height] = stored
 
-        // Update tip if this is the new best chain
-        if tip == nil || stored.height > tip!.height {
+        guard let currentTip = tip else {
+            headersByHeight[stored.height] = stored
             tip = stored
+            return
+        }
+
+        if stored.header.prevBlock == currentTip.header.hash {
+            headersByHeight[stored.height] = stored
+            tip = stored
+            return
+        }
+
+        if shouldReorganize(currentTip: currentTip, candidateTip: stored) {
+            reorganize(from: currentTip, to: stored)
         }
     }
 
@@ -222,25 +269,11 @@ public final class HeaderChain: @unchecked Sendable {
         logger.info("Checkpoint validated at height \(height)")
     }
 
-    /// Validate that the header hash meets the proof-of-work difficulty target
-    private func validateProofOfWork(header: BlockHeader) throws {
-        let hash = header.hash
-        let target = bitsToTarget(header.bits)
-
-        // Compare hash to target (both are 256-bit values, hash must be <= target)
-        guard hashMeetsTarget(hash: hash, target: target) else {
-            logger.error("PoW validation failed: hash \(header.hashHex) does not meet target")
-            throw ValidationError.invalidProofOfWork(
-                hash: header.hashHex,
-                target: target.hexString
-            )
-        }
-    }
-
     /// Validate block timestamp
-    private func validateTimestamp(header: BlockHeader, parentTimestamp: UInt32) throws {
-        // Timestamp must be greater than parent (simplified - full validation uses median time past)
-        guard header.timestamp > parentTimestamp else {
+    private func validateTimestamp(header: BlockHeader, parent: StoredHeader) throws {
+        let medianTimePast = medianTimePast(from: parent)
+
+        guard header.timestamp > medianTimePast else {
             throw ValidationError.invalidTimestamp(timestamp: header.timestamp)
         }
 
@@ -251,49 +284,6 @@ public final class HeaderChain: @unchecked Sendable {
         guard header.timestamp <= maxFutureTime else {
             throw ValidationError.futureTooFar(timestamp: header.timestamp)
         }
-    }
-
-    /// Convert compact "bits" format to 256-bit target
-    private func bitsToTarget(_ bits: UInt32) -> Data {
-        let exponent = Int(bits >> 24)
-        let mantissa = bits & 0x007fffff
-
-        var target = Data(count: 32)
-
-        if exponent <= 3 {
-            let shift = 8 * (3 - exponent)
-            let value = mantissa >> shift
-            target[0] = UInt8(value & 0xff)
-        } else {
-            let byteIndex = exponent - 3
-            if byteIndex < 32 {
-                target[byteIndex] = UInt8(mantissa & 0xff)
-                if byteIndex + 1 < 32 {
-                    target[byteIndex + 1] = UInt8((mantissa >> 8) & 0xff)
-                }
-                if byteIndex + 2 < 32 {
-                    target[byteIndex + 2] = UInt8((mantissa >> 16) & 0xff)
-                }
-            }
-        }
-
-        return target
-    }
-
-    /// Check if a hash meets the target (hash <= target)
-    private func hashMeetsTarget(hash: Data, target: Data) -> Bool {
-        // Compare from most significant byte (end of array since little-endian)
-        for i in (0..<32).reversed() {
-            let hashByte = i < hash.count ? hash[i] : 0
-            let targetByte = i < target.count ? target[i] : 0
-
-            if hashByte < targetByte {
-                return true
-            } else if hashByte > targetByte {
-                return false
-            }
-        }
-        return true // Equal
     }
 
     /// Add multiple headers
@@ -373,12 +363,10 @@ public final class HeaderChain: @unchecked Sendable {
 
             for header in headers {
                 headersByHash[header.header.hash] = header
-                headersByHeight[header.height] = header
-
-                if tip == nil || header.height > tip!.height {
-                    tip = header
-                }
             }
+
+            recomputeChainWorkIfNeeded()
+            rebuildBestChainIndex()
 
             logger.info("Loaded \(headers.count) headers, tip at height \(self.tip?.height ?? -1)")
         } catch {
@@ -430,12 +418,273 @@ public final class HeaderChain: @unchecked Sendable {
             )
         }
 
-        let stored = StoredHeader(header: genesis, height: 0)
+        let stored = StoredHeader(header: genesis, height: 0, chainWork: genesisChainWork)
         headersByHash[genesis.hash] = stored
         headersByHeight[0] = stored
         tip = stored
 
         logger.info("Initialized genesis block")
+    }
+
+    // MARK: - Chainwork + Reorg
+
+    private static func isAuxpow(version: Int32) -> Bool {
+        (version & 0x100) == 0x100
+    }
+
+    private var powLimit: Data {
+        withUnsafeBytes(of: chainParams.pow_limit) { Data($0) }
+    }
+
+    private var genesisChainWork: Data {
+        withUnsafeBytes(of: chainParams.genesisblockchainwork) { Data($0) }
+    }
+
+    private func calculateBlockWork(for header: BlockHeader, validatePoW: Bool) throws -> Data {
+        var hash = validatePoW ? scryptHash(for: header) : Data(repeating: 0, count: 32)
+        var work = Data(repeating: 0, count: 32)
+        let success = withUnsafePointer(to: chainParams) { paramsPtr in
+            hash.withUnsafeMutableBytes { hashBytes in
+                work.withUnsafeMutableBytes { workBytes in
+                    guard let hashPtr = hashBytes.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                          let workPtr = workBytes.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                        return false
+                    }
+                    return check_pow(hashPtr, header.bits, paramsPtr, workPtr) != 0
+                }
+            }
+        }
+
+        guard success else {
+            if validatePoW {
+                let targetHex = targetHexString(bits: header.bits)
+                logger.error("PoW validation failed: hash \(header.hashHex) does not meet target")
+                throw ValidationError.invalidProofOfWork(hash: header.hashHex, target: targetHex)
+            }
+
+            throw ValidationError.invalidDifficulty(bits: header.bits)
+        }
+
+        return work
+    }
+
+    private func scryptHash(for header: BlockHeader) -> Data {
+        let headerData = header.serializeCore()
+        var hash = Data(repeating: 0, count: 32)
+
+        headerData.withUnsafeBytes { headerBytes in
+            guard let baseAddress = headerBytes.baseAddress else { return }
+            guard let cstr = cstr_new_buf(baseAddress, headerData.count) else { return }
+            defer { cstr_free(cstr, 1) }
+
+            hash.withUnsafeMutableBytes { hashBytes in
+                guard let hashPtr = hashBytes.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+                dogecoin_block_header_scrypt_hash(cstr, hashPtr)
+            }
+        }
+
+        return hash
+    }
+
+    private func medianTimePast(from header: StoredHeader) -> UInt32 {
+        var timestamps: [UInt32] = []
+        var cursor: StoredHeader? = header
+
+        for _ in 0..<11 {
+            guard let current = cursor else { break }
+            timestamps.append(current.header.timestamp)
+            cursor = headersByHash[current.header.prevBlock]
+        }
+
+        timestamps.sort()
+        return timestamps[timestamps.count / 2]
+    }
+
+    private func normalizedChainWork(_ work: Data) -> Data {
+        guard work.count == 32 else {
+            var padded = Data(repeating: 0, count: 32)
+            let copyCount = min(work.count, 32)
+            padded.replaceSubrange(0..<copyCount, with: work.prefix(copyCount))
+            return padded
+        }
+        return work
+    }
+
+    private func addChainWork(_ lhs: Data, _ rhs: Data) -> Data {
+        let left = normalizedChainWork(lhs)
+        let right = normalizedChainWork(rhs)
+        var result = Data(repeating: 0, count: 32)
+        var carry: UInt16 = 0
+
+        for index in 0..<32 {
+            let sum = UInt16(left[index]) + UInt16(right[index]) + carry
+            result[index] = UInt8(sum & 0xff)
+            carry = sum >> 8
+        }
+
+        return result
+    }
+
+    private func compareChainWork(_ lhs: Data, _ rhs: Data) -> ComparisonResult {
+        let left = normalizedChainWork(lhs)
+        let right = normalizedChainWork(rhs)
+
+        for index in stride(from: 31, through: 0, by: -1) {
+            let leftByte = left[index]
+            let rightByte = right[index]
+            if leftByte == rightByte { continue }
+            return leftByte < rightByte ? .orderedAscending : .orderedDescending
+        }
+
+        return .orderedSame
+    }
+
+    private func shouldReorganize(currentTip: StoredHeader, candidateTip: StoredHeader) -> Bool {
+        let comparison = compareChainWork(candidateTip.chainWork, currentTip.chainWork)
+        if comparison == .orderedDescending {
+            return true
+        }
+        if comparison == .orderedSame {
+            return candidateTip.header.timestamp > currentTip.header.timestamp
+        }
+        return false
+    }
+
+    private func reorganize(from currentTip: StoredHeader, to newTip: StoredHeader) {
+        guard let commonAncestor = findCommonAncestor(between: currentTip, and: newTip) else {
+            logger.error("Unable to find common ancestor for reorg")
+            return
+        }
+
+        var oldCursor: StoredHeader? = currentTip
+        while let cursor = oldCursor, cursor.height > commonAncestor.height {
+            headersByHeight.removeValue(forKey: cursor.height)
+            oldCursor = headersByHash[cursor.header.prevBlock]
+        }
+
+        var newChain: [StoredHeader] = []
+        var newCursor: StoredHeader? = newTip
+        while let cursor = newCursor, cursor.height > commonAncestor.height {
+            newChain.append(cursor)
+            newCursor = headersByHash[cursor.header.prevBlock]
+        }
+
+        for header in newChain.reversed() {
+            headersByHeight[header.height] = header
+        }
+
+        tip = newTip
+        logger.info("Chain reorganized at height \(commonAncestor.height)")
+    }
+
+    private func findCommonAncestor(between first: StoredHeader, and second: StoredHeader) -> StoredHeader? {
+        var a: StoredHeader? = first
+        var b: StoredHeader? = second
+
+        while let aHeader = a, let bHeader = b, aHeader.height != bHeader.height {
+            if aHeader.height > bHeader.height {
+                a = headersByHash[aHeader.header.prevBlock]
+            } else {
+                b = headersByHash[bHeader.header.prevBlock]
+            }
+        }
+
+        while let aHeader = a, let bHeader = b {
+            if aHeader.header.hash == bHeader.header.hash {
+                return aHeader
+            }
+            a = headersByHash[aHeader.header.prevBlock]
+            b = headersByHash[bHeader.header.prevBlock]
+        }
+
+        return nil
+    }
+
+    private func rebuildBestChainIndex() {
+        guard !headersByHash.isEmpty else { return }
+
+        headersByHeight = [:]
+
+        let bestTip = headersByHash.values.reduce(nil) { currentBest, candidate in
+            guard let currentBest else { return candidate }
+            return shouldReorganize(currentTip: currentBest, candidateTip: candidate) ? candidate : currentBest
+        }
+
+        guard let tip = bestTip else { return }
+        self.tip = tip
+
+        var cursor: StoredHeader? = tip
+        while let header = cursor {
+            headersByHeight[header.height] = header
+            if header.height == 0 { break }
+            cursor = headersByHash[header.header.prevBlock]
+        }
+    }
+
+    private func recomputeChainWorkIfNeeded() {
+        let needsRecompute = headersByHash.values.contains { $0.chainWork.count != 32 }
+        guard needsRecompute else { return }
+
+        logger.info("Recomputing chainwork for stored headers")
+
+        let sortedHeaders = headersByHash.values.sorted { $0.height < $1.height }
+        for stored in sortedHeaders {
+            if stored.height == 0 {
+                let updated = StoredHeader(header: stored.header, height: 0, chainWork: genesisChainWork)
+                headersByHash[stored.header.hash] = updated
+                continue
+            }
+
+            guard let parent = headersByHash[stored.header.prevBlock] else { continue }
+            guard let work = try? calculateBlockWork(for: stored.header, validatePoW: false) else { continue }
+            let chainWork = addChainWork(normalizedChainWork(parent.chainWork), work)
+            let updated = StoredHeader(header: stored.header, height: stored.height, chainWork: chainWork)
+            headersByHash[stored.header.hash] = updated
+        }
+    }
+
+    private func targetHexString(bits: UInt32) -> String {
+        guard let target = targetFromBits(bits) else { return "invalid" }
+        return Data(target.reversed()).hexString
+    }
+
+    private func targetFromBits(_ bits: UInt32) -> Data? {
+        let size = Int(bits >> 24)
+        var word = bits & 0x007fffff
+
+        if word == 0 {
+            return nil
+        }
+
+        let negative = (bits & 0x00800000) != 0
+        let overflow = word != 0 && (size > 34 || (word > 0xff && size > 33) || (word > 0xffff && size > 32))
+        if negative || overflow {
+            return nil
+        }
+
+        var target = Data(repeating: 0, count: 32)
+        if size <= 3 {
+            let shift = 8 * (3 - size)
+            word >>= UInt32(shift)
+            target[0] = UInt8(word & 0xff)
+            target[1] = UInt8((word >> 8) & 0xff)
+            target[2] = UInt8((word >> 16) & 0xff)
+        } else {
+            let offset = size - 3
+            guard offset + 2 < 32 else { return nil }
+            target[offset] = UInt8(word & 0xff)
+            target[offset + 1] = UInt8((word >> 8) & 0xff)
+            target[offset + 2] = UInt8((word >> 16) & 0xff)
+        }
+
+        guard compareChainWork(target, powLimit) != .orderedDescending else { return nil }
+        return target
+    }
+
+    private func logAuxpowSkipIfNeeded() {
+        guard !didLogAuxpowWarning else { return }
+        didLogAuxpowWarning = true
+        logger.notice("AuxPoW headers detected; PoW validation is skipped without auxpow data")
     }
 }
 
