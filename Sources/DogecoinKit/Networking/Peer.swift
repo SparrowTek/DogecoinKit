@@ -341,6 +341,24 @@ public final class Peer: @unchecked Sendable {
         send(message)
     }
 
+    /// Send a filterload message to configure bloom filtering
+    public func sendFilterLoad(_ filter: BloomFilter) {
+        let message = ProtocolMessage(network: network, command: ProtocolMessage.Command.filterload, payload: filter.loadMessage().serialize())
+        send(message)
+    }
+
+    /// Send a filteradd message to add an element to the bloom filter
+    public func sendFilterAdd(element: Data) {
+        let message = ProtocolMessage(network: network, command: ProtocolMessage.Command.filteradd, payload: FilterAddMessage(element: element).serialize())
+        send(message)
+    }
+
+    /// Send a filterclear message to disable bloom filtering
+    public func sendFilterClear() {
+        let message = ProtocolMessage(network: network, command: ProtocolMessage.Command.filterclear, payload: FilterClearMessage().serialize())
+        send(message)
+    }
+
     // MARK: - Private Methods
 
     private func handleConnectionState(_ state: NWConnection.State) {

@@ -338,7 +338,7 @@ public final class PeerManager: @unchecked Sendable {
             throw DogecoinError.noPeersAvailable
         }
 
-        let txid = txMessage.txid
+        let txid = txMessage.txidInternal
         let txidHex = txMessage.txidHex
 
         // Store transaction for when peers request it

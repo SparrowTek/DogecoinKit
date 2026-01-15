@@ -315,6 +315,19 @@ public final class HeaderChain: @unchecked Sendable {
         return headersByHeight[height]
     }
 
+    /// Check if a header is part of the current best chain
+    public func isHeaderInBestChain(_ hash: Data) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let stored = headersByHash[hash],
+              let bestAtHeight = headersByHeight[stored.height] else {
+            return false
+        }
+
+        return bestAtHeight.header.hash == hash
+    }
+
     /// Get block locator hashes for getheaders message
     public func getBlockLocator() -> [Data] {
         lock.lock()

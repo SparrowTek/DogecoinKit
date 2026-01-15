@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 
 /// Transaction message for broadcasting and receiving transactions
 public struct TxMessage: Sendable {
@@ -30,13 +29,14 @@ public struct TxMessage: Sendable {
         return TxMessage(rawData: data)
     }
 
-    /// Calculate the transaction ID (txid)
-    /// The txid is the double SHA256 of the raw transaction, byte-reversed
+    /// Transaction ID in internal byte order (double SHA256, no reversal)
+    public var txidInternal: Data {
+        MerkleTree.doubleSHA256(rawData)
+    }
+
+    /// Transaction ID in display byte order (reversed)
     public var txid: Data {
-        let hash1 = SHA256.hash(data: rawData)
-        let hash2 = SHA256.hash(data: Data(hash1))
-        // Reverse for display (little-endian to big-endian)
-        return Data(hash2.reversed())
+        Data(txidInternal.reversed())
     }
 
     /// Transaction ID as hex string (suitable for display and APIs)
@@ -44,4 +44,3 @@ public struct TxMessage: Sendable {
         txid.hexString
     }
 }
-
