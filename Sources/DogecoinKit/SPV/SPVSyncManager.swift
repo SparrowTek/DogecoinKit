@@ -206,7 +206,7 @@ public final class SPVSyncManager: @unchecked Sendable {
             filter.insert(element)
         }
 
-        let clampedStart = min(max(0, startHeight), headerChain.height)
+        let clampedStart = max(Int32(0), startHeight)
         withTxLock { state in
             state.bloomFilter = filter
             state.nextFilteredHeight = clampedStart
