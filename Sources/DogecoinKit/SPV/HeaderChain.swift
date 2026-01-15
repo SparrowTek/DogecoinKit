@@ -133,6 +133,13 @@ public final class HeaderChain: @unchecked Sendable {
     /// Maximum allowed time drift for block timestamps (2 hours)
     private static let maxTimeDrift: UInt32 = 7200
 
+    private static let headerStoreVersion = 1
+
+    private struct HeaderStore: Codable {
+        let version: Int
+        let headers: [StoredHeader]
+    }
+
     /// Validation errors
     public enum ValidationError: Error, Sendable {
         case checkpointMismatch(height: Int32, expected: String, got: String)
@@ -371,8 +378,14 @@ public final class HeaderChain: @unchecked Sendable {
 
         do {
             let data = try Data(contentsOf: fileURL)
-            let headers = try JSONDecoder().decode([StoredHeader].self, from: data)
+            let headers: [StoredHeader]
+            if let store = try? JSONDecoder().decode(HeaderStore.self, from: data) {
+                headers = store.headers
+            } else {
+                headers = try JSONDecoder().decode([StoredHeader].self, from: data)
+            }
 
+            headersByHash = [:]
             for header in headers {
                 headersByHash[header.header.hash] = header
             }
@@ -383,6 +396,7 @@ public final class HeaderChain: @unchecked Sendable {
             logger.info("Loaded \(headers.count) headers, tip at height \(self.tip?.height ?? -1)")
         } catch {
             logger.error("Failed to load headers: \(error.localizedDescription)")
+            handleCorruptHeaders(at: fileURL)
         }
     }
 
@@ -394,11 +408,25 @@ public final class HeaderChain: @unchecked Sendable {
         lock.unlock()
 
         do {
-            let data = try JSONEncoder().encode(headers)
-            try data.write(to: fileURL)
+            let store = HeaderStore(version: Self.headerStoreVersion, headers: headers)
+            let data = try JSONEncoder().encode(store)
+            try data.write(to: fileURL, options: .atomic)
             logger.debug("Saved \(headers.count) headers")
         } catch {
             logger.error("Failed to save headers: \(error.localizedDescription)")
+        }
+    }
+
+    private func handleCorruptHeaders(at url: URL) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMddHHmmss"
+        let timestamp = formatter.string(from: Date())
+        let backupURL = url.appendingPathExtension("corrupt-\(timestamp)")
+        do {
+            try FileManager.default.moveItem(at: url, to: backupURL)
+            logger.warning("Moved corrupt headers file to \(backupURL.path)")
+        } catch {
+            logger.error("Failed to move corrupt headers file: \(error.localizedDescription)")
         }
     }
 

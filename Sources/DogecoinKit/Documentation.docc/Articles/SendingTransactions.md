@@ -179,7 +179,8 @@ _ = try tx.finalize(
 
 ### Using the Convenience Function
 
-For simpler cases, use the ``createTransaction(inputs:outputs:privateKey:changeAddress:fee:)`` function:
+For simpler cases where all inputs belong to the same address, use the
+``createTransaction(inputs:outputs:privateKey:changeAddress:fee:)`` function:
 
 ```swift
 let utxos = [
@@ -200,6 +201,24 @@ let signedTx = try createTransaction(
 )
 
 print("Transaction hex: \(signedTx.rawHex)")
+```
+
+For wallets that spend from multiple addresses, use
+``createTransaction(inputs:outputs:signingKeysByAddress:changeAddress:fee:)``:
+
+```swift
+let signingKeys = [
+    "DMyAddr1...": "QPrivateKey1...",
+    "DMyAddr2...": "QPrivateKey2..."
+]
+
+let signedTx = try createTransaction(
+    inputs: utxos,
+    outputs: outputs,
+    signingKeysByAddress: signingKeys,
+    changeAddress: "DMyChange...",
+    fee: DogecoinAmount(doge: 1)
+)
 ```
 
 ## Calculating Fees

@@ -1,7 +1,92 @@
 import Foundation
-import Vault
+import Security
 
 // MARK: - Stored Credential Types
+
+private enum KeychainStoreError: Error {
+    case notFound
+    case invalidData
+    case unhandled(status: OSStatus)
+}
+
+extension KeychainStoreError: CustomStringConvertible {
+    var description: String {
+        switch self {
+        case .notFound:
+            return "Key not found"
+        case .invalidData:
+            return "Invalid keychain data"
+        case .unhandled(let status):
+            return "Keychain error (status: \(status))"
+        }
+    }
+}
+
+private struct KeychainStore {
+    let service: String
+    let account: String
+    let accessGroup: String?
+
+    private var baseQuery: [String: Any] {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecUseDataProtectionKeychain as String: true
+        ]
+        if let accessGroup {
+            query[kSecAttrAccessGroup as String] = accessGroup
+        }
+        return query
+    }
+
+    func read() throws -> String {
+        var query = baseQuery
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        query[kSecReturnData as String] = kCFBooleanTrue
+
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status != errSecItemNotFound else { throw KeychainStoreError.notFound }
+        guard status == errSecSuccess else { throw KeychainStoreError.unhandled(status: status) }
+        guard let data = item as? Data,
+              let value = String(data: data, encoding: .utf8) else {
+            throw KeychainStoreError.invalidData
+        }
+        return value
+    }
+
+    func save(_ value: String) throws {
+        let data = value.data(using: .utf8) ?? Data()
+        var newItem = baseQuery
+        newItem[kSecValueData as String] = data
+        newItem[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+
+        let status = SecItemAdd(newItem as CFDictionary, nil)
+        if status == errSecDuplicateItem {
+            let attributes: [String: Any] = [
+                kSecValueData as String: data,
+                kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+            ]
+            let updateStatus = SecItemUpdate(baseQuery as CFDictionary, attributes as CFDictionary)
+            guard updateStatus == errSecSuccess else {
+                throw KeychainStoreError.unhandled(status: updateStatus)
+            }
+            return
+        }
+
+        guard status == errSecSuccess else {
+            throw KeychainStoreError.unhandled(status: status)
+        }
+    }
+
+    func delete() throws {
+        let status = SecItemDelete(baseQuery as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeychainStoreError.unhandled(status: status)
+        }
+    }
+}
 
 /// Represents wallet credentials stored in the Keychain
 public struct StoredWalletCredentials: Codable, Sendable {
@@ -41,7 +126,7 @@ extension DogecoinNetwork: Codable {
 
 // MARK: - Secure Key Storage
 
-/// Manages secure storage of wallet credentials in the iOS Keychain via Vault
+/// Manages secure storage of wallet credentials in the iOS Keychain
 ///
 /// This class provides a thread-safe interface for storing, retrieving, and deleting
 /// sensitive wallet data such as mnemonic phrases and master keys.
@@ -125,16 +210,13 @@ public final class SecureKeyStorage: Sendable {
                 throw DogecoinError.keychainStorageFailed("Failed to encode credentials")
             }
 
-            let config = KeychainConfiguration(
-                serviceName: serviceName,
-                accessGroup: accessGroup,
-                accountName: accountName
-            )
-
-            try Vault.savePrivateKey(jsonString, keychainConfiguration: config)
+            let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
+            try store.save(jsonString)
             return id
         } catch let error as DogecoinError {
             throw error
+        } catch let error as KeychainStoreError {
+            throw DogecoinError.keychainStorageFailed("\(error)")
         } catch {
             throw DogecoinError.keychainStorageFailed(error.localizedDescription)
         }
@@ -151,13 +233,8 @@ public final class SecureKeyStorage: Sendable {
         let accountName = Self.walletCredentialsPrefix + id
 
         do {
-            let config = KeychainConfiguration(
-                serviceName: serviceName,
-                accessGroup: accessGroup,
-                accountName: accountName
-            )
-
-            let jsonString = try Vault.getPrivateKey(keychainConfiguration: config)
+            let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
+            let jsonString = try store.read()
 
             guard let jsonData = jsonString.data(using: .utf8) else {
                 throw DogecoinError.keychainRetrievalFailed("Failed to decode stored data")
@@ -167,11 +244,10 @@ public final class SecureKeyStorage: Sendable {
             return credentials
         } catch let error as DogecoinError {
             throw error
-        } catch let error as VaultError {
-            if case .noKeychainConfiguration = error {
-                throw DogecoinError.keyNotFound(id)
-            }
-            throw DogecoinError.keychainRetrievalFailed(error.localizedDescription)
+        } catch KeychainStoreError.notFound {
+            throw DogecoinError.keyNotFound(id)
+        } catch let error as KeychainStoreError {
+            throw DogecoinError.keychainRetrievalFailed("\(error)")
         } catch {
             throw DogecoinError.keychainRetrievalFailed(error.localizedDescription)
         }
@@ -187,13 +263,8 @@ public final class SecureKeyStorage: Sendable {
         let accountName = Self.walletCredentialsPrefix + id
 
         do {
-            let config = KeychainConfiguration(
-                serviceName: serviceName,
-                accessGroup: accessGroup,
-                accountName: accountName
-            )
-
-            try Vault.deletePrivateKey(keychainConfiguration: config)
+            let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
+            try store.delete()
         } catch {
             throw DogecoinError.keychainDeletionFailed(error.localizedDescription)
         }
@@ -235,16 +306,13 @@ public final class SecureKeyStorage: Sendable {
                 throw DogecoinError.keychainStorageFailed("Failed to encode master key")
             }
 
-            let config = KeychainConfiguration(
-                serviceName: serviceName,
-                accessGroup: accessGroup,
-                accountName: accountName
-            )
-
-            try Vault.savePrivateKey(jsonString, keychainConfiguration: config)
+            let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
+            try store.save(jsonString)
             return id
         } catch let error as DogecoinError {
             throw error
+        } catch let error as KeychainStoreError {
+            throw DogecoinError.keychainStorageFailed("\(error)")
         } catch {
             throw DogecoinError.keychainStorageFailed(error.localizedDescription)
         }
@@ -261,13 +329,8 @@ public final class SecureKeyStorage: Sendable {
         let accountName = Self.masterKeyPrefix + id
 
         do {
-            let config = KeychainConfiguration(
-                serviceName: serviceName,
-                accessGroup: accessGroup,
-                accountName: accountName
-            )
-
-            let jsonString = try Vault.getPrivateKey(keychainConfiguration: config)
+            let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
+            let jsonString = try store.read()
 
             guard let jsonData = jsonString.data(using: .utf8) else {
                 throw DogecoinError.keychainRetrievalFailed("Failed to decode stored data")
@@ -277,6 +340,10 @@ public final class SecureKeyStorage: Sendable {
             return (payload.masterKey, payload.network)
         } catch let error as DogecoinError {
             throw error
+        } catch KeychainStoreError.notFound {
+            throw DogecoinError.keyNotFound(id)
+        } catch let error as KeychainStoreError {
+            throw DogecoinError.keychainRetrievalFailed("\(error)")
         } catch {
             throw DogecoinError.keyNotFound(id)
         }
@@ -292,13 +359,8 @@ public final class SecureKeyStorage: Sendable {
         let accountName = Self.masterKeyPrefix + id
 
         do {
-            let config = KeychainConfiguration(
-                serviceName: serviceName,
-                accessGroup: accessGroup,
-                accountName: accountName
-            )
-
-            try Vault.deletePrivateKey(keychainConfiguration: config)
+            let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
+            try store.delete()
         } catch {
             throw DogecoinError.keychainDeletionFailed(error.localizedDescription)
         }
@@ -327,16 +389,13 @@ public final class SecureKeyStorage: Sendable {
                 throw DogecoinError.keychainStorageFailed("Failed to encode private key")
             }
 
-            let config = KeychainConfiguration(
-                serviceName: serviceName,
-                accessGroup: accessGroup,
-                accountName: accountName
-            )
-
-            try Vault.savePrivateKey(jsonString, keychainConfiguration: config)
+            let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
+            try store.save(jsonString)
             return id
         } catch let error as DogecoinError {
             throw error
+        } catch let error as KeychainStoreError {
+            throw DogecoinError.keychainStorageFailed("\(error)")
         } catch {
             throw DogecoinError.keychainStorageFailed(error.localizedDescription)
         }
@@ -353,13 +412,8 @@ public final class SecureKeyStorage: Sendable {
         let accountName = Self.privateKeyPrefix + id
 
         do {
-            let config = KeychainConfiguration(
-                serviceName: serviceName,
-                accessGroup: accessGroup,
-                accountName: accountName
-            )
-
-            let jsonString = try Vault.getPrivateKey(keychainConfiguration: config)
+            let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
+            let jsonString = try store.read()
 
             guard let jsonData = jsonString.data(using: .utf8) else {
                 throw DogecoinError.keychainRetrievalFailed("Failed to decode stored data")
@@ -369,6 +423,10 @@ public final class SecureKeyStorage: Sendable {
             return (payload.privateKeyWIF, payload.address)
         } catch let error as DogecoinError {
             throw error
+        } catch KeychainStoreError.notFound {
+            throw DogecoinError.keyNotFound(id)
+        } catch let error as KeychainStoreError {
+            throw DogecoinError.keychainRetrievalFailed("\(error)")
         } catch {
             throw DogecoinError.keyNotFound(id)
         }
@@ -384,13 +442,8 @@ public final class SecureKeyStorage: Sendable {
         let accountName = Self.privateKeyPrefix + id
 
         do {
-            let config = KeychainConfiguration(
-                serviceName: serviceName,
-                accessGroup: accessGroup,
-                accountName: accountName
-            )
-
-            try Vault.deletePrivateKey(keychainConfiguration: config)
+            let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
+            try store.delete()
         } catch {
             throw DogecoinError.keychainDeletionFailed(error.localizedDescription)
         }

@@ -46,4 +46,16 @@ struct HDWalletVectorTests {
         let mainnetAddress = try mainnetWallet.deriveAddress(account: 0, index: 0, change: false)
         #expect(mainnetAddress == "DTdKu8YgcxoXyjFCDtCeKimaZzsK27rcwT")
     }
+
+    @Test("Derived private keys match known vectors")
+    func testDerivedPrivateKeyVectors() throws {
+        let mnemonic = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote"
+        let wallet = try HDWallet(mnemonic: mnemonic, passphrase: "", network: .mainnet)
+
+        let externalKey = try wallet.derivePrivateKey(account: 1, index: 1, change: false)
+        #expect(externalKey == "QPhPcYBCZPPc73Ldrdj6Ubc8SiiRqwRns6nuEqgzshiqJA6WEp62")
+
+        let changeKey = try wallet.derivePrivateKey(account: 1, index: 1, change: true)
+        #expect(changeKey == "QQiHajxrYwkCK1zkbmt2ZTKSQyy64jUPVbw4CDYJBchg975TRBJu")
+    }
 }

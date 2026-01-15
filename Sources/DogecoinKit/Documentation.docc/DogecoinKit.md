@@ -73,6 +73,7 @@ print("Send DOGE to: \(address)")
 - ``UTXO``
 - ``SignedTransaction``
 - ``createTransaction(inputs:outputs:privateKey:changeAddress:fee:)``
+- ``createTransaction(inputs:outputs:signingKeysByAddress:changeAddress:fee:)``
 
 ### Network & Synchronization
 

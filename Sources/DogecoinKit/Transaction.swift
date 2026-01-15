@@ -13,6 +13,8 @@ public final class TransactionBuilder: @unchecked Sendable {
     /// Track if transaction has been finalized
     private var isFinalized = false
 
+    private var inputCount: Int = 0
+
     /// Create a new transaction builder
     /// - Throws: `DogecoinError.transactionCreationFailed` if creation fails
     public init() throws {
@@ -50,6 +52,8 @@ public final class TransactionBuilder: @unchecked Sendable {
         guard result == 1 else {
             throw DogecoinError.addInputFailed
         }
+
+        inputCount += 1
     }
 
     /// Add an output to the transaction
@@ -130,13 +134,30 @@ public final class TransactionBuilder: @unchecked Sendable {
     /// - Parameter privateKeyWIF: The private key in WIF format
     /// - Throws: `DogecoinError.transactionSigningFailed` if signing fails
     public func sign(privateKeyWIF: String) throws {
+        guard inputCount > 0 else {
+            throw DogecoinError.transactionSigningFailed
+        }
+
+        for index in 0..<inputCount {
+            try signInput(index: index, privateKeyWIF: privateKeyWIF)
+        }
+    }
+
+    /// Sign a specific input using a private key
+    /// - Parameters:
+    ///   - index: The input index to sign
+    ///   - privateKeyWIF: The private key in WIF format
+    /// - Throws: `DogecoinError.transactionSigningFailed` if signing fails
+    public func signInput(index: Int, privateKeyWIF: String) throws {
         lock.lock()
         defer { lock.unlock() }
 
-        var privKeyBuffer = Array(privateKeyWIF.utf8CString)
+        guard index >= 0, index < inputCount else {
+            throw DogecoinError.transactionSigningFailed
+        }
 
-        // Use the simplified signing function
-        let result = sign_transaction_w_privkey(txIndex, 0, &privKeyBuffer)
+        var privKeyBuffer = Array(privateKeyWIF.utf8CString)
+        let result = sign_transaction_w_privkey(txIndex, Int32(index), &privKeyBuffer)
 
         guard result == 1 else {
             throw DogecoinError.transactionSigningFailed
@@ -227,8 +248,9 @@ public struct SignedTransaction: Sendable, Equatable, Hashable {
     /// The transaction ID (computed from the raw hex)
     public var txid: String {
         // Transaction ID is the double SHA256 of the raw tx, reversed
-        // For now, we don't compute it here - it would be done by the network
-        rawHex
+        guard let data = Data(hexString: rawHex) else { return rawHex }
+        let hash = MerkleTree.doubleSHA256(data)
+        return Data(hash.reversed()).hexString
     }
 
     /// Create from raw hex
@@ -255,22 +277,50 @@ public func createTransaction(
     changeAddress: String? = nil,
     fee: DogecoinAmount
 ) throws -> SignedTransaction {
+    let uniqueAddresses = Set(inputs.map { $0.address })
+    guard uniqueAddresses.count <= 1 else {
+        throw DogecoinError.transactionValidationFailed("Multiple input addresses require per-input signing keys")
+    }
+
+    return try createTransaction(
+        inputs: inputs,
+        outputs: outputs,
+        signingKeysByAddress: [inputs.first?.address ?? "": privateKey],
+        changeAddress: changeAddress,
+        fee: fee
+    )
+}
+
+/// Create and sign a transaction with per-input signing keys
+/// - Parameters:
+///   - inputs: The UTXOs to spend
+///   - outputs: The recipient addresses and amounts
+///   - signingKeysByAddress: Map of address -> private key (WIF)
+///   - changeAddress: The address for change
+///   - fee: The transaction fee
+/// - Returns: The signed transaction
+/// - Throws: `DogecoinError` if any step fails
+public func createTransaction(
+    inputs: [UTXO],
+    outputs: [(address: String, amount: DogecoinAmount)],
+    signingKeysByAddress: [String: String],
+    changeAddress: String? = nil,
+    fee: DogecoinAmount
+) throws -> SignedTransaction {
+    try validateTransaction(inputs: inputs, outputs: outputs, fee: fee)
+
     let builder = try TransactionBuilder()
 
-    // Add all inputs
     for input in inputs {
         try builder.addInput(txid: input.txid, vout: input.vout)
     }
 
-    // Add all outputs
     for output in outputs {
         try builder.addOutput(address: output.address, amount: output.amount)
     }
 
-    // Calculate total input
     let totalInput = inputs.reduce(DogecoinAmount.zero) { $0 + $1.amount }
 
-    // Finalize (first output address is the primary destination)
     guard let firstOutput = outputs.first else {
         throw DogecoinError.transactionCreationFailed
     }
@@ -282,11 +332,42 @@ public func createTransaction(
         changeAddress: changeAddress ?? inputs.first?.address
     )
 
-    // Sign
-    try builder.sign(privateKeyWIF: privateKey)
+    for (index, input) in inputs.enumerated() {
+        guard let privateKey = signingKeysByAddress[input.address] else {
+            throw DogecoinError.transactionValidationFailed("Missing signing key for address \(input.address)")
+        }
+        try builder.signInput(index: index, privateKeyWIF: privateKey)
+    }
 
-    // Get the raw hex
     let rawHex = try builder.getRawTransaction()
-
     return SignedTransaction(rawHex: rawHex)
+}
+
+private func validateTransaction(
+    inputs: [UTXO],
+    outputs: [(address: String, amount: DogecoinAmount)],
+    fee: DogecoinAmount
+) throws {
+    guard !inputs.isEmpty else {
+        throw DogecoinError.transactionValidationFailed("Transaction requires at least one input")
+    }
+    guard !outputs.isEmpty else {
+        throw DogecoinError.transactionValidationFailed("Transaction requires at least one output")
+    }
+
+    for input in inputs where input.address.isEmpty {
+        throw DogecoinError.transactionValidationFailed("Input address is missing")
+    }
+
+    for output in outputs where output.amount.koinu == 0 {
+        throw DogecoinError.transactionValidationFailed("Output amount must be greater than zero")
+    }
+
+    let totalInput = inputs.reduce(DogecoinAmount.zero) { $0 + $1.amount }
+    let totalOutput = outputs.reduce(DogecoinAmount.zero) { $0 + $1.amount }
+    let required = totalOutput + fee
+
+    guard totalInput >= required else {
+        throw DogecoinError.transactionValidationFailed("Inputs do not cover outputs and fee")
+    }
 }

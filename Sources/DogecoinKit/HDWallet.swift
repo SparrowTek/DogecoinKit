@@ -47,6 +47,8 @@ public final class HDWallet: Sendable {
         }
 
         let masterKey = Self.stringFromCStringBuffer(masterKeyBuffer)
+        zeroize(&masterKeyBuffer)
+        zeroize(&seed)
         guard !masterKey.isEmpty else {
             throw DogecoinError.keyGenerationFailed
         }
@@ -137,10 +139,17 @@ public final class HDWallet: Sendable {
         )
 
         guard result == 1 else {
+            zeroize(&masterKeyBuffer)
+            zeroize(&pathBuffer)
+            zeroize(&addressBuffer)
             throw DogecoinError.derivationFailed
         }
 
-        return Self.stringFromCStringBuffer(addressBuffer)
+        let address = Self.stringFromCStringBuffer(addressBuffer)
+        zeroize(&masterKeyBuffer)
+        zeroize(&pathBuffer)
+        zeroize(&addressBuffer)
+        return address
     }
 
     /// Derive an address at a custom derivation path
@@ -167,10 +176,17 @@ public final class HDWallet: Sendable {
         )
 
         guard result == 1 else {
+            zeroize(&masterKeyBuffer)
+            zeroize(&pathBuffer)
+            zeroize(&addressBuffer)
             throw DogecoinError.derivationFailed
         }
 
-        return Self.stringFromCStringBuffer(addressBuffer)
+        let address = Self.stringFromCStringBuffer(addressBuffer)
+        zeroize(&masterKeyBuffer)
+        zeroize(&pathBuffer)
+        zeroize(&addressBuffer)
+        return address
     }
 
     /// Generate multiple addresses for this wallet
@@ -228,6 +244,9 @@ public final class HDWallet: Sendable {
             &addressBuffer,
             true  // Output private key
         ) else {
+            zeroize(&masterKeyBuffer)
+            zeroize(&pathBuffer)
+            zeroize(&addressBuffer)
             throw DogecoinError.derivationFailed
         }
 
@@ -235,6 +254,9 @@ public final class HDWallet: Sendable {
 
         // Free the allocated memory from the C function
         dogecoin_free(UnsafeMutableRawPointer(mutating: privateKeyPtr))
+        zeroize(&masterKeyBuffer)
+        zeroize(&pathBuffer)
+        zeroize(&addressBuffer)
 
         guard !privateKeyWIF.isEmpty else {
             throw DogecoinError.derivationFailed
@@ -265,11 +287,17 @@ public final class HDWallet: Sendable {
             &addressBuffer,
             true
         ) else {
+            zeroize(&masterKeyBuffer)
+            zeroize(&pathBuffer)
+            zeroize(&addressBuffer)
             throw DogecoinError.derivationFailed
         }
 
         let privateKeyWIF = String(cString: privateKeyPtr)
         dogecoin_free(UnsafeMutableRawPointer(mutating: privateKeyPtr))
+        zeroize(&masterKeyBuffer)
+        zeroize(&pathBuffer)
+        zeroize(&addressBuffer)
 
         guard !privateKeyWIF.isEmpty else {
             throw DogecoinError.derivationFailed
@@ -330,6 +358,18 @@ private extension HDWallet {
     static func stringFromCStringBuffer(_ buffer: [CChar]) -> String {
         let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
         return String(bytes: bytes, encoding: .utf8) ?? ""
+    }
+}
+
+private func zeroize(_ buffer: inout [UInt8]) {
+    for index in buffer.indices {
+        buffer[index] = 0
+    }
+}
+
+private func zeroize(_ buffer: inout [CChar]) {
+    for index in buffer.indices {
+        buffer[index] = 0
     }
 }
 

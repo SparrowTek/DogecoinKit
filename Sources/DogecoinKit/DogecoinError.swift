@@ -26,6 +26,9 @@ public enum DogecoinError: Error, LocalizedError, Sendable {
     /// Transaction creation failed
     case transactionCreationFailed
 
+    /// Transaction validation failed
+    case transactionValidationFailed(String)
+
     /// Transaction signing failed
     case transactionSigningFailed
 
@@ -105,6 +108,8 @@ public enum DogecoinError: Error, LocalizedError, Sendable {
             return "HD key derivation failed"
         case .transactionCreationFailed:
             return "Failed to create transaction"
+        case .transactionValidationFailed(let reason):
+            return "Transaction validation failed: \(reason)"
         case .transactionSigningFailed:
             return "Failed to sign transaction"
         case .addInputFailed:
