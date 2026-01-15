@@ -89,7 +89,7 @@ public enum Address {
         var addressBuffer = Array(address.utf8CString)
         while addressBuffer.count < Int(P2PKHLEN) { addressBuffer.append(0) }
 
-        var hashBuffer = [CChar](repeating: 0, count: Int(PUBKEYHASHLEN))
+        var hashBuffer = [CChar](repeating: 0, count: Int(SCRIPTPUBKEYLEN))
 
         let result = dogecoin_p2pkh_address_to_pubkey_hash(&addressBuffer, &hashBuffer)
 
