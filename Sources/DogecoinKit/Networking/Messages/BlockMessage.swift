@@ -25,12 +25,24 @@ public struct BlockMessage: Sendable {
     }
 
     /// Skip AuxPoW data and return the new offset, or nil if parsing fails
+    /// AuxPoW structure (from Dogecoin's CAuxPow which extends CMerkleTx):
+    /// - coinbase_tx (variable)
+    /// - hashBlock (32 bytes) - block hash where coinbase was included
+    /// - vMerkleBranch (varint count + 32*count) - merkle proof for coinbase
+    /// - nIndex (4 bytes) - position in merkle tree
+    /// - vChainMerkleBranch (varint count + 32*count) - chain merkle branch
+    /// - nChainIndex (4 bytes)
+    /// - parentBlock (80 bytes) - parent chain block header
     private static func skipAuxPow(in data: Data, from offset: Int) -> Int? {
         var pos = offset
 
         // Skip coinbase transaction
         guard let txEnd = TransactionParser.skipTransaction(in: data, from: pos) else { return nil }
         pos = txEnd
+
+        // Skip hashBlock (32 bytes)
+        guard data.count >= pos + 32 else { return nil }
+        pos += 32
 
         // Skip coinbase merkle branch (varint count + 32*count bytes)
         guard let (branchCount1, branchSize1) = VarInt.parse(from: Data(data[pos...])) else { return nil }
@@ -39,18 +51,18 @@ public struct BlockMessage: Sendable {
         guard data.count >= pos + branch1Bytes else { return nil }
         pos += branch1Bytes
 
-        // Skip coinbase branch side mask (4 bytes)
+        // Skip nIndex (4 bytes)
         guard data.count >= pos + 4 else { return nil }
         pos += 4
 
-        // Skip blockchain link merkle branch (varint count + 32*count bytes)
+        // Skip chain merkle branch (varint count + 32*count bytes)
         guard let (branchCount2, branchSize2) = VarInt.parse(from: Data(data[pos...])) else { return nil }
         pos += branchSize2
         let branch2Bytes = Int(branchCount2) * 32
         guard data.count >= pos + branch2Bytes else { return nil }
         pos += branch2Bytes
 
-        // Skip blockchain branch side mask (4 bytes)
+        // Skip nChainIndex (4 bytes)
         guard data.count >= pos + 4 else { return nil }
         pos += 4
 
@@ -111,34 +123,51 @@ struct TransactionParser {
     private static func parseTransactionImpl(from data: Data, offset: inout Int) -> Data? {
         let start = offset
 
+        // Version (4 bytes)
         guard data.count >= offset + 4 else { return nil }
         offset += 4
 
+        // Check for SegWit marker (0x00) and flag (0x01)
+        // SegWit transactions have marker=0x00, flag=0x01 after version
+        var isSegWit = false
+        if data.count >= offset + 2 && data[offset] == 0x00 && data[offset + 1] == 0x01 {
+            isSegWit = true
+            offset += 2  // Skip marker and flag
+        }
+
+        // Input count
         guard let (inputCount, inputSize) = VarInt.parse(from: Data(data[offset...])) else { return nil }
         guard inputCount <= UInt64(Int.max) else { return nil }
         offset += inputSize
 
+        // Inputs
         for _ in 0..<inputCount {
+            // Previous output (32 bytes txid + 4 bytes index)
             guard data.count >= offset + 36 else { return nil }
             offset += 36
 
+            // Script sig length and script
             guard let (scriptLength, scriptSize) = VarInt.parse(from: Data(data[offset...])) else { return nil }
             guard scriptLength <= UInt64(Int.max) else { return nil }
             offset += scriptSize
 
             let scriptBytes = Int(scriptLength)
             guard data.count >= offset + scriptBytes + 4 else { return nil }
-            offset += scriptBytes + 4
+            offset += scriptBytes + 4  // script + sequence
         }
 
+        // Output count
         guard let (outputCount, outputSize) = VarInt.parse(from: Data(data[offset...])) else { return nil }
         guard outputCount <= UInt64(Int.max) else { return nil }
         offset += outputSize
 
+        // Outputs
         for _ in 0..<outputCount {
+            // Value (8 bytes)
             guard data.count >= offset + 8 else { return nil }
             offset += 8
 
+            // Script pubkey length and script
             guard let (scriptLength, scriptSize) = VarInt.parse(from: Data(data[offset...])) else { return nil }
             guard scriptLength <= UInt64(Int.max) else { return nil }
             offset += scriptSize
@@ -148,6 +177,27 @@ struct TransactionParser {
             offset += scriptBytes
         }
 
+        // Witness data (only for SegWit transactions)
+        if isSegWit {
+            // One witness per input
+            for _ in 0..<inputCount {
+                // Number of stack items for this input
+                guard let (stackItemCount, stackItemCountSize) = VarInt.parse(from: Data(data[offset...])) else { return nil }
+                offset += stackItemCountSize
+
+                // Each stack item
+                for _ in 0..<stackItemCount {
+                    guard let (itemLength, itemLengthSize) = VarInt.parse(from: Data(data[offset...])) else { return nil }
+                    offset += itemLengthSize
+
+                    let itemBytes = Int(itemLength)
+                    guard data.count >= offset + itemBytes else { return nil }
+                    offset += itemBytes
+                }
+            }
+        }
+
+        // Locktime (4 bytes)
         guard data.count >= offset + 4 else { return nil }
         offset += 4
 

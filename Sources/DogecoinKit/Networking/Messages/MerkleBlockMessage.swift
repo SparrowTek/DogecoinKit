@@ -41,14 +41,24 @@ public struct MerkleBlockMessage: Sendable {
     }
 
     /// Skip AuxPoW data and return the new offset, or nil if parsing fails
-    /// AuxPoW structure: coinbase_tx, coinbase_merkle_branch, side_mask,
-    /// blockchain_merkle_branch, side_mask, parent_block_header
+    /// AuxPoW structure (from Dogecoin's CAuxPow which extends CMerkleTx):
+    /// - coinbase_tx (variable)
+    /// - hashBlock (32 bytes) - block hash where coinbase was included
+    /// - vMerkleBranch (varint count + 32*count) - merkle proof for coinbase
+    /// - nIndex (4 bytes) - position in merkle tree
+    /// - vChainMerkleBranch (varint count + 32*count) - chain merkle branch
+    /// - nChainIndex (4 bytes)
+    /// - parentBlock (80 bytes) - parent chain block header
     private static func skipAuxPow(in data: Data, from offset: Int) -> Int? {
         var pos = offset
 
         // Skip coinbase transaction
         guard let txEnd = TransactionParser.skipTransaction(in: data, from: pos) else { return nil }
         pos = txEnd
+
+        // Skip hashBlock (32 bytes)
+        guard data.count >= pos + 32 else { return nil }
+        pos += 32
 
         // Skip coinbase merkle branch (varint count + 32*count bytes)
         guard let (branchCount1, branchSize1) = VarInt.parse(from: Data(data[pos...])) else { return nil }
@@ -57,18 +67,18 @@ public struct MerkleBlockMessage: Sendable {
         guard data.count >= pos + branch1Bytes else { return nil }
         pos += branch1Bytes
 
-        // Skip coinbase branch side mask (4 bytes)
+        // Skip nIndex (4 bytes)
         guard data.count >= pos + 4 else { return nil }
         pos += 4
 
-        // Skip blockchain link merkle branch (varint count + 32*count bytes)
+        // Skip chain merkle branch (varint count + 32*count bytes)
         guard let (branchCount2, branchSize2) = VarInt.parse(from: Data(data[pos...])) else { return nil }
         pos += branchSize2
         let branch2Bytes = Int(branchCount2) * 32
         guard data.count >= pos + branch2Bytes else { return nil }
         pos += branch2Bytes
 
-        // Skip blockchain branch side mask (4 bytes)
+        // Skip nChainIndex (4 bytes)
         guard data.count >= pos + 4 else { return nil }
         pos += 4
 
