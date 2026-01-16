@@ -35,11 +35,61 @@ public struct MerkleBlockMessage: Sendable {
         return data
     }
 
+    /// Check if block version indicates AuxPoW (merged mining)
+    private static func isAuxPow(version: Int32) -> Bool {
+        (version & 0x100) == 0x100
+    }
+
+    /// Skip AuxPoW data and return the new offset, or nil if parsing fails
+    /// AuxPoW structure: coinbase_tx, coinbase_merkle_branch, side_mask,
+    /// blockchain_merkle_branch, side_mask, parent_block_header
+    private static func skipAuxPow(in data: Data, from offset: Int) -> Int? {
+        var pos = offset
+
+        // Skip coinbase transaction
+        guard let txEnd = TransactionParser.skipTransaction(in: data, from: pos) else { return nil }
+        pos = txEnd
+
+        // Skip coinbase merkle branch (varint count + 32*count bytes)
+        guard let (branchCount1, branchSize1) = VarInt.parse(from: Data(data[pos...])) else { return nil }
+        pos += branchSize1
+        let branch1Bytes = Int(branchCount1) * 32
+        guard data.count >= pos + branch1Bytes else { return nil }
+        pos += branch1Bytes
+
+        // Skip coinbase branch side mask (4 bytes)
+        guard data.count >= pos + 4 else { return nil }
+        pos += 4
+
+        // Skip blockchain link merkle branch (varint count + 32*count bytes)
+        guard let (branchCount2, branchSize2) = VarInt.parse(from: Data(data[pos...])) else { return nil }
+        pos += branchSize2
+        let branch2Bytes = Int(branchCount2) * 32
+        guard data.count >= pos + branch2Bytes else { return nil }
+        pos += branch2Bytes
+
+        // Skip blockchain branch side mask (4 bytes)
+        guard data.count >= pos + 4 else { return nil }
+        pos += 4
+
+        // Skip parent block header (80 bytes)
+        guard data.count >= pos + 80 else { return nil }
+        pos += 80
+
+        return pos
+    }
+
     public static func parse(from data: Data) -> MerkleBlockMessage? {
         guard data.count >= BlockHeader.size + 4 else { return nil }
         guard let header = BlockHeader.parse(from: Data(data.prefix(BlockHeader.size))) else { return nil }
 
         var offset = BlockHeader.size
+
+        // If this is an AuxPoW block, skip the auxpow data
+        if isAuxPow(version: header.version) {
+            guard let newOffset = skipAuxPow(in: data, from: offset) else { return nil }
+            offset = newOffset
+        }
         guard let totalRaw: UInt32 = data.readInteger(at: offset) else { return nil }
         let totalTransactions = UInt32(littleEndian: totalRaw)
         offset += 4
