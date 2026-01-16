@@ -133,7 +133,7 @@ public final class HeaderChain: @unchecked Sendable {
     /// Maximum allowed time drift for block timestamps (2 hours)
     private static let maxTimeDrift: UInt32 = 7200
 
-    private static let headerStoreVersion = 1
+    private static let headerStoreVersion = 2  // Incremented due to genesis merkle root fix
 
     private struct HeaderStore: Codable {
         let version: Int
@@ -379,10 +379,20 @@ public final class HeaderChain: @unchecked Sendable {
         do {
             let data = try Data(contentsOf: fileURL)
             let headers: [StoredHeader]
+
             if let store = try? JSONDecoder().decode(HeaderStore.self, from: data) {
+                // Check version - if outdated, treat as corrupt and re-sync
+                if store.version < Self.headerStoreVersion {
+                    logger.warning("Header store version \(store.version) is outdated (current: \(Self.headerStoreVersion)), re-syncing")
+                    handleCorruptHeaders(at: fileURL)
+                    return
+                }
                 headers = store.headers
             } else {
-                headers = try JSONDecoder().decode([StoredHeader].self, from: data)
+                // Legacy format without version - treat as outdated
+                logger.warning("Legacy header store format detected, re-syncing")
+                handleCorruptHeaders(at: fileURL)
+                return
             }
 
             headersByHash = [:]
@@ -437,12 +447,15 @@ public final class HeaderChain: @unchecked Sendable {
         guard headersByHeight[0] == nil else { return }
 
         // Create genesis header based on network
+        // Note: merkle root is reversed from display format to internal byte order
+        let merkleRootInternal = Data(Data(hexString: "5b2a3f53f605d62c53e62932dac6925e3d74afa5a4b459745c36d42d0ed26a69")!.reversed())
+
         let genesis: BlockHeader
         if network == .mainnet {
             genesis = BlockHeader(
                 version: 1,
                 prevBlock: Data(count: 32),
-                merkleRoot: Data(hexString: "5b2a3f53f605d62c53e62932dac6925e3d74afa5a4b459745c36d42d0ed26a69")!,
+                merkleRoot: merkleRootInternal,
                 timestamp: 1386325540,
                 bits: 0x1e0ffff0,
                 nonce: 99943
@@ -451,7 +464,7 @@ public final class HeaderChain: @unchecked Sendable {
             genesis = BlockHeader(
                 version: 1,
                 prevBlock: Data(count: 32),
-                merkleRoot: Data(hexString: "5b2a3f53f605d62c53e62932dac6925e3d74afa5a4b459745c36d42d0ed26a69")!,
+                merkleRoot: merkleRootInternal,
                 timestamp: 1391503289,
                 bits: 0x1e0ffff0,
                 nonce: 997879
@@ -460,11 +473,21 @@ public final class HeaderChain: @unchecked Sendable {
 
         let genesisWork = (try? calculateBlockWork(for: genesis, validatePoW: true)) ?? Data(repeating: 0, count: 32)
         let stored = StoredHeader(header: genesis, height: 0, chainWork: genesisWork)
+
+        // Verify genesis hash matches expected checkpoint
+        let checkpoints = network == .mainnet ? Self.mainnetCheckpoints : Self.testnetCheckpoints
+        if let expectedHash = checkpoints[0] {
+            let actualHash = genesis.hashHex
+            if actualHash != expectedHash {
+                logger.error("Genesis hash mismatch: expected \(expectedHash), got \(actualHash)")
+            }
+        }
+
         headersByHash[genesis.hash] = stored
         headersByHeight[0] = stored
         tip = stored
 
-        logger.info("Initialized genesis block")
+        logger.info("Initialized genesis block with hash \(genesis.hashHex)")
     }
 
     // MARK: - Chainwork + Reorg

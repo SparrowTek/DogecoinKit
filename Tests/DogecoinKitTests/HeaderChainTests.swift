@@ -8,6 +8,26 @@ struct HeaderChainTests {
         Dogecoin.initialize()
     }
 
+    @Test("Mainnet genesis hash matches expected checkpoint")
+    func testMainnetGenesisHash() {
+        let storageURL = temporaryStorageURL()
+        let chain = HeaderChain(network: .mainnet, storageDirectory: storageURL)
+
+        let genesis = chain.getHeader(height: 0)
+        #expect(genesis != nil)
+        #expect(genesis?.header.hashHex == "1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691")
+    }
+
+    @Test("Testnet genesis hash matches expected checkpoint")
+    func testTestnetGenesisHash() {
+        let storageURL = temporaryStorageURL()
+        let chain = HeaderChain(network: .testnet, storageDirectory: storageURL)
+
+        let genesis = chain.getHeader(height: 0)
+        #expect(genesis != nil)
+        #expect(genesis?.header.hashHex == "bb0a78264637406b6360aad926284d544d7049f45189db5664f3c4d07350559e")
+    }
+
     @Test("Median time past validation rejects stale timestamps")
     func testMedianTimePast() throws {
         let storageURL = temporaryStorageURL()
