@@ -27,10 +27,16 @@ public struct KeyPair: Sendable, Equatable, Hashable {
         guard result == 1 else {
             throw DogecoinError.keyGenerationFailed
         }
+        
+        let privateKeyBytes = Data(privateKey.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
+        let privateKeyString = String(decoding: privateKeyBytes, as: UTF8.self)
+        
+        let addressBytes = Data(address.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
+        let addressString = String(decoding: addressBytes, as: UTF8.self)
 
         return KeyPair(
-            privateKeyWIF: String(cString: privateKey),
-            address: String(cString: address),
+            privateKeyWIF: privateKeyString,
+            address: addressString,
             network: network
         )
     }
@@ -74,7 +80,8 @@ public struct KeyPair: Sendable, Equatable, Hashable {
             throw DogecoinError.invalidPrivateKey
         }
 
-        return String(cString: pubKeyHex)
+        let bytes = Data(pubKeyHex.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
+        return String(decoding: bytes, as: UTF8.self)
     }
 }
 

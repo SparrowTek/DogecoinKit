@@ -89,6 +89,7 @@ extension String {
 extension Array where Element == CChar {
     /// Convert CChar array to Swift String, trimming null terminator
     internal var asString: String {
-        String(cString: self)
+        let bytes = Data(self.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
+        return String(decoding: bytes, as: UTF8.self)
     }
 }

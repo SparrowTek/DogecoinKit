@@ -481,7 +481,8 @@ public final class PeerManager: @unchecked Sendable {
             var addr = sockaddr.sin_addr
             inet_ntop(AF_INET, &addr, &buffer, socklen_t(INET_ADDRSTRLEN))
 
-            return String(cString: buffer)
+            let bytes = Data(buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
+            return String(decoding: bytes, as: UTF8.self)
         }
     }
 
@@ -498,7 +499,8 @@ public final class PeerManager: @unchecked Sendable {
             var addr = sockaddr.sin6_addr
             inet_ntop(AF_INET6, &addr, &buffer, socklen_t(INET6_ADDRSTRLEN))
 
-            return String(cString: buffer)
+            let bytes = Data(buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
+            return String(decoding: bytes, as: UTF8.self)
         }
     }
 

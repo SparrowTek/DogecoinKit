@@ -351,7 +351,8 @@ public func generateMnemonic(strength: MnemonicStrength = .words12) throws -> St
         throw DogecoinError.keyGenerationFailed
     }
 
-    return String(cString: mnemonic)
+    let bytes = Data(mnemonic.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
+    return String(decoding: bytes, as: UTF8.self)
 }
 
 private extension HDWallet {

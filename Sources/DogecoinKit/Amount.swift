@@ -68,7 +68,8 @@ public struct DogecoinAmount: Sendable, Equatable, Hashable, Comparable {
             return String(format: "%.8f", doge)
         }
 
-        return String(cString: buffer)
+        let bytes = Data(buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     /// Format the amount with a specific number of decimal places

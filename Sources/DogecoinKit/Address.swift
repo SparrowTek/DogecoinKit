@@ -74,7 +74,8 @@ public enum Address {
             throw DogecoinError.invalidPublicKey
         }
 
-        return String(cString: addressBuffer)
+        let bytes = Data(addressBuffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     /// Get the pubkey hash from an address
@@ -97,7 +98,8 @@ public enum Address {
             throw DogecoinError.invalidAddress(address)
         }
 
-        return String(cString: hashBuffer)
+        let bytes = Data(hashBuffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     /// Create an address from a pubkey hash
@@ -120,7 +122,8 @@ public enum Address {
             throw DogecoinError.invalidPublicKey
         }
 
-        return String(cString: addressBuffer)
+        let bytes = Data(addressBuffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
+        return String(decoding: bytes, as: UTF8.self)
     }
 }
 

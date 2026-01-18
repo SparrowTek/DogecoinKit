@@ -234,7 +234,9 @@ public struct NetworkAddress: Sendable {
         guard inet_ntop(AF_INET6, &addr, &output, socklen_t(INET6_ADDRSTRLEN)) != nil else {
             return nil
         }
-        return String(cString: output)
+        
+        let bytes = Data(output.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     /// Basic routability check (filters local/invalid addresses)
@@ -364,3 +366,4 @@ public struct VarInt: Sendable {
         }
     }
 }
+
