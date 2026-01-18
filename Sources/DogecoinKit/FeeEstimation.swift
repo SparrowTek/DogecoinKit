@@ -227,7 +227,6 @@ public enum FeeEstimation {
         guard !utxos.isEmpty else { return .zero }
 
         let totalInput = utxos.reduce(DogecoinAmount.zero) { $0 + $1.amount }
-        let fee = estimateSendFee(inputCount: utxos.count, priority: priority)
 
         // Max sendable is total - fee, output count is 1 (no change needed when sending max)
         let sendAllFee = estimateFee(inputCount: utxos.count, outputCount: 1, priority: priority)
