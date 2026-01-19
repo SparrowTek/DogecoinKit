@@ -165,7 +165,11 @@ public final class HeaderChain: @unchecked Sendable {
     }
 
     /// Create a header chain
-    public init(network: DogecoinNetwork = .mainnet, storageDirectory: URL? = nil) {
+    /// - Parameters:
+    ///   - network: The Dogecoin network (mainnet or testnet)
+    ///   - storageDirectory: Optional custom storage directory for header cache
+    ///   - bundledCacheDirectory: Optional directory containing pre-bundled headers.bin.lzfse and metadata.json
+    public init(network: DogecoinNetwork = .mainnet, storageDirectory: URL? = nil, bundledCacheDirectory: URL? = nil) {
         self.network = network
 
         if let url = storageDirectory {
@@ -176,8 +180,60 @@ public final class HeaderChain: @unchecked Sendable {
         }
 
         createStorageDirectory()
+        installBundledCacheIfNeeded(from: bundledCacheDirectory)
         loadHeaders()
         initializeGenesisIfNeeded()
+    }
+
+    /// Attempt to install bundled cache if it's newer than local cache
+    private func installBundledCacheIfNeeded(from bundledDirectory: URL?) {
+        guard let bundledDirectory else { return }
+
+        let cacheManager = HeaderCacheManager()
+        let semaphore = DispatchSemaphore(value: 0)
+
+        Task {
+            do {
+                // Load bundled metadata
+                guard let bundledMetadata = await cacheManager.loadMetadata(from: bundledDirectory) else {
+                    logger.info("No bundled cache metadata found at \(bundledDirectory.path)")
+                    semaphore.signal()
+                    return
+                }
+
+                // Load local metadata if exists
+                let localMetadata = await cacheManager.loadMetadata(from: storageURL)
+
+                // Check if we should use the bundled cache
+                let shouldInstall = await cacheManager.shouldUseBundledCache(
+                    localMetadata: localMetadata,
+                    bundledMetadata: bundledMetadata
+                )
+
+                guard shouldInstall else {
+                    logger.info("Local cache is newer or equal, skipping bundled cache installation")
+                    semaphore.signal()
+                    return
+                }
+
+                // Install the bundled cache
+                logger.info("Installing bundled cache with \(bundledMetadata.headerCount) headers")
+                try await cacheManager.installBundledCache(
+                    from: bundledDirectory,
+                    to: storageURL,
+                    network: network
+                ) { progress in
+                    // Progress could be logged or reported here
+                }
+                logger.info("Successfully installed bundled header cache")
+            } catch {
+                logger.error("Failed to install bundled cache: \(error.localizedDescription)")
+            }
+            semaphore.signal()
+        }
+
+        // Wait for async installation to complete (with timeout)
+        _ = semaphore.wait(timeout: .now() + 300) // 5 minute timeout for large caches
     }
 
     /// Add a header to the chain with full validation

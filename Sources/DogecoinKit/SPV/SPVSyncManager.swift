@@ -130,10 +130,14 @@ public final class SPVSyncManager: @unchecked Sendable {
     }
 
     /// Create an SPV sync manager
-    public init(network: DogecoinNetwork = .mainnet, storageDirectory: URL? = nil) {
+    /// - Parameters:
+    ///   - network: The Dogecoin network (mainnet or testnet)
+    ///   - storageDirectory: Optional custom storage directory for header cache
+    ///   - bundledCacheDirectory: Optional directory containing pre-bundled headers.bin.lzfse and metadata.json
+    public init(network: DogecoinNetwork = .mainnet, storageDirectory: URL? = nil, bundledCacheDirectory: URL? = nil) {
         self.network = network
         self.peerManager = PeerManager(network: network)
-        self.headerChain = HeaderChain(network: network, storageDirectory: storageDirectory)
+        self.headerChain = HeaderChain(network: network, storageDirectory: storageDirectory, bundledCacheDirectory: bundledCacheDirectory)
     }
 
     /// Start synchronization
