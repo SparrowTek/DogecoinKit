@@ -135,7 +135,7 @@ public final class HeaderChain: @unchecked Sendable {
 
     private static let headerStoreVersion = 2  // Incremented due to genesis merkle root fix
 
-    private struct HeaderStore: Codable {
+    struct HeaderStore: Codable {
         let version: Int
         let headers: [StoredHeader]
     }
