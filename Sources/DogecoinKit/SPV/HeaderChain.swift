@@ -148,7 +148,14 @@ public final class HeaderChain: @unchecked Sendable {
         case invalidTimestamp(timestamp: UInt32)
         case invalidPreviousBlock
         case futureTooFar(timestamp: UInt32)
+        case auxPowRequired(height: Int32)
+        case auxPowValidationFailed(AuxPoW.ValidationError)
     }
+
+    /// Highest checkpoint heights for each network
+    /// AuxPoW validation is required for blocks above these heights
+    private static let mainnetHighestCheckpoint: Int32 = 5_400_000
+    private static let testnetHighestCheckpoint: Int32 = 5_900_000
 
     /// Current chain height
     public var height: Int32 {
@@ -188,10 +195,35 @@ public final class HeaderChain: @unchecked Sendable {
         }
     }
 
+    /// Add a header with AuxPoW data for merged-mining validation
+    /// - Parameters:
+    ///   - header: The block header to add
+    ///   - auxpow: The AuxPoW data for validation (required for AuxPoW blocks above highest checkpoint)
+    /// - Returns: true if the header was added successfully
+    @discardableResult
+    public func addHeader(_ header: BlockHeader, auxpow: AuxPoW?) -> Bool {
+        do {
+            try addHeaderValidated(header, auxpow: auxpow)
+            return true
+        } catch {
+            logger.warning("Header validation failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
     /// Add a header with validation, throwing on errors
     /// - Parameter header: The block header to add
     /// - Throws: ValidationError if header fails validation
     public func addHeaderValidated(_ header: BlockHeader) throws {
+        try addHeaderValidated(header, auxpow: nil)
+    }
+
+    /// Add a header with validation and optional AuxPoW data
+    /// - Parameters:
+    ///   - header: The block header to add
+    ///   - auxpow: Optional AuxPoW data for merged-mining validation
+    /// - Throws: ValidationError if header fails validation
+    public func addHeaderValidated(_ header: BlockHeader, auxpow: AuxPoW?) throws {
         lock.lock()
         defer { lock.unlock() }
 
@@ -213,10 +245,33 @@ public final class HeaderChain: @unchecked Sendable {
         // Validate checkpoint if one exists at this height
         try validateCheckpoint(header: header, height: newHeight)
 
-        let requiresPoW = !Self.isAuxpow(version: header.version)
-        let blockWork = try calculateBlockWork(for: header, validatePoW: requiresPoW)
-        if !requiresPoW {
-            logAuxpowSkipIfNeeded()
+        // Determine validation strategy based on height and AuxPoW status
+        let isAuxPowBlock = AuxPoW.isAuxPow(version: header.version)
+        let highestCheckpoint = network == .mainnet ? Self.mainnetHighestCheckpoint : Self.testnetHighestCheckpoint
+        let requiresAuxPowValidation = isAuxPowBlock && newHeight > highestCheckpoint
+
+        let blockWork: Data
+        if isAuxPowBlock {
+            if requiresAuxPowValidation {
+                // Above highest checkpoint: require and validate AuxPoW
+                guard let auxpowData = auxpow else {
+                    throw ValidationError.auxPowRequired(height: newHeight)
+                }
+                do {
+                    try auxpowData.validate(dogecoinBlockHash: hash)
+                    logger.debug("AuxPoW validated for block at height \(newHeight)")
+                } catch let error as AuxPoW.ValidationError {
+                    throw ValidationError.auxPowValidationFailed(error)
+                }
+            } else {
+                // Below or at highest checkpoint: trust checkpoint validation
+                logAuxpowTrustCheckpointIfNeeded(height: newHeight)
+            }
+            // For AuxPoW blocks, calculate work without scrypt PoW validation
+            blockWork = try calculateBlockWork(for: header, validatePoW: false)
+        } else {
+            // Regular block: validate scrypt PoW
+            blockWork = try calculateBlockWork(for: header, validatePoW: true)
         }
 
         // Validate timestamp
@@ -492,10 +547,6 @@ public final class HeaderChain: @unchecked Sendable {
 
     // MARK: - Chainwork + Reorg
 
-    private static func isAuxpow(version: Int32) -> Bool {
-        (version & 0x100) == 0x100
-    }
-
     private func calculateBlockWork(for header: BlockHeader, validatePoW: Bool) throws -> Data {
         guard let target = targetFromBits(header.bits) else {
             throw ValidationError.invalidDifficulty(bits: header.bits)
@@ -733,10 +784,11 @@ public final class HeaderChain: @unchecked Sendable {
         return target
     }
 
-    private func logAuxpowSkipIfNeeded() {
+    private func logAuxpowTrustCheckpointIfNeeded(height: Int32) {
         guard !didLogAuxpowWarning else { return }
         didLogAuxpowWarning = true
-        logger.notice("AuxPoW headers detected; PoW validation is skipped without auxpow data")
+        let highestCheckpoint = network == .mainnet ? Self.mainnetHighestCheckpoint : Self.testnetHighestCheckpoint
+        logger.notice("AuxPoW block at height \(height) <= checkpoint \(highestCheckpoint): trusting checkpoint validation")
     }
 }
 

@@ -3,10 +3,13 @@ import Foundation
 public struct BlockMessage: Sendable {
     public let header: BlockHeader
     public let transactions: [Data]
+    /// AuxPoW data for merged-mined blocks (nil for regular blocks)
+    public let auxpow: AuxPoW?
 
-    public init(header: BlockHeader, transactions: [Data]) {
+    public init(header: BlockHeader, transactions: [Data], auxpow: AuxPoW? = nil) {
         self.header = header
         self.transactions = transactions
+        self.auxpow = auxpow
     }
 
     public func serialize() -> Data {
@@ -19,71 +22,20 @@ public struct BlockMessage: Sendable {
         return data
     }
 
-    /// Check if block version indicates AuxPoW (merged mining)
-    private static func isAuxPow(version: Int32) -> Bool {
-        (version & 0x100) == 0x100
-    }
-
-    /// Skip AuxPoW data and return the new offset, or nil if parsing fails
-    /// AuxPoW structure (from Dogecoin's CAuxPow which extends CMerkleTx):
-    /// - coinbase_tx (variable)
-    /// - hashBlock (32 bytes) - block hash where coinbase was included
-    /// - vMerkleBranch (varint count + 32*count) - merkle proof for coinbase
-    /// - nIndex (4 bytes) - position in merkle tree
-    /// - vChainMerkleBranch (varint count + 32*count) - chain merkle branch
-    /// - nChainIndex (4 bytes)
-    /// - parentBlock (80 bytes) - parent chain block header
-    private static func skipAuxPow(in data: Data, from offset: Int) -> Int? {
-        var pos = offset
-
-        // Skip coinbase transaction
-        guard let txEnd = TransactionParser.skipTransaction(in: data, from: pos) else { return nil }
-        pos = txEnd
-
-        // Skip hashBlock (32 bytes)
-        guard data.count >= pos + 32 else { return nil }
-        pos += 32
-
-        // Skip coinbase merkle branch (varint count + 32*count bytes)
-        guard let (branchCount1, branchSize1) = VarInt.parse(from: Data(data[pos...])) else { return nil }
-        pos += branchSize1
-        let branch1Bytes = Int(branchCount1) * 32
-        guard data.count >= pos + branch1Bytes else { return nil }
-        pos += branch1Bytes
-
-        // Skip nIndex (4 bytes)
-        guard data.count >= pos + 4 else { return nil }
-        pos += 4
-
-        // Skip chain merkle branch (varint count + 32*count bytes)
-        guard let (branchCount2, branchSize2) = VarInt.parse(from: Data(data[pos...])) else { return nil }
-        pos += branchSize2
-        let branch2Bytes = Int(branchCount2) * 32
-        guard data.count >= pos + branch2Bytes else { return nil }
-        pos += branch2Bytes
-
-        // Skip nChainIndex (4 bytes)
-        guard data.count >= pos + 4 else { return nil }
-        pos += 4
-
-        // Skip parent block header (80 bytes)
-        guard data.count >= pos + 80 else { return nil }
-        pos += 80
-
-        return pos
-    }
-
     public static func parse(from data: Data) -> BlockMessage? {
         guard data.count >= BlockHeader.size else { return nil }
         guard let header = BlockHeader.parse(from: Data(data.prefix(BlockHeader.size))) else { return nil }
 
         var offset = BlockHeader.size
+        var auxpow: AuxPoW?
 
-        // If this is an AuxPoW block, skip the auxpow data
-        if isAuxPow(version: header.version) {
-            guard let newOffset = skipAuxPow(in: data, from: offset) else { return nil }
+        // If this is an AuxPoW block, parse the auxpow data
+        if AuxPoW.isAuxPow(version: header.version) {
+            guard let (parsed, newOffset) = AuxPoW.parse(from: data, at: offset) else { return nil }
+            auxpow = parsed
             offset = newOffset
         }
+
         guard let (txCount, txCountSize) = VarInt.parse(from: Data(data[offset...])) else { return nil }
         guard txCount <= UInt64(Int.max) else { return nil }
         offset += txCountSize
@@ -96,7 +48,7 @@ public struct BlockMessage: Sendable {
             transactions.append(tx)
         }
 
-        return BlockMessage(header: header, transactions: transactions)
+        return BlockMessage(header: header, transactions: transactions, auxpow: auxpow)
     }
 
     public var transactionHashes: [Data] {
