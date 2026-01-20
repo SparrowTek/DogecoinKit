@@ -171,6 +171,118 @@ public struct HeadersMessage: Sendable {
         return data
     }
 
+    /// Check if a block version indicates AuxPoW (merged mining)
+    private static func isAuxPow(version: Int32) -> Bool {
+        (version & 0x100) == 0x100
+    }
+
+    /// Skip AuxPoW data in the buffer, returning the new offset
+    private static func skipAuxPow(in data: Data, from offset: Int) -> Int? {
+        var pos = offset
+
+        // AuxPoW structure:
+        // - coinbase tx (variable)
+        // - block hash (32 bytes)
+        // - coinbase branch (merkle branch)
+        // - blockchain branch (merkle branch)
+        // - parent block header (80 bytes)
+
+        // Skip coinbase transaction
+        guard let txEnd = skipTransaction(in: data, from: pos) else { return nil }
+        pos = txEnd
+
+        // Skip block hash (32 bytes)
+        guard data.count >= pos + 32 else { return nil }
+        pos += 32
+
+        // Skip coinbase merkle branch
+        guard let branchEnd1 = skipMerkleBranch(in: data, from: pos) else { return nil }
+        pos = branchEnd1
+
+        // Skip blockchain merkle branch
+        guard let branchEnd2 = skipMerkleBranch(in: data, from: pos) else { return nil }
+        pos = branchEnd2
+
+        // Skip parent block header (80 bytes)
+        guard data.count >= pos + 80 else { return nil }
+        pos += 80
+
+        return pos
+    }
+
+    /// Skip a transaction in the buffer
+    private static func skipTransaction(in data: Data, from offset: Int) -> Int? {
+        var pos = offset
+
+        // Version (4 bytes)
+        guard data.count >= pos + 4 else { return nil }
+        pos += 4
+
+        // Input count
+        guard let (inputCount, inputCountSize) = VarInt.parse(from: Data(data[pos...])) else { return nil }
+        pos += inputCountSize
+
+        // Skip inputs
+        for _ in 0..<inputCount {
+            // Previous output (36 bytes: 32 hash + 4 index)
+            guard data.count >= pos + 36 else { return nil }
+            pos += 36
+
+            // Script length and script
+            guard let (scriptLen, scriptLenSize) = VarInt.parse(from: Data(data[pos...])) else { return nil }
+            pos += scriptLenSize
+            guard data.count >= pos + Int(scriptLen) else { return nil }
+            pos += Int(scriptLen)
+
+            // Sequence (4 bytes)
+            guard data.count >= pos + 4 else { return nil }
+            pos += 4
+        }
+
+        // Output count
+        guard let (outputCount, outputCountSize) = VarInt.parse(from: Data(data[pos...])) else { return nil }
+        pos += outputCountSize
+
+        // Skip outputs
+        for _ in 0..<outputCount {
+            // Value (8 bytes)
+            guard data.count >= pos + 8 else { return nil }
+            pos += 8
+
+            // Script length and script
+            guard let (scriptLen, scriptLenSize) = VarInt.parse(from: Data(data[pos...])) else { return nil }
+            pos += scriptLenSize
+            guard data.count >= pos + Int(scriptLen) else { return nil }
+            pos += Int(scriptLen)
+        }
+
+        // Lock time (4 bytes)
+        guard data.count >= pos + 4 else { return nil }
+        pos += 4
+
+        return pos
+    }
+
+    /// Skip a merkle branch in the buffer
+    private static func skipMerkleBranch(in data: Data, from offset: Int) -> Int? {
+        var pos = offset
+
+        // Branch length
+        guard let (branchLen, branchLenSize) = VarInt.parse(from: Data(data[pos...])) else { return nil }
+        pos += branchLenSize
+
+        // Skip hashes (32 bytes each)
+        let hashesSize = Int(branchLen) * 32
+        guard data.count >= pos + hashesSize else { return nil }
+        pos += hashesSize
+
+        // Branch side mask (4 bytes)
+        guard data.count >= pos + 4 else { return nil }
+        pos += 4
+
+        return pos
+    }
+
     /// Parse from Data
     public static func parse(from data: Data) -> HeadersMessage? {
         guard let (count, varIntSize) = VarInt.parse(from: data) else { return nil }
@@ -183,6 +295,12 @@ public struct HeadersMessage: Sendable {
             guard let header = BlockHeader.parse(from: Data(data[offset..<offset+BlockHeader.size])) else { return nil }
             headers.append(header)
             offset += BlockHeader.size
+
+            // If this is an AuxPoW block, skip the auxpow data
+            if isAuxPow(version: header.version) {
+                guard let newOffset = skipAuxPow(in: data, from: offset) else { return nil }
+                offset = newOffset
+            }
 
             // Skip transaction count (varint, should be 0)
             if data.count > offset {
