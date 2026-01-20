@@ -107,8 +107,8 @@ public final class HeaderChain: @unchecked Sendable {
     /// Cached warning state for auxpow handling
     private var didLogAuxpowWarning = false
 
-    /// Set of header hashes that have been persisted to disk
-    private var persistedHashes: Set<Data> = []
+    /// Headers waiting to be persisted to disk (added since last save)
+    private var pendingHeaders: [StoredHeader] = []
 
     /// Binary record size: 80 (header) + 4 (height) + 32 (chainWork) = 116 bytes
     private static let binaryRecordSize = 116
@@ -379,6 +379,7 @@ public final class HeaderChain: @unchecked Sendable {
 
         // Store it
         headersByHash[hash] = stored
+        pendingHeaders.append(stored)
 
         guard let currentTip = tip else {
             headersByHeight[stored.height] = stored
@@ -545,8 +546,8 @@ public final class HeaderChain: @unchecked Sendable {
             let recordCount = data.count / Self.binaryRecordSize
 
             headersByHash = [:]
-            persistedHashes = []
-            persistedHashes.reserveCapacity(recordCount)
+            headersByHash.reserveCapacity(recordCount)
+            pendingHeaders = []
 
             for i in 0..<recordCount {
                 let offset = i * Self.binaryRecordSize
@@ -557,9 +558,7 @@ public final class HeaderChain: @unchecked Sendable {
                     continue
                 }
 
-                let hash = stored.header.hash
-                headersByHash[hash] = stored
-                persistedHashes.insert(hash)
+                headersByHash[stored.header.hash] = stored
             }
 
             recomputeChainWorkIfNeeded()
@@ -589,7 +588,7 @@ public final class HeaderChain: @unchecked Sendable {
             }
 
             headersByHash = [:]
-            persistedHashes = []
+            pendingHeaders = []
 
             for header in store.headers {
                 headersByHash[header.header.hash] = header
@@ -618,7 +617,6 @@ public final class HeaderChain: @unchecked Sendable {
 
             for header in allHeaders {
                 binaryData.append(header.serializeBinary())
-                persistedHashes.insert(header.header.hash)
             }
 
             try binaryData.write(to: binaryURL, options: .atomic)
@@ -636,16 +634,17 @@ public final class HeaderChain: @unchecked Sendable {
         let binaryURL = storageURL.appendingPathComponent("headers.bin")
 
         lock.lock()
-        let newHeaders = headersByHash.values.filter { !persistedHashes.contains($0.header.hash) }
+        let headersToSave = pendingHeaders
+        pendingHeaders.removeAll(keepingCapacity: true)
         lock.unlock()
 
-        guard !newHeaders.isEmpty else { return }
+        guard !headersToSave.isEmpty else { return }
 
         do {
             var appendData = Data()
-            appendData.reserveCapacity(newHeaders.count * Self.binaryRecordSize)
+            appendData.reserveCapacity(headersToSave.count * Self.binaryRecordSize)
 
-            for header in newHeaders {
+            for header in headersToSave {
                 appendData.append(header.serializeBinary())
             }
 
@@ -659,16 +658,13 @@ public final class HeaderChain: @unchecked Sendable {
                 try appendData.write(to: binaryURL, options: .atomic)
             }
 
-            // Track newly persisted headers
-            lock.lock()
-            for header in newHeaders {
-                persistedHashes.insert(header.header.hash)
-            }
-            lock.unlock()
-
-            logger.debug("Appended \(newHeaders.count) headers to binary file (total: \(self.persistedHashes.count))")
+            logger.debug("Appended \(headersToSave.count) headers to binary file")
         } catch {
             logger.error("Failed to save headers: \(error.localizedDescription)")
+            // Put headers back in pending queue on failure
+            lock.lock()
+            pendingHeaders.insert(contentsOf: headersToSave, at: 0)
+            lock.unlock()
         }
     }
 
