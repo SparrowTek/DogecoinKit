@@ -51,6 +51,36 @@ extension BlockHeader: Codable {
     }
 }
 
+// MARK: - Binary Serialization
+
+extension StoredHeader {
+    /// Serialize to binary format: 80 bytes header + 4 bytes height + 32 bytes chainWork = 116 bytes
+    func serializeBinary() -> Data {
+        var data = Data()
+        data.reserveCapacity(116)
+        data.append(header.serializeCore())
+        withUnsafeBytes(of: height.littleEndian) { data.append(contentsOf: $0) }
+        let paddedChainWork = chainWork.count == 32 ? chainWork : chainWork.prefix(32) + Data(repeating: 0, count: max(0, 32 - chainWork.count))
+        data.append(paddedChainWork.prefix(32))
+        return data
+    }
+
+    /// Deserialize from binary format
+    static func deserializeBinary(from data: Data) -> StoredHeader? {
+        guard data.count >= 116 else { return nil }
+
+        let headerData = data.prefix(80)
+        guard let header = BlockHeader.parse(from: Data(headerData)) else { return nil }
+
+        let heightData = data.subdata(in: 80..<84)
+        let height = heightData.withUnsafeBytes { $0.load(as: Int32.self).littleEndian }
+
+        let chainWork = data.subdata(in: 84..<116)
+
+        return StoredHeader(header: header, height: height, chainWork: chainWork)
+    }
+}
+
 /// Manages the chain of block headers for SPV verification
 public final class HeaderChain: @unchecked Sendable {
     /// The network
@@ -76,6 +106,12 @@ public final class HeaderChain: @unchecked Sendable {
 
     /// Cached warning state for auxpow handling
     private var didLogAuxpowWarning = false
+
+    /// Set of header hashes that have been persisted to disk
+    private var persistedHashes: Set<Data> = []
+
+    /// Binary record size: 80 (header) + 4 (height) + 32 (chainWork) = 116 bytes
+    private static let binaryRecordSize = 116
 
     // MARK: - Checkpoints
 
@@ -484,55 +520,153 @@ public final class HeaderChain: @unchecked Sendable {
     }
 
     private func loadHeaders() {
-        let fileURL = storageURL.appendingPathComponent("headers.json")
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
+        let binaryURL = storageURL.appendingPathComponent("headers.bin")
+        let jsonURL = storageURL.appendingPathComponent("headers.json")
 
+        // Try binary format first
+        if FileManager.default.fileExists(atPath: binaryURL.path) {
+            loadHeadersBinary(from: binaryURL)
+            return
+        }
+
+        // Fall back to JSON (migration case)
+        if FileManager.default.fileExists(atPath: jsonURL.path) {
+            loadHeadersJSON(from: jsonURL)
+            // Migrate to binary format
+            if !headersByHash.isEmpty {
+                migrateJSONToBinary(jsonURL: jsonURL, binaryURL: binaryURL)
+            }
+        }
+    }
+
+    private func loadHeadersBinary(from url: URL) {
         do {
-            let data = try Data(contentsOf: fileURL)
-            let headers: [StoredHeader]
+            let data = try Data(contentsOf: url)
+            let recordCount = data.count / Self.binaryRecordSize
 
-            if let store = try? JSONDecoder().decode(HeaderStore.self, from: data) {
-                // Check version - if outdated, treat as corrupt and re-sync
-                if store.version < Self.headerStoreVersion {
-                    logger.warning("Header store version \(store.version) is outdated (current: \(Self.headerStoreVersion)), re-syncing")
-                    handleCorruptHeaders(at: fileURL)
-                    return
+            headersByHash = [:]
+            persistedHashes = []
+            persistedHashes.reserveCapacity(recordCount)
+
+            for i in 0..<recordCount {
+                let offset = i * Self.binaryRecordSize
+                let recordData = data.subdata(in: offset..<(offset + Self.binaryRecordSize))
+
+                guard let stored = StoredHeader.deserializeBinary(from: recordData) else {
+                    logger.warning("Failed to parse header record at offset \(offset)")
+                    continue
                 }
-                headers = store.headers
-            } else {
-                // Legacy format without version - treat as outdated
+
+                let hash = stored.header.hash
+                headersByHash[hash] = stored
+                persistedHashes.insert(hash)
+            }
+
+            recomputeChainWorkIfNeeded()
+            rebuildBestChainIndex()
+
+            logger.info("Loaded \(headersByHash.count) headers from binary, tip at height \(self.tip?.height ?? -1)")
+        } catch {
+            logger.error("Failed to load binary headers: \(error.localizedDescription)")
+            handleCorruptHeaders(at: url)
+        }
+    }
+
+    private func loadHeadersJSON(from url: URL) {
+        do {
+            let data = try Data(contentsOf: url)
+
+            guard let store = try? JSONDecoder().decode(HeaderStore.self, from: data) else {
                 logger.warning("Legacy header store format detected, re-syncing")
-                handleCorruptHeaders(at: fileURL)
+                handleCorruptHeaders(at: url)
+                return
+            }
+
+            if store.version < Self.headerStoreVersion {
+                logger.warning("Header store version \(store.version) is outdated (current: \(Self.headerStoreVersion)), re-syncing")
+                handleCorruptHeaders(at: url)
                 return
             }
 
             headersByHash = [:]
-            for header in headers {
+            persistedHashes = []
+
+            for header in store.headers {
                 headersByHash[header.header.hash] = header
             }
 
             recomputeChainWorkIfNeeded()
             rebuildBestChainIndex()
 
-            logger.info("Loaded \(headers.count) headers, tip at height \(self.tip?.height ?? -1)")
+            logger.info("Loaded \(store.headers.count) headers from JSON, tip at height \(self.tip?.height ?? -1)")
         } catch {
-            logger.error("Failed to load headers: \(error.localizedDescription)")
-            handleCorruptHeaders(at: fileURL)
+            logger.error("Failed to load JSON headers: \(error.localizedDescription)")
+            handleCorruptHeaders(at: url)
+        }
+    }
+
+    private func migrateJSONToBinary(jsonURL: URL, binaryURL: URL) {
+        logger.info("Migrating \(headersByHash.count) headers from JSON to binary format")
+
+        lock.lock()
+        let allHeaders = Array(headersByHash.values)
+        lock.unlock()
+
+        do {
+            var binaryData = Data()
+            binaryData.reserveCapacity(allHeaders.count * Self.binaryRecordSize)
+
+            for header in allHeaders {
+                binaryData.append(header.serializeBinary())
+                persistedHashes.insert(header.header.hash)
+            }
+
+            try binaryData.write(to: binaryURL, options: .atomic)
+
+            // Remove old JSON file after successful migration
+            try? FileManager.default.removeItem(at: jsonURL)
+
+            logger.info("Successfully migrated to binary format")
+        } catch {
+            logger.error("Failed to migrate to binary format: \(error.localizedDescription)")
         }
     }
 
     private func saveHeaders() {
-        let fileURL = storageURL.appendingPathComponent("headers.json")
+        let binaryURL = storageURL.appendingPathComponent("headers.bin")
 
         lock.lock()
-        let headers = Array(headersByHash.values)
+        let newHeaders = headersByHash.values.filter { !persistedHashes.contains($0.header.hash) }
         lock.unlock()
 
+        guard !newHeaders.isEmpty else { return }
+
         do {
-            let store = HeaderStore(version: Self.headerStoreVersion, headers: headers)
-            let data = try JSONEncoder().encode(store)
-            try data.write(to: fileURL, options: .atomic)
-            logger.debug("Saved \(headers.count) headers")
+            var appendData = Data()
+            appendData.reserveCapacity(newHeaders.count * Self.binaryRecordSize)
+
+            for header in newHeaders {
+                appendData.append(header.serializeBinary())
+            }
+
+            // Append to existing file or create new one
+            if FileManager.default.fileExists(atPath: binaryURL.path) {
+                let handle = try FileHandle(forWritingTo: binaryURL)
+                try handle.seekToEnd()
+                try handle.write(contentsOf: appendData)
+                try handle.close()
+            } else {
+                try appendData.write(to: binaryURL, options: .atomic)
+            }
+
+            // Track newly persisted headers
+            lock.lock()
+            for header in newHeaders {
+                persistedHashes.insert(header.header.hash)
+            }
+            lock.unlock()
+
+            logger.debug("Appended \(newHeaders.count) headers to binary file (total: \(persistedHashes.count))")
         } catch {
             logger.error("Failed to save headers: \(error.localizedDescription)")
         }
