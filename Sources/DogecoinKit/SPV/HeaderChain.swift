@@ -565,7 +565,7 @@ public final class HeaderChain: @unchecked Sendable {
             recomputeChainWorkIfNeeded()
             rebuildBestChainIndex()
 
-            logger.info("Loaded \(headersByHash.count) headers from binary, tip at height \(self.tip?.height ?? -1)")
+            logger.info("Loaded \(self.headersByHash.count) headers from binary, tip at height \(self.tip?.height ?? -1)")
         } catch {
             logger.error("Failed to load binary headers: \(error.localizedDescription)")
             handleCorruptHeaders(at: url)
@@ -606,7 +606,7 @@ public final class HeaderChain: @unchecked Sendable {
     }
 
     private func migrateJSONToBinary(jsonURL: URL, binaryURL: URL) {
-        logger.info("Migrating \(headersByHash.count) headers from JSON to binary format")
+        logger.info("Migrating \(self.headersByHash.count) headers from JSON to binary format")
 
         lock.lock()
         let allHeaders = Array(headersByHash.values)
@@ -666,7 +666,7 @@ public final class HeaderChain: @unchecked Sendable {
             }
             lock.unlock()
 
-            logger.debug("Appended \(newHeaders.count) headers to binary file (total: \(persistedHashes.count))")
+            logger.debug("Appended \(newHeaders.count) headers to binary file (total: \(self.persistedHashes.count))")
         } catch {
             logger.error("Failed to save headers: \(error.localizedDescription)")
         }
