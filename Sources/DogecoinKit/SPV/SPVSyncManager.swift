@@ -463,6 +463,10 @@ public final class SPVSyncManager: @unchecked Sendable {
             if currentHeight >= targetHeight {
                 setState(.synchronized)
                 delegate?.spvSyncDidComplete(self)
+            } else {
+                // Peer returned empty but we're not at target - try another peer
+                logger.info("Still below target height (\(self.currentHeight) < \(self.targetHeight)), trying next peer")
+                retryWithNextPeer()
             }
             return
         }
@@ -488,12 +492,14 @@ public final class SPVSyncManager: @unchecked Sendable {
         // Update progress
         delegate?.spvSync(self, progressUpdated: progress, height: currentHeight)
 
-        // Request more if we got a full batch
-        if headers.count >= 2000 {
-            requestHeaders(from: peer)
-        } else if currentHeight >= targetHeight {
+        // Request more headers or mark as synchronized
+        if currentHeight >= targetHeight {
             setState(.synchronized)
             delegate?.spvSyncDidComplete(self)
+        } else {
+            // Continue requesting headers until we reach target height
+            // Even partial batches (< 2000) mean the peer may have more
+            requestHeaders(from: peer)
         }
     }
 }
