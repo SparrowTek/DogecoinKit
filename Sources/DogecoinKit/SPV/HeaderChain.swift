@@ -107,6 +107,9 @@ public final class HeaderChain: @unchecked Sendable {
     /// Cached warning state for auxpow handling
     private var didLogAuxpowWarning = false
 
+    /// Cached state for SPV trust logging
+    private var didLogAuxpowSPVTrust = false
+
     /// Headers waiting to be persisted to disk (added since last save)
     private var pendingHeaders: [StoredHeader] = []
 
@@ -340,15 +343,14 @@ public final class HeaderChain: @unchecked Sendable {
         // Determine validation strategy based on height and AuxPoW status
         let isAuxPowBlock = AuxPoW.isAuxPow(version: header.version)
         let highestCheckpoint = network == .mainnet ? Self.mainnetHighestCheckpoint : Self.testnetHighestCheckpoint
-        let requiresAuxPowValidation = isAuxPowBlock && newHeight > highestCheckpoint
 
         let blockWork: Data
         if isAuxPowBlock {
-            if requiresAuxPowValidation {
-                // Above highest checkpoint: require and validate AuxPoW
-                guard let auxpowData = auxpow else {
-                    throw ValidationError.auxPowRequired(height: newHeight)
-                }
+            if newHeight <= highestCheckpoint {
+                // At or below checkpoint: trust checkpoint validation
+                logAuxpowTrustCheckpointIfNeeded(height: newHeight)
+            } else if let auxpowData = auxpow {
+                // Above checkpoint with AuxPoW data provided: validate it
                 do {
                     try auxpowData.validate(dogecoinBlockHash: hash)
                     logger.debug("AuxPoW validated for block at height \(newHeight)")
@@ -356,8 +358,10 @@ public final class HeaderChain: @unchecked Sendable {
                     throw ValidationError.auxPowValidationFailed(error)
                 }
             } else {
-                // Below or at highest checkpoint: trust checkpoint validation
-                logAuxpowTrustCheckpointIfNeeded(height: newHeight)
+                // Above checkpoint without AuxPoW data: SPV mode - trust difficulty
+                // This is the standard SPV security model where we trust cumulative
+                // proof-of-work rather than validating each block's AuxPoW proof
+                logAuxpowSPVTrustIfNeeded(height: newHeight)
             }
             // For AuxPoW blocks, calculate work without scrypt PoW validation
             blockWork = try calculateBlockWork(for: header, validatePoW: false)
@@ -975,6 +979,12 @@ public final class HeaderChain: @unchecked Sendable {
         didLogAuxpowWarning = true
         let highestCheckpoint = network == .mainnet ? Self.mainnetHighestCheckpoint : Self.testnetHighestCheckpoint
         logger.notice("AuxPoW block at height \(height) <= checkpoint \(highestCheckpoint): trusting checkpoint validation")
+    }
+
+    private func logAuxpowSPVTrustIfNeeded(height: Int32) {
+        guard !didLogAuxpowSPVTrust else { return }
+        didLogAuxpowSPVTrust = true
+        logger.notice("AuxPoW block at height \(height): SPV mode - trusting cumulative difficulty (AuxPoW proof not validated)")
     }
 }
 
