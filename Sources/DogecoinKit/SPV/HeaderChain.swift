@@ -460,6 +460,11 @@ public final class HeaderChain: @unchecked Sendable {
         return added
     }
 
+    /// Flush any pending headers to disk
+    public func flush() {
+        saveHeaders()
+    }
+
     /// Get a header by hash
     public func getHeader(hash: Data) -> StoredHeader? {
         lock.lock()

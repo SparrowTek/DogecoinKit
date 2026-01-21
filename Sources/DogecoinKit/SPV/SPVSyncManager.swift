@@ -296,6 +296,10 @@ public final class SPVSyncManager: @unchecked Sendable {
 
         stopTimeoutTimer()
         peerManager.stop()
+
+        // Flush any pending headers to disk before stopping
+        headerChain.flush()
+
         withLock { state in
             state.syncPeer = nil
             state.waitingForHeaders = false
