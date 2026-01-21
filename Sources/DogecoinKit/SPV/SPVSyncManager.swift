@@ -54,6 +54,9 @@ public final class SPVSyncManager: @unchecked Sendable {
         var targetHeight: Int32 = 0
         var syncPeer: Peer?
         var waitingForHeaders = false
+        var headerRequestTime: Date?
+        var lastProgressTime: Date?
+        var filteredBlockRequestTime: Date?
     }
 
     private struct PendingMerkleBlock: Sendable {
@@ -113,6 +116,18 @@ public final class SPVSyncManager: @unchecked Sendable {
     private let filteredBlockBatchSize = 32
     private let maxFilteredBlocksInFlight = 128
 
+    /// Timeout for header requests (seconds)
+    private let headerRequestTimeout: TimeInterval = 60
+
+    /// Timeout for filtered block requests (seconds)
+    private let filteredBlockTimeout: TimeInterval = 120
+
+    /// Interval between timeout checks (seconds)
+    private let timeoutCheckInterval: TimeInterval = 5
+
+    /// Timer for periodic timeout checks
+    private var timeoutTimer: DispatchSourceTimer?
+
     private func withLock<T>(_ body: (inout SyncState) -> T) -> T {
         lock.lock()
         defer { lock.unlock() }
@@ -127,6 +142,120 @@ public final class SPVSyncManager: @unchecked Sendable {
 
     private func setState(_ newState: SPVSyncState) {
         withLock { $0.state = newState }
+    }
+
+    private func startTimeoutTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.schedule(
+            deadline: .now() + timeoutCheckInterval,
+            repeating: timeoutCheckInterval
+        )
+        timer.setEventHandler { [weak self] in
+            self?.checkTimeouts()
+        }
+        timeoutTimer = timer
+        timer.resume()
+    }
+
+    private func stopTimeoutTimer() {
+        timeoutTimer?.cancel()
+        timeoutTimer = nil
+    }
+
+    private func checkTimeouts() {
+        let now = Date()
+
+        // Check header request timeout
+        let headerTimeout = withLock { state -> Bool in
+            guard state.waitingForHeaders,
+                  let requestTime = state.headerRequestTime,
+                  now.timeIntervalSince(requestTime) > headerRequestTimeout else {
+                return false
+            }
+            return true
+        }
+
+        if headerTimeout {
+            logger.warning("Header request timed out")
+            handleHeaderRequestTimeout()
+        }
+
+        // Check filtered block timeout
+        let filteredTimeout = withTxLock { state -> Bool in
+            guard state.filteredBlocksInFlight > 0,
+                  let requestTime = withLock({ $0.filteredBlockRequestTime }),
+                  now.timeIntervalSince(requestTime) > filteredBlockTimeout else {
+                return false
+            }
+            return true
+        }
+
+        if filteredTimeout {
+            logger.warning("Filtered block request timed out")
+            handleFilteredBlockTimeout()
+        }
+    }
+
+    private func handleHeaderRequestTimeout() {
+        let currentPeer = withLock { state -> Peer? in
+            state.waitingForHeaders = false
+            state.headerRequestTime = nil
+            let peer = state.syncPeer
+            state.syncPeer = nil
+            return peer
+        }
+
+        // Disconnect the unresponsive peer
+        if let peer = currentPeer {
+            logger.info("Disconnecting unresponsive peer: \(peer.host)")
+            peerManager.removePeer(peer)
+        }
+
+        // Try to find another peer
+        retryWithNextPeer()
+    }
+
+    private func handleFilteredBlockTimeout() {
+        // Reset the counter to allow new requests
+        withTxLock { state in
+            state.filteredBlocksInFlight = 0
+        }
+        withLock { state in
+            state.filteredBlockRequestTime = nil
+        }
+
+        logger.info("Resetting filtered blocks and retrying")
+        requestFilteredBlocksIfNeeded()
+    }
+
+    private func retryWithNextPeer() {
+        if let nextPeer = peerManager.connectedPeers.first {
+            withLock { $0.syncPeer = nextPeer }
+            logger.info("Switching to peer: \(nextPeer.host)")
+            requestHeaders(from: nextPeer)
+        } else {
+            logger.info("No peers available, waiting for connection")
+            scheduleRetryWhenPeersAvailable()
+        }
+    }
+
+    private func scheduleRetryWhenPeersAvailable() {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self else { return }
+
+            let shouldRetry = withLock { state in
+                state.syncPeer == nil && state.state == .syncing
+            }
+
+            guard shouldRetry else { return }
+
+            if let peer = peerManager.connectedPeers.first {
+                withLock { $0.syncPeer = peer }
+                requestHeaders(from: peer)
+            } else {
+                scheduleRetryWhenPeersAvailable()
+            }
+        }
     }
 
     /// Create an SPV sync manager
@@ -145,6 +274,7 @@ public final class SPVSyncManager: @unchecked Sendable {
         let canStart = withLock { state in
             guard state.state == .idle else { return false }
             state.state = .connecting
+            state.lastProgressTime = Date()
             return true
         }
 
@@ -155,6 +285,7 @@ public final class SPVSyncManager: @unchecked Sendable {
 
         logger.info("Starting SPV sync")
 
+        startTimeoutTimer()
         peerManager.delegate = self
         peerManager.start()
     }
@@ -163,10 +294,13 @@ public final class SPVSyncManager: @unchecked Sendable {
     public func stop() {
         logger.info("Stopping SPV sync")
 
+        stopTimeoutTimer()
         peerManager.stop()
         withLock { state in
             state.syncPeer = nil
             state.waitingForHeaders = false
+            state.headerRequestTime = nil
+            state.filteredBlockRequestTime = nil
             state.state = .idle
         }
     }
@@ -291,6 +425,9 @@ public final class SPVSyncManager: @unchecked Sendable {
             state.nextFilteredHeight = height
             state.filteredBlocksInFlight += inventory.count
         }
+        withLock { state in
+            state.filteredBlockRequestTime = Date()
+        }
 
         peer.sendGetData(inventory: inventory)
     }
@@ -300,6 +437,7 @@ public final class SPVSyncManager: @unchecked Sendable {
         let canRequest = withLock { state in
             guard !state.waitingForHeaders else { return false }
             state.waitingForHeaders = true
+            state.headerRequestTime = Date()
             return true
         }
 
@@ -313,7 +451,11 @@ public final class SPVSyncManager: @unchecked Sendable {
 
     /// Handle received headers
     private func handleHeaders(_ headers: [BlockHeader], from peer: Peer) {
-        withLock { $0.waitingForHeaders = false }
+        withLock { state in
+            state.waitingForHeaders = false
+            state.headerRequestTime = nil
+            state.lastProgressTime = Date()
+        }
 
         guard !headers.isEmpty else {
             logger.info("No more headers from \(peer.host)")
@@ -396,16 +538,14 @@ extension SPVSyncManager: PeerManagerDelegate {
             guard peer == state.syncPeer else { return false }
             state.syncPeer = nil
             state.waitingForHeaders = false
+            state.headerRequestTime = nil
             return true
         }
 
         guard shouldReconnect else { return }
 
-        // Try another peer
-        if let nextPeer = manager.connectedPeers.first {
-            withLock { $0.syncPeer = nextPeer }
-            requestHeaders(from: nextPeer)
-        }
+        // Try another peer with retry logic if none available
+        retryWithNextPeer()
     }
 
     public func peerManager(_ manager: PeerManager, peer: Peer, didReceiveMessage message: ProtocolMessage) {
