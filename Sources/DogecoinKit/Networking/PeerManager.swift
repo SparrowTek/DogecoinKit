@@ -400,6 +400,19 @@ public final class PeerManager: @unchecked Sendable {
             for seed in seeds {
                 self.resolveHost(seed)
             }
+
+            // If DNS resolution failed, use hardcoded fallback nodes
+            self.queue.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self = self else { return }
+
+                if self.connectedPeerCount == 0 && self.network == .mainnet {
+                    self.logger.info("DNS seeds failed, trying fallback nodes")
+                    for node in NetworkConstants.mainnetFallbackNodes {
+                        self.addDiscoveredAddress(host: node.host, port: node.port)
+                    }
+                    self.connectToDiscoveredPeers()
+                }
+            }
         }
     }
 

@@ -40,6 +40,19 @@ public enum NetworkConstants {
         "seed.dogechain.info"
     ]
 
+    /// Hardcoded fallback node IPs for mainnet (used when DNS seeds fail)
+    /// Updated 2026-01 from blockchair.com/dogecoin/nodes
+    public static let mainnetFallbackNodes: [(host: String, port: UInt16)] = [
+        ("104.248.81.232", 22556),   // NL - Shibetoshi:1.14.9
+        ("108.31.131.157", 22556),   // US - Shibetoshi:1.14.9
+        ("104.153.44.42", 22556),    // US - Shibetoshi:1.14.9
+        ("162.55.185.119", 22556),   // DE - Shibetoshi:1.14.9
+        ("144.126.147.210", 22556),  // US - Shibetoshi:1.14.9
+        ("159.203.16.119", 22556),   // US - Shibetoshi:1.14.9
+        ("149.28.246.230", 22556),   // US - Shibetoshi:1.14.9
+        ("185.165.169.182", 22556),  // DE - Shibetoshi:1.14.9
+    ]
+
     /// DNS seeds for testnet
     public static let testnetSeeds = [
         "testnetseed.jrn.me.uk"

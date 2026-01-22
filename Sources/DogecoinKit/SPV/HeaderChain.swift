@@ -694,6 +694,7 @@ public final class HeaderChain: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
+        // If genesis already exists in the chain, nothing to do
         guard headersByHeight[0] == nil else { return }
 
         // Create genesis header based on network
@@ -735,9 +736,15 @@ public final class HeaderChain: @unchecked Sendable {
 
         headersByHash[genesis.hash] = stored
         headersByHeight[0] = stored
-        tip = stored
 
-        logger.info("Initialized genesis block with hash \(genesis.hashHex)")
+        // Only set tip to genesis if we don't have a better tip already
+        // This handles the case where we loaded headers but are missing genesis
+        if tip == nil {
+            tip = stored
+            logger.info("Initialized genesis block as tip with hash \(genesis.hashHex)")
+        } else {
+            logger.info("Added missing genesis block with hash \(genesis.hashHex), keeping existing tip at height \(self.tip?.height ?? -1)")
+        }
     }
 
     // MARK: - Chainwork + Reorg
