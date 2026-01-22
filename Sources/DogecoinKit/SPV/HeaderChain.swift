@@ -498,7 +498,7 @@ public final class HeaderChain: @unchecked Sendable {
         defer { lock.unlock() }
 
         var locator: [Data] = []
-        var step = 1
+        var step: Int32 = 1
         var height = tip?.height ?? 0
 
         while height >= 0 {
@@ -507,10 +507,11 @@ public final class HeaderChain: @unchecked Sendable {
             }
 
             if locator.count >= 10 {
-                step *= 2
+                // Cap step to prevent overflow - max step of ~1 billion is plenty
+                step = step <= 536_870_912 ? step * 2 : step
             }
 
-            height -= Int32(step)
+            height -= step
         }
 
         // Always include genesis
