@@ -218,9 +218,10 @@ public final class HeaderChain: @unchecked Sendable {
         }
 
         createStorageDirectory()
+        // Check bundled cache BEFORE opening database (avoids close/reopen issues)
+        installBundledCacheIfNeeded(from: bundledCacheDirectory)
         openOrCreateDatabase()
         migrateFromBinaryIfNeeded()
-        installBundledCacheIfNeeded(from: bundledCacheDirectory)
         loadTipFromDatabase()
         initializeGenesisIfNeeded()
     }
@@ -314,23 +315,41 @@ public final class HeaderChain: @unchecked Sendable {
     }
 
     /// Attempt to install bundled cache if it's newer than local cache
+    /// Called BEFORE opening the database to avoid close/reopen issues
     private func installBundledCacheIfNeeded(from bundledDirectory: URL?) {
         guard let bundledDirectory else { return }
 
         let bundledDBPath = bundledDirectory.appendingPathComponent("headers.sqlite")
+        let bundledMetadataPath = bundledDirectory.appendingPathComponent("metadata.json")
+
         guard FileManager.default.fileExists(atPath: bundledDBPath.path) else {
             logger.info("No bundled SQLite database found at \(bundledDBPath.path)")
             return
         }
 
-        guard let localDB = database else { return }
+        guard FileManager.default.fileExists(atPath: bundledMetadataPath.path) else {
+            logger.info("No bundled metadata found at \(bundledMetadataPath.path)")
+            return
+        }
 
         do {
-            let localCount = try localDB.getHeaderCount()
+            // Read bundled count from metadata (don't open the DB - bundle is read-only)
+            let metadataData = try Data(contentsOf: bundledMetadataPath)
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let metadata = try decoder.decode(HeaderCacheMetadata.self, from: metadataData)
+            let bundledCount = metadata.headerCount
 
-            // Open bundled database to check its count
-            let bundledDB = try HeaderDatabase(path: bundledDBPath.path)
-            let bundledCount = try bundledDB.getHeaderCount()
+            // Check local database count (if it exists)
+            let localDBPath = storageURL.appendingPathComponent("headers.sqlite")
+            var localCount = 0
+
+            if FileManager.default.fileExists(atPath: localDBPath.path) {
+                // Temporarily open local DB just to get count, then close
+                let tempDB = try HeaderDatabase(path: localDBPath.path)
+                localCount = try tempDB.getHeaderCount()
+                // tempDB will be deallocated here, closing the connection
+            }
 
             guard bundledCount > localCount else {
                 logger.info("Local database has \(localCount) headers, bundled has \(bundledCount). Skipping install.")
@@ -339,14 +358,13 @@ public final class HeaderChain: @unchecked Sendable {
 
             logger.info("Installing bundled cache: \(bundledCount) headers (local has \(localCount))")
 
-            // Copy bundled database over local
-            let localDBPath = storageURL.appendingPathComponent("headers.sqlite")
+            // Remove local database files (including WAL/SHM)
             try? FileManager.default.removeItem(at: localDBPath)
-            try FileManager.default.copyItem(at: bundledDBPath, to: localDBPath)
+            try? FileManager.default.removeItem(atPath: localDBPath.path + "-wal")
+            try? FileManager.default.removeItem(atPath: localDBPath.path + "-shm")
 
-            // Reopen database
-            database = try HeaderDatabase(path: localDBPath.path)
-            loadTipFromDatabase()
+            // Copy bundled database to local storage
+            try FileManager.default.copyItem(at: bundledDBPath, to: localDBPath)
 
             logger.info("Successfully installed bundled header cache")
         } catch {
