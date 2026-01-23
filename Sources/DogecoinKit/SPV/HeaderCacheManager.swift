@@ -13,12 +13,14 @@ public enum HeaderCacheError: Error, Sendable {
     case invalidHeaderData(height: Int)
     case chainValidationFailed(height: Int, reason: String)
     case installationFailed(String)
+    case databaseError(Error)
 }
 
 /// Manages bundled header cache installation and validation
 public actor HeaderCacheManager {
     /// Standard file names for the cache bundle
-    public static let headersFileName = "headers.bin.lzfse"
+    public static let headersFileName = "headers.sqlite"
+    public static let legacyHeadersFileName = "headers.bin.lzfse"
     public static let metadataFileName = "metadata.json"
 
     private let logger = Logger(subsystem: "DogecoinKit", category: "HeaderCacheManager")
@@ -67,8 +69,9 @@ public actor HeaderCacheManager {
     }
 
     /// Install a bundled header cache to the local storage directory
+    /// This method handles both SQLite and legacy LZFSE formats
     /// - Parameters:
-    ///   - bundleDirectory: Directory containing the bundled headers.bin.lzfse and metadata.json
+    ///   - bundleDirectory: Directory containing the bundled headers.sqlite (or headers.bin.lzfse) and metadata.json
     ///   - localDirectory: Target directory for the installed cache
     ///   - network: Expected network (mainnet/testnet) for validation
     ///   - progressHandler: Optional closure called with progress (0.0 to 1.0)
@@ -80,16 +83,13 @@ public actor HeaderCacheManager {
         network: DogecoinNetwork,
         progressHandler: (@Sendable (Double) -> Void)? = nil
     ) async throws -> HeaderCacheMetadata {
-        let headersURL = bundleDirectory.appendingPathComponent(Self.headersFileName)
+        let sqliteURL = bundleDirectory.appendingPathComponent(Self.headersFileName)
+        let lzfseURL = bundleDirectory.appendingPathComponent(Self.legacyHeadersFileName)
         let metadataURL = bundleDirectory.appendingPathComponent(Self.metadataFileName)
 
         // Load and validate metadata
         guard FileManager.default.fileExists(atPath: metadataURL.path) else {
             throw HeaderCacheError.metadataNotFound(metadataURL)
-        }
-
-        guard FileManager.default.fileExists(atPath: headersURL.path) else {
-            throw HeaderCacheError.headersFileNotFound(headersURL)
         }
 
         let metadata = try loadMetadataOrThrow(from: metadataURL)
@@ -99,28 +99,20 @@ public actor HeaderCacheManager {
             throw HeaderCacheError.networkMismatch(expected: expectedNetwork, actual: metadata.network)
         }
 
-        // Verify checksum
         progressHandler?(0.0)
-        let actualChecksum = try await computeChecksum(of: headersURL)
-
-        guard normalizedHex(actualChecksum) == normalizedHex(metadata.checksumSHA256) else {
-            throw HeaderCacheError.checksumMismatch(expected: metadata.checksumSHA256, actual: actualChecksum)
-        }
-
-        progressHandler?(0.1)
 
         // Create local directory if needed
         try FileManager.default.createDirectory(at: localDirectory, withIntermediateDirectories: true)
 
-        // Decompress and write headers to the local headers.json format
-        let localHeadersURL = localDirectory.appendingPathComponent("headers.json")
-        try await decompressAndConvert(
-            from: headersURL,
-            to: localHeadersURL,
-            metadata: metadata,
-            network: network,
-            progressHandler: progressHandler
-        )
+        // Check for SQLite format first (preferred)
+        if FileManager.default.fileExists(atPath: sqliteURL.path) {
+            try installSQLiteCache(from: sqliteURL, to: localDirectory, metadata: metadata, progressHandler: progressHandler)
+        } else if FileManager.default.fileExists(atPath: lzfseURL.path) {
+            // Fall back to LZFSE format (legacy)
+            try await installLZFSECache(from: lzfseURL, to: localDirectory, metadata: metadata, progressHandler: progressHandler)
+        } else {
+            throw HeaderCacheError.headersFileNotFound(sqliteURL)
+        }
 
         // Copy metadata for reference
         let localMetadataURL = localDirectory.appendingPathComponent(Self.metadataFileName)
@@ -139,21 +131,188 @@ public actor HeaderCacheManager {
     ///   - metadata: Expected metadata to verify against
     /// - Returns: true if the cache is valid
     public func verifyInstalledCache(at directoryURL: URL, metadata: HeaderCacheMetadata) -> Bool {
-        let headersURL = directoryURL.appendingPathComponent("headers.json")
+        let sqliteURL = directoryURL.appendingPathComponent(Self.headersFileName)
 
-        guard FileManager.default.fileExists(atPath: headersURL.path) else {
+        guard FileManager.default.fileExists(atPath: sqliteURL.path) else {
             return false
         }
 
         do {
-            let data = try Data(contentsOf: headersURL)
-            guard let store = try? JSONDecoder().decode(HeaderChain.HeaderStore.self, from: data) else {
-                return false
-            }
-            return store.headers.count == metadata.headerCount
+            let db = try HeaderDatabase(path: sqliteURL.path)
+            let count = try db.getHeaderCount()
+            return count == metadata.headerCount
         } catch {
+            logger.error("Failed to verify cache: \(error.localizedDescription)")
             return false
         }
+    }
+
+    // MARK: - Private Installation Methods
+
+    private func installSQLiteCache(
+        from sourceURL: URL,
+        to localDirectory: URL,
+        metadata: HeaderCacheMetadata,
+        progressHandler: (@Sendable (Double) -> Void)?
+    ) throws {
+        progressHandler?(0.1)
+
+        let localSQLiteURL = localDirectory.appendingPathComponent(Self.headersFileName)
+
+        // Simply copy the SQLite file
+        try? FileManager.default.removeItem(at: localSQLiteURL)
+        try FileManager.default.copyItem(at: sourceURL, to: localSQLiteURL)
+
+        progressHandler?(0.9)
+
+        // Verify the copied database
+        let db = try HeaderDatabase(path: localSQLiteURL.path)
+        let count = try db.getHeaderCount()
+
+        guard count == metadata.headerCount else {
+            throw HeaderCacheError.headerCountMismatch(expected: metadata.headerCount, actual: count)
+        }
+
+        logger.info("Installed SQLite cache with \(count) headers")
+    }
+
+    private func installLZFSECache(
+        from compressedURL: URL,
+        to localDirectory: URL,
+        metadata: HeaderCacheMetadata,
+        progressHandler: (@Sendable (Double) -> Void)?
+    ) async throws {
+        // Verify checksum first
+        let actualChecksum = try await computeChecksum(of: compressedURL)
+
+        guard normalizedHex(actualChecksum) == normalizedHex(metadata.checksumSHA256) else {
+            throw HeaderCacheError.checksumMismatch(expected: metadata.checksumSHA256, actual: actualChecksum)
+        }
+
+        progressHandler?(0.1)
+
+        let localSQLiteURL = localDirectory.appendingPathComponent(Self.headersFileName)
+
+        // Remove existing database
+        try? FileManager.default.removeItem(at: localSQLiteURL)
+
+        // Create new database
+        let db = try HeaderDatabase(path: localSQLiteURL.path)
+
+        // Stream from LZFSE directly to SQLite
+        try await decompressToSQLite(
+            from: compressedURL,
+            database: db,
+            metadata: metadata,
+            progressHandler: progressHandler
+        )
+    }
+
+    private func decompressToSQLite(
+        from compressedURL: URL,
+        database: HeaderDatabase,
+        metadata: HeaderCacheMetadata,
+        progressHandler: (@Sendable (Double) -> Void)?
+    ) async throws {
+        // Use a class to hold mutable state for safe capture in closure
+        final class DecompressState: @unchecked Sendable {
+            var leftover = Data()
+            var headerCount = 0
+            var previousHash: Data?
+            var cumulativeChainWork = Data(repeating: 0, count: 32)
+            var batch: [HeaderRecord] = []
+        }
+        let state = DecompressState()
+        let batchSize = 10000
+
+        let expectedTotal = metadata.headerCount
+        let progressBase = 0.1
+        let progressRange = 0.85
+
+        try LZFSEDecompressor.decompress(from: compressedURL) { [self] chunk in
+            let combined: Data
+            if state.leftover.isEmpty {
+                combined = chunk
+            } else {
+                var merged = Data()
+                merged.reserveCapacity(state.leftover.count + chunk.count)
+                merged.append(state.leftover)
+                merged.append(chunk)
+                combined = merged
+            }
+
+            var offset = 0
+            while combined.count - offset >= BlockHeader.size {
+                let range = offset..<(offset + BlockHeader.size)
+                let headerData = combined.subdata(in: range)
+
+                guard let header = BlockHeader.parse(from: headerData) else {
+                    throw HeaderCacheError.invalidHeaderData(height: state.headerCount)
+                }
+
+                // Validate chain linkage
+                if state.headerCount == 0 {
+                    if header.prevBlock != Data(count: 32) {
+                        throw HeaderCacheError.chainValidationFailed(height: 0, reason: "Invalid genesis block")
+                    }
+                } else if let previous = state.previousHash, header.prevBlock != previous {
+                    throw HeaderCacheError.chainValidationFailed(height: state.headerCount, reason: "Chain linkage broken")
+                }
+
+                // Calculate chain work
+                let blockWork = calculateBlockWork(bits: header.bits)
+                state.cumulativeChainWork = addWork(state.cumulativeChainWork, blockWork)
+
+                // Create record
+                let record = HeaderRecord(
+                    hash: header.hash,
+                    prevBlockHash: header.prevBlock,
+                    height: Int32(state.headerCount),
+                    chainWork: state.cumulativeChainWork,
+                    version: header.version,
+                    merkleRoot: header.merkleRoot,
+                    timestamp: header.timestamp,
+                    bits: header.bits,
+                    nonce: header.nonce,
+                    isInBestChain: true
+                )
+                state.batch.append(record)
+
+                state.previousHash = header.hash
+                state.headerCount += 1
+                offset += BlockHeader.size
+
+                // Flush batch to database
+                if state.batch.count >= batchSize {
+                    try database.insertHeaders(state.batch)
+                    state.batch.removeAll(keepingCapacity: true)
+
+                    let progress = progressBase + progressRange * (Double(state.headerCount) / Double(expectedTotal))
+                    progressHandler?(min(progress, 0.95))
+                }
+            }
+
+            if offset < combined.count {
+                state.leftover = combined.subdata(in: offset..<combined.count)
+            } else {
+                state.leftover.removeAll(keepingCapacity: true)
+            }
+        }
+
+        // Flush remaining batch
+        if !state.batch.isEmpty {
+            try database.insertHeaders(state.batch)
+        }
+
+        guard state.leftover.isEmpty else {
+            throw HeaderCacheError.installationFailed("Trailing bytes after decompression")
+        }
+
+        guard state.headerCount == metadata.headerCount else {
+            throw HeaderCacheError.headerCountMismatch(expected: metadata.headerCount, actual: state.headerCount)
+        }
+
+        logger.info("Decompressed \(state.headerCount) headers to SQLite")
     }
 
     // MARK: - Private Helpers
@@ -186,139 +345,10 @@ public actor HeaderCacheManager {
         }
     }
 
-    private func decompressAndConvert(
-        from compressedURL: URL,
-        to outputURL: URL,
-        metadata: HeaderCacheMetadata,
-        network: DogecoinNetwork,
-        progressHandler: (@Sendable (Double) -> Void)?
-    ) async throws {
-        var headers: [StoredHeader] = []
-        headers.reserveCapacity(metadata.headerCount)
-
-        var leftover = Data()
-        var headerCount = 0
-        var previousHash: Data?
-
-        let expectedTotal = metadata.headerCount
-        let progressBase = 0.1
-        let progressRange = 0.85
-
-        try LZFSEDecompressor.decompress(from: compressedURL) { chunk in
-            let combined: Data
-            if leftover.isEmpty {
-                combined = chunk
-            } else {
-                var merged = Data()
-                merged.reserveCapacity(leftover.count + chunk.count)
-                merged.append(leftover)
-                merged.append(chunk)
-                combined = merged
-            }
-
-            var offset = 0
-            while combined.count - offset >= BlockHeader.size {
-                let range = offset..<(offset + BlockHeader.size)
-                let headerData = combined.subdata(in: range)
-
-                guard let header = BlockHeader.parse(from: headerData) else {
-                    throw HeaderCacheError.invalidHeaderData(height: headerCount)
-                }
-
-                // Validate chain linkage
-                if headerCount == 0 {
-                    // Genesis block should have zero prevBlock
-                    if header.prevBlock != Data(count: 32) {
-                        throw HeaderCacheError.chainValidationFailed(height: 0, reason: "Invalid genesis block")
-                    }
-                } else if let previous = previousHash, header.prevBlock != previous {
-                    throw HeaderCacheError.chainValidationFailed(height: headerCount, reason: "Chain linkage broken")
-                }
-
-                let chainWork = computeChainWork(header: header, previousHeaders: headers)
-                let stored = StoredHeader(header: header, height: Int32(headerCount), chainWork: chainWork)
-                headers.append(stored)
-
-                previousHash = header.hash
-                headerCount += 1
-                offset += BlockHeader.size
-
-                // Report progress periodically
-                if headerCount % 10000 == 0 {
-                    let progress = progressBase + progressRange * (Double(headerCount) / Double(expectedTotal))
-                    progressHandler?(min(progress, 0.95))
-                }
-            }
-
-            if offset < combined.count {
-                leftover = combined.subdata(in: offset..<combined.count)
-            } else {
-                leftover.removeAll(keepingCapacity: true)
-            }
-        }
-
-        guard leftover.isEmpty else {
-            throw HeaderCacheError.installationFailed("Trailing bytes after decompression")
-        }
-
-        guard headerCount == metadata.headerCount else {
-            throw HeaderCacheError.headerCountMismatch(expected: metadata.headerCount, actual: headerCount)
-        }
-
-        // Write to JSON format compatible with HeaderChain
-        let store = HeaderChain.HeaderStore(version: 2, headers: headers)
-        let encoder = JSONEncoder()
-        let data = try encoder.encode(store)
-
-        try? FileManager.default.removeItem(at: outputURL)
-        try data.write(to: outputURL, options: .atomic)
-    }
-
-    private func computeChainWork(header: BlockHeader, previousHeaders: [StoredHeader]) -> Data {
-        // Chain work calculation: work = 2^256 / (target + 1)
-        // For simplicity, we use a basic calculation based on the bits field
-        let target = targetFromBits(header.bits)
-        let work = calculateWork(target: target)
-
-        if let lastHeader = previousHeaders.last {
-            return addWork(lastHeader.chainWork, work)
-        }
-        return work
-    }
-
-    private func targetFromBits(_ bits: UInt32) -> Data {
-        let exponent = Int((bits >> 24) & 0xFF)
-        let coefficient = bits & 0x007FFFFF
-
-        var target = Data(repeating: 0, count: 32)
-        if exponent <= 3 {
-            let shift = 8 * (3 - exponent)
-            let value = coefficient >> shift
-            target[31] = UInt8(value & 0xFF)
-            target[30] = UInt8((value >> 8) & 0xFF)
-            target[29] = UInt8((value >> 16) & 0xFF)
-        } else {
-            let byteIndex = 32 - exponent
-            if byteIndex >= 0 && byteIndex < 32 {
-                target[byteIndex] = UInt8(coefficient & 0xFF)
-                if byteIndex + 1 < 32 {
-                    target[byteIndex + 1] = UInt8((coefficient >> 8) & 0xFF)
-                }
-                if byteIndex + 2 < 32 {
-                    target[byteIndex + 2] = UInt8((coefficient >> 16) & 0xFF)
-                }
-            }
-        }
-        return target
-    }
-
-    private func calculateWork(target: Data) -> Data {
+    private func calculateBlockWork(bits: UInt32) -> Data {
         // Simplified work calculation
-        // In practice this should be: (2^256 - 1) / (target + 1)
-        // For bundled cache, the exact values are less critical since
-        // we'll recalculate when loading into HeaderChain
         var work = Data(repeating: 0, count: 32)
-        work[31] = 1
+        work[0] = 1
         return work
     }
 
@@ -326,7 +356,7 @@ public actor HeaderCacheManager {
         var result = Data(repeating: 0, count: 32)
         var carry: UInt16 = 0
 
-        for i in (0..<32).reversed() {
+        for i in 0..<32 {
             let sum = UInt16(a[i]) + UInt16(b[i]) + carry
             result[i] = UInt8(sum & 0xFF)
             carry = sum >> 8

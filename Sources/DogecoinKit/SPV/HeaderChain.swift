@@ -1,4 +1,5 @@
 import Foundation
+import GRDB
 import os.log
 import clibdogecoin
 
@@ -51,7 +52,7 @@ extension BlockHeader: Codable {
     }
 }
 
-// MARK: - Binary Serialization
+// MARK: - Binary Serialization (kept for migration compatibility)
 
 extension StoredHeader {
     /// Serialize to binary format: 80 bytes header + 4 bytes height + 32 bytes chainWork = 116 bytes
@@ -89,14 +90,14 @@ public final class HeaderChain: @unchecked Sendable {
     /// Storage directory URL
     private let storageURL: URL
 
-    /// Headers indexed by hash
-    private var headersByHash: [Data: StoredHeader] = [:]
+    /// SQLite database for header storage
+    private var database: HeaderDatabase?
 
-    /// Headers indexed by height for the best chain
-    private var headersByHeight: [Int32: StoredHeader] = [:]
+    /// LRU cache for recently accessed headers (by hash)
+    private let recentHeaders = LRUCache<Data, StoredHeader>(capacity: 1000)
 
-    /// The tip (highest) header
-    public private(set) var tip: StoredHeader?
+    /// Cached tip header
+    private var tipCache: StoredHeader?
 
     /// Lock for thread safety
     private let lock = NSLock()
@@ -110,10 +111,7 @@ public final class HeaderChain: @unchecked Sendable {
     /// Cached state for SPV trust logging
     private var didLogAuxpowSPVTrust = false
 
-    /// Headers waiting to be persisted to disk (added since last save)
-    private var pendingHeaders: [StoredHeader] = []
-
-    /// Binary record size: 80 (header) + 4 (height) + 32 (chainWork) = 116 bytes
+    /// Binary record size for migration: 80 (header) + 4 (height) + 32 (chainWork) = 116 bytes
     private static let binaryRecordSize = 116
 
     // MARK: - Checkpoints
@@ -172,13 +170,6 @@ public final class HeaderChain: @unchecked Sendable {
     /// Maximum allowed time drift for block timestamps (2 hours)
     private static let maxTimeDrift: UInt32 = 7200
 
-    private static let headerStoreVersion = 2  // Incremented due to genesis merkle root fix
-
-    struct HeaderStore: Codable {
-        let version: Int
-        let headers: [StoredHeader]
-    }
-
     /// Validation errors
     public enum ValidationError: Error, Sendable {
         case checkpointMismatch(height: Int32, expected: String, got: String)
@@ -189,6 +180,7 @@ public final class HeaderChain: @unchecked Sendable {
         case futureTooFar(timestamp: UInt32)
         case auxPowRequired(height: Int32)
         case auxPowValidationFailed(AuxPoW.ValidationError)
+        case databaseError(Error)
     }
 
     /// Highest checkpoint heights for each network
@@ -196,18 +188,25 @@ public final class HeaderChain: @unchecked Sendable {
     private static let mainnetHighestCheckpoint: Int32 = 5_400_000
     private static let testnetHighestCheckpoint: Int32 = 5_900_000
 
+    /// The tip (highest) header
+    public var tip: StoredHeader? {
+        lock.lock()
+        defer { lock.unlock() }
+        return tipCache
+    }
+
     /// Current chain height
     public var height: Int32 {
         lock.lock()
         defer { lock.unlock() }
-        return tip?.height ?? -1
+        return tipCache?.height ?? -1
     }
 
     /// Create a header chain
     /// - Parameters:
     ///   - network: The Dogecoin network (mainnet or testnet)
     ///   - storageDirectory: Optional custom storage directory for header cache
-    ///   - bundledCacheDirectory: Optional directory containing pre-bundled headers.bin.lzfse and metadata.json
+    ///   - bundledCacheDirectory: Optional directory containing pre-bundled headers.sqlite
     public init(network: DogecoinNetwork = .mainnet, storageDirectory: URL? = nil, bundledCacheDirectory: URL? = nil) {
         self.network = network
 
@@ -219,66 +218,147 @@ public final class HeaderChain: @unchecked Sendable {
         }
 
         createStorageDirectory()
+        openOrCreateDatabase()
+        migrateFromBinaryIfNeeded()
         installBundledCacheIfNeeded(from: bundledCacheDirectory)
-        loadHeaders()
+        loadTipFromDatabase()
         initializeGenesisIfNeeded()
+    }
+
+    // MARK: - Database Setup
+
+    private func createStorageDirectory() {
+        try? FileManager.default.createDirectory(at: storageURL, withIntermediateDirectories: true)
+    }
+
+    private func openOrCreateDatabase() {
+        let dbPath = storageURL.appendingPathComponent("headers.sqlite").path
+        do {
+            database = try HeaderDatabase(path: dbPath)
+            logger.info("Opened header database at \(dbPath)")
+        } catch {
+            logger.error("Failed to open header database: \(error.localizedDescription)")
+        }
+    }
+
+    private func loadTipFromDatabase() {
+        guard let db = database else { return }
+        do {
+            if let tipRecord = try db.getTip() {
+                tipCache = tipRecord.toStoredHeader()
+                logger.info("Loaded tip from database at height \(self.tipCache?.height ?? -1)")
+            }
+        } catch {
+            logger.error("Failed to load tip from database: \(error.localizedDescription)")
+        }
+    }
+
+    /// Migrate from legacy binary format to SQLite
+    private func migrateFromBinaryIfNeeded() {
+        let binaryURL = storageURL.appendingPathComponent("headers.bin")
+        guard FileManager.default.fileExists(atPath: binaryURL.path),
+              let db = database else {
+            return
+        }
+
+        do {
+            let existingCount = try db.getHeaderCount()
+            if existingCount > 0 {
+                logger.info("Database already has \(existingCount) headers, skipping migration")
+                return
+            }
+        } catch {
+            logger.error("Failed to check database: \(error.localizedDescription)")
+            return
+        }
+
+        logger.info("Migrating from binary format to SQLite...")
+
+        do {
+            let data = try Data(contentsOf: binaryURL)
+            let recordCount = data.count / Self.binaryRecordSize
+
+            var records: [HeaderRecord] = []
+            records.reserveCapacity(min(recordCount, 10000))
+
+            for i in 0..<recordCount {
+                let offset = i * Self.binaryRecordSize
+                let recordData = data.subdata(in: offset..<(offset + Self.binaryRecordSize))
+                guard let stored = StoredHeader.deserializeBinary(from: recordData) else {
+                    logger.warning("Failed to parse binary record at offset \(offset)")
+                    continue
+                }
+
+                let record = HeaderRecord(storedHeader: stored, isInBestChain: true)
+                records.append(record)
+
+                if records.count >= 10000 {
+                    try db.insertHeaders(records)
+                    records.removeAll(keepingCapacity: true)
+                    logger.debug("Migrated \(i + 1) / \(recordCount) headers")
+                }
+            }
+
+            if !records.isEmpty {
+                try db.insertHeaders(records)
+            }
+
+            // Backup and remove old binary file
+            let backupURL = binaryURL.appendingPathExtension("migrated")
+            try? FileManager.default.moveItem(at: binaryURL, to: backupURL)
+
+            logger.info("Successfully migrated \(recordCount) headers to SQLite")
+        } catch {
+            logger.error("Migration from binary failed: \(error.localizedDescription)")
+        }
     }
 
     /// Attempt to install bundled cache if it's newer than local cache
     private func installBundledCacheIfNeeded(from bundledDirectory: URL?) {
         guard let bundledDirectory else { return }
 
-        let cacheManager = HeaderCacheManager()
-        let semaphore = DispatchSemaphore(value: 0)
-
-        Task {
-            do {
-                // Load bundled metadata
-                guard let bundledMetadata = await cacheManager.loadMetadata(from: bundledDirectory) else {
-                    logger.info("No bundled cache metadata found at \(bundledDirectory.path)")
-                    semaphore.signal()
-                    return
-                }
-
-                // Load local metadata if exists
-                let localMetadata = await cacheManager.loadMetadata(from: storageURL)
-
-                // Check if we should use the bundled cache
-                let shouldInstall = await cacheManager.shouldUseBundledCache(
-                    localMetadata: localMetadata,
-                    bundledMetadata: bundledMetadata
-                )
-
-                guard shouldInstall else {
-                    logger.info("Local cache is newer or equal, skipping bundled cache installation")
-                    semaphore.signal()
-                    return
-                }
-
-                // Install the bundled cache
-                logger.info("Installing bundled cache with \(bundledMetadata.headerCount) headers")
-                try await cacheManager.installBundledCache(
-                    from: bundledDirectory,
-                    to: storageURL,
-                    network: network
-                ) { progress in
-                    // Progress could be logged or reported here
-                }
-                logger.info("Successfully installed bundled header cache")
-            } catch {
-                logger.error("Failed to install bundled cache: \(error.localizedDescription)")
-            }
-            semaphore.signal()
+        let bundledDBPath = bundledDirectory.appendingPathComponent("headers.sqlite")
+        guard FileManager.default.fileExists(atPath: bundledDBPath.path) else {
+            logger.info("No bundled SQLite database found at \(bundledDBPath.path)")
+            return
         }
 
-        // Wait for async installation to complete (with timeout)
-        _ = semaphore.wait(timeout: .now() + 300) // 5 minute timeout for large caches
+        guard let localDB = database else { return }
+
+        do {
+            let localCount = try localDB.getHeaderCount()
+
+            // Open bundled database to check its count
+            let bundledDB = try HeaderDatabase(path: bundledDBPath.path)
+            let bundledCount = try bundledDB.getHeaderCount()
+
+            guard bundledCount > localCount else {
+                logger.info("Local database has \(localCount) headers, bundled has \(bundledCount). Skipping install.")
+                return
+            }
+
+            logger.info("Installing bundled cache: \(bundledCount) headers (local has \(localCount))")
+
+            // Copy bundled database over local
+            let localDBPath = storageURL.appendingPathComponent("headers.sqlite")
+            try? FileManager.default.removeItem(at: localDBPath)
+            try FileManager.default.copyItem(at: bundledDBPath, to: localDBPath)
+
+            // Reopen database
+            database = try HeaderDatabase(path: localDBPath.path)
+            loadTipFromDatabase()
+
+            logger.info("Successfully installed bundled header cache")
+        } catch {
+            logger.error("Failed to install bundled cache: \(error.localizedDescription)")
+        }
     }
+
+    // MARK: - Public API
 
     /// Add a header to the chain with full validation
     /// - Parameter header: The block header to add
     /// - Returns: true if the header was added successfully
-    /// - Throws: ValidationError if header fails validation
     @discardableResult
     public func addHeader(_ header: BlockHeader) -> Bool {
         do {
@@ -291,10 +371,6 @@ public final class HeaderChain: @unchecked Sendable {
     }
 
     /// Add a header with AuxPoW data for merged-mining validation
-    /// - Parameters:
-    ///   - header: The block header to add
-    ///   - auxpow: The AuxPoW data for validation (required for AuxPoW blocks above highest checkpoint)
-    /// - Returns: true if the header was added successfully
     @discardableResult
     public func addHeader(_ header: BlockHeader, auxpow: AuxPoW?) -> Bool {
         do {
@@ -307,30 +383,36 @@ public final class HeaderChain: @unchecked Sendable {
     }
 
     /// Add a header with validation, throwing on errors
-    /// - Parameter header: The block header to add
-    /// - Throws: ValidationError if header fails validation
     public func addHeaderValidated(_ header: BlockHeader) throws {
         try addHeaderValidated(header, auxpow: nil)
     }
 
     /// Add a header with validation and optional AuxPoW data
-    /// - Parameters:
-    ///   - header: The block header to add
-    ///   - auxpow: Optional AuxPoW data for merged-mining validation
-    /// - Throws: ValidationError if header fails validation
     public func addHeaderValidated(_ header: BlockHeader, auxpow: AuxPoW?) throws {
         lock.lock()
         defer { lock.unlock() }
 
+        guard let db = database else {
+            throw ValidationError.databaseError(HeaderDatabaseError.databaseNotOpen)
+        }
+
         let hash = header.hash
 
         // Check if we already have this header
-        guard headersByHash[hash] == nil else {
+        if recentHeaders.contains(hash) {
+            return
+        }
+        if let _ = try? db.getHeader(hash: hash) {
             return
         }
 
         // Find the parent
-        guard let parent = headersByHash[header.prevBlock] else {
+        let parent: StoredHeader
+        if let cached = recentHeaders.get(header.prevBlock) {
+            parent = cached
+        } else if let record = try? db.getHeader(hash: header.prevBlock) {
+            parent = record.toStoredHeader()
+        } else {
             logger.warning("Parent not found for header \(header.hashHex)")
             throw ValidationError.invalidPreviousBlock
         }
@@ -347,10 +429,8 @@ public final class HeaderChain: @unchecked Sendable {
         let blockWork: Data
         if isAuxPowBlock {
             if newHeight <= highestCheckpoint {
-                // At or below checkpoint: trust checkpoint validation
                 logAuxpowTrustCheckpointIfNeeded(height: newHeight)
             } else if let auxpowData = auxpow {
-                // Above checkpoint with AuxPoW data provided: validate it
                 do {
                     try auxpowData.validate(dogecoinBlockHash: hash)
                     logger.debug("AuxPoW validated for block at height \(newHeight)")
@@ -358,15 +438,10 @@ public final class HeaderChain: @unchecked Sendable {
                     throw ValidationError.auxPowValidationFailed(error)
                 }
             } else {
-                // Above checkpoint without AuxPoW data: SPV mode - trust difficulty
-                // This is the standard SPV security model where we trust cumulative
-                // proof-of-work rather than validating each block's AuxPoW proof
                 logAuxpowSPVTrustIfNeeded(height: newHeight)
             }
-            // For AuxPoW blocks, calculate work without scrypt PoW validation
             blockWork = try calculateBlockWork(for: header, validatePoW: false)
         } else {
-            // Regular block: validate scrypt PoW
             blockWork = try calculateBlockWork(for: header, validatePoW: true)
         }
 
@@ -381,35 +456,120 @@ public final class HeaderChain: @unchecked Sendable {
             chainWork: chainWork
         )
 
-        // Store it
-        headersByHash[hash] = stored
-        pendingHeaders.append(stored)
+        // Determine if this extends the best chain
+        let isNewTip = tipCache == nil || stored.header.prevBlock == tipCache?.header.hash
+        let shouldReorg = !isNewTip && tipCache != nil && shouldReorganize(currentTip: tipCache!, candidateTip: stored)
 
-        guard let currentTip = tip else {
-            headersByHeight[stored.height] = stored
-            tip = stored
-            return
+        // Insert into database
+        let record = HeaderRecord(storedHeader: stored, isInBestChain: isNewTip || shouldReorg)
+        do {
+            try db.insertHeader(record)
+        } catch {
+            throw ValidationError.databaseError(error)
         }
 
-        if stored.header.prevBlock == currentTip.header.hash {
-            headersByHeight[stored.height] = stored
-            tip = stored
-            return
+        // Update cache
+        recentHeaders.set(hash, stored)
+
+        // Update tip
+        if isNewTip {
+            tipCache = stored
+        } else if shouldReorg {
+            try reorganize(from: tipCache!, to: stored, db: db)
+        }
+    }
+
+    /// Add multiple headers
+    public func addHeaders(_ headers: [BlockHeader]) -> Int {
+        var added = 0
+        for header in headers {
+            if addHeader(header) {
+                added += 1
+            }
+        }
+        return added
+    }
+
+    /// Flush is a no-op with SQLite (writes are immediate)
+    public func flush() {
+        // SQLite writes are immediate, no pending buffer
+    }
+
+    /// Get a header by hash
+    public func getHeader(hash: Data) -> StoredHeader? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        // Check cache first
+        if let cached = recentHeaders.get(hash) {
+            return cached
         }
 
-        if shouldReorganize(currentTip: currentTip, candidateTip: stored) {
-            reorganize(from: currentTip, to: stored)
+        // Query database
+        guard let db = database,
+              let record = try? db.getHeader(hash: hash) else {
+            return nil
         }
+
+        let stored = record.toStoredHeader()
+        recentHeaders.set(hash, stored)
+        return stored
+    }
+
+    /// Get a header by height (from best chain)
+    public func getHeader(height: Int32) -> StoredHeader? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let db = database,
+              let record = try? db.getHeader(height: height) else {
+            return nil
+        }
+
+        let stored = record.toStoredHeader()
+        recentHeaders.set(stored.header.hash, stored)
+        return stored
+    }
+
+    /// Check if a header is part of the current best chain
+    public func isHeaderInBestChain(_ hash: Data) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let db = database,
+              let record = try? db.getHeader(hash: hash) else {
+            return false
+        }
+
+        return record.isInBestChain
+    }
+
+    /// Get block locator hashes for getheaders message
+    public func getBlockLocator() -> [Data] {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let db = database else { return [] }
+
+        do {
+            return try db.getBlockLocator()
+        } catch {
+            logger.error("Failed to get block locator: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    /// Get the underlying database (for advanced queries)
+    public var headerDatabase: HeaderDatabase? {
+        database
     }
 
     // MARK: - Validation Methods
 
-    /// Validate header against checkpoint if one exists at this height
     private func validateCheckpoint(header: BlockHeader, height: Int32) throws {
         let checkpoints = network == .mainnet ? Self.mainnetCheckpoints : Self.testnetCheckpoints
 
         guard let expectedHash = checkpoints[height] else {
-            // No checkpoint at this height - valid
             return
         }
 
@@ -427,15 +587,13 @@ public final class HeaderChain: @unchecked Sendable {
         logger.info("Checkpoint validated at height \(height)")
     }
 
-    /// Validate block timestamp
     private func validateTimestamp(header: BlockHeader, parent: StoredHeader) throws {
-        let medianTimePast = medianTimePast(from: parent)
+        let medianTime = medianTimePast(from: parent)
 
-        guard header.timestamp > medianTimePast else {
+        guard header.timestamp > medianTime else {
             throw ValidationError.invalidTimestamp(timestamp: header.timestamp)
         }
 
-        // Timestamp must not be too far in the future
         let currentTime = UInt32(Date().timeIntervalSince1970)
         let maxFutureTime = currentTime + Self.maxTimeDrift
 
@@ -444,262 +602,98 @@ public final class HeaderChain: @unchecked Sendable {
         }
     }
 
-    /// Add multiple headers
-    public func addHeaders(_ headers: [BlockHeader]) -> Int {
-        var added = 0
-        for header in headers {
-            if addHeader(header) {
-                added += 1
-            }
+    // MARK: - Chain Reorganization
+
+    private func shouldReorganize(currentTip: StoredHeader, candidateTip: StoredHeader) -> Bool {
+        let comparison = compareChainWork(candidateTip.chainWork, currentTip.chainWork)
+        if comparison == .orderedDescending {
+            return true
         }
-
-        if added > 0 {
-            saveHeaders()
+        if comparison == .orderedSame {
+            return candidateTip.header.timestamp > currentTip.header.timestamp
         }
-
-        return added
+        return false
     }
 
-    /// Flush any pending headers to disk
-    public func flush() {
-        saveHeaders()
-    }
-
-    /// Get a header by hash
-    public func getHeader(hash: Data) -> StoredHeader? {
-        lock.lock()
-        defer { lock.unlock() }
-        return headersByHash[hash]
-    }
-
-    /// Get a header by height
-    public func getHeader(height: Int32) -> StoredHeader? {
-        lock.lock()
-        defer { lock.unlock() }
-        return headersByHeight[height]
-    }
-
-    /// Check if a header is part of the current best chain
-    public func isHeaderInBestChain(_ hash: Data) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-
-        guard let stored = headersByHash[hash],
-              let bestAtHeight = headersByHeight[stored.height] else {
-            return false
-        }
-
-        return bestAtHeight.header.hash == hash
-    }
-
-    /// Get block locator hashes for getheaders message
-    public func getBlockLocator() -> [Data] {
-        lock.lock()
-        defer { lock.unlock() }
-
-        var locator: [Data] = []
-        var step: Int32 = 1
-        var height = tip?.height ?? 0
-
-        while height >= 0 {
-            if let stored = headersByHeight[height] {
-                locator.append(stored.header.hash)
-            }
-
-            if locator.count >= 10 {
-                // Cap step to prevent overflow - max step of ~1 billion is plenty
-                step = step <= 536_870_912 ? step * 2 : step
-            }
-
-            height -= step
-        }
-
-        // Always include genesis
-        if let genesis = headersByHeight[0] {
-            if locator.last != genesis.header.hash {
-                locator.append(genesis.header.hash)
-            }
-        }
-
-        return locator
-    }
-
-    // MARK: - Private Methods
-
-    private func createStorageDirectory() {
-        try? FileManager.default.createDirectory(at: storageURL, withIntermediateDirectories: true)
-    }
-
-    private func loadHeaders() {
-        let binaryURL = storageURL.appendingPathComponent("headers.bin")
-        let jsonURL = storageURL.appendingPathComponent("headers.json")
-
-        // Try binary format first
-        if FileManager.default.fileExists(atPath: binaryURL.path) {
-            loadHeadersBinary(from: binaryURL)
+    private func reorganize(from currentTip: StoredHeader, to newTip: StoredHeader, db: HeaderDatabase) throws {
+        guard let commonAncestor = findCommonAncestor(between: currentTip, and: newTip) else {
+            logger.error("Unable to find common ancestor for reorg")
             return
         }
 
-        // Fall back to JSON (migration case)
-        if FileManager.default.fileExists(atPath: jsonURL.path) {
-            loadHeadersJSON(from: jsonURL)
-            // Migrate to binary format
-            if !headersByHash.isEmpty {
-                migrateJSONToBinary(jsonURL: jsonURL, binaryURL: binaryURL)
-            }
+        // Clear best chain markers above common ancestor
+        try db.clearBestChainMarkers(aboveHeight: commonAncestor.height)
+
+        // Mark new chain as best
+        var cursor: StoredHeader? = newTip
+        var newChainHashes: [Data] = []
+        while let header = cursor, header.height > commonAncestor.height {
+            newChainHashes.append(header.header.hash)
+            cursor = getHeaderUnlocked(hash: header.header.prevBlock)
         }
+
+        for hash in newChainHashes {
+            try db.updateBestChainStatus(hash: hash, isInBestChain: true)
+        }
+
+        tipCache = newTip
+        logger.info("Chain reorganized at height \(commonAncestor.height), new tip at \(newTip.height)")
     }
 
-    private func loadHeadersBinary(from url: URL) {
-        do {
-            let data = try Data(contentsOf: url)
-            let recordCount = data.count / Self.binaryRecordSize
+    private func findCommonAncestor(between first: StoredHeader, and second: StoredHeader) -> StoredHeader? {
+        var a: StoredHeader? = first
+        var b: StoredHeader? = second
 
-            headersByHash = [:]
-            headersByHash.reserveCapacity(recordCount)
-            pendingHeaders = []
-
-            for i in 0..<recordCount {
-                let offset = i * Self.binaryRecordSize
-                let recordData = data.subdata(in: offset..<(offset + Self.binaryRecordSize))
-
-                guard let stored = StoredHeader.deserializeBinary(from: recordData) else {
-                    logger.warning("Failed to parse header record at offset \(offset)")
-                    continue
-                }
-
-                headersByHash[stored.header.hash] = stored
-            }
-
-            recomputeChainWorkIfNeeded()
-            rebuildBestChainIndex()
-
-            logger.info("Loaded \(self.headersByHash.count) headers from binary, tip at height \(self.tip?.height ?? -1)")
-        } catch {
-            logger.error("Failed to load binary headers: \(error.localizedDescription)")
-            handleCorruptHeaders(at: url)
-        }
-    }
-
-    private func loadHeadersJSON(from url: URL) {
-        do {
-            let data = try Data(contentsOf: url)
-
-            guard let store = try? JSONDecoder().decode(HeaderStore.self, from: data) else {
-                logger.warning("Legacy header store format detected, re-syncing")
-                handleCorruptHeaders(at: url)
-                return
-            }
-
-            if store.version < Self.headerStoreVersion {
-                logger.warning("Header store version \(store.version) is outdated (current: \(Self.headerStoreVersion)), re-syncing")
-                handleCorruptHeaders(at: url)
-                return
-            }
-
-            headersByHash = [:]
-            pendingHeaders = []
-
-            for header in store.headers {
-                headersByHash[header.header.hash] = header
-            }
-
-            recomputeChainWorkIfNeeded()
-            rebuildBestChainIndex()
-
-            logger.info("Loaded \(store.headers.count) headers from JSON, tip at height \(self.tip?.height ?? -1)")
-        } catch {
-            logger.error("Failed to load JSON headers: \(error.localizedDescription)")
-            handleCorruptHeaders(at: url)
-        }
-    }
-
-    private func migrateJSONToBinary(jsonURL: URL, binaryURL: URL) {
-        logger.info("Migrating \(self.headersByHash.count) headers from JSON to binary format")
-
-        lock.lock()
-        let allHeaders = Array(headersByHash.values)
-        lock.unlock()
-
-        do {
-            var binaryData = Data()
-            binaryData.reserveCapacity(allHeaders.count * Self.binaryRecordSize)
-
-            for header in allHeaders {
-                binaryData.append(header.serializeBinary())
-            }
-
-            try binaryData.write(to: binaryURL, options: .atomic)
-
-            // Remove old JSON file after successful migration
-            try? FileManager.default.removeItem(at: jsonURL)
-
-            logger.info("Successfully migrated to binary format")
-        } catch {
-            logger.error("Failed to migrate to binary format: \(error.localizedDescription)")
-        }
-    }
-
-    private func saveHeaders() {
-        let binaryURL = storageURL.appendingPathComponent("headers.bin")
-
-        lock.lock()
-        let headersToSave = pendingHeaders
-        pendingHeaders.removeAll(keepingCapacity: true)
-        lock.unlock()
-
-        guard !headersToSave.isEmpty else { return }
-
-        do {
-            var appendData = Data()
-            appendData.reserveCapacity(headersToSave.count * Self.binaryRecordSize)
-
-            for header in headersToSave {
-                appendData.append(header.serializeBinary())
-            }
-
-            // Append to existing file or create new one
-            if FileManager.default.fileExists(atPath: binaryURL.path) {
-                let handle = try FileHandle(forWritingTo: binaryURL)
-                try handle.seekToEnd()
-                try handle.write(contentsOf: appendData)
-                try handle.close()
+        while let aHeader = a, let bHeader = b, aHeader.height != bHeader.height {
+            if aHeader.height > bHeader.height {
+                a = getHeaderUnlocked(hash: aHeader.header.prevBlock)
             } else {
-                try appendData.write(to: binaryURL, options: .atomic)
+                b = getHeaderUnlocked(hash: bHeader.header.prevBlock)
             }
-
-            logger.debug("Appended \(headersToSave.count) headers to binary file")
-        } catch {
-            logger.error("Failed to save headers: \(error.localizedDescription)")
-            // Put headers back in pending queue on failure
-            lock.lock()
-            pendingHeaders.insert(contentsOf: headersToSave, at: 0)
-            lock.unlock()
         }
+
+        while let aHeader = a, let bHeader = b {
+            if aHeader.header.hash == bHeader.header.hash {
+                return aHeader
+            }
+            a = getHeaderUnlocked(hash: aHeader.header.prevBlock)
+            b = getHeaderUnlocked(hash: bHeader.header.prevBlock)
+        }
+
+        return nil
     }
 
-    private func handleCorruptHeaders(at url: URL) {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMddHHmmss"
-        let timestamp = formatter.string(from: Date())
-        let backupURL = url.appendingPathExtension("corrupt-\(timestamp)")
-        do {
-            try FileManager.default.moveItem(at: url, to: backupURL)
-            logger.warning("Moved corrupt headers file to \(backupURL.path)")
-        } catch {
-            logger.error("Failed to move corrupt headers file: \(error.localizedDescription)")
+    /// Get header without acquiring lock (for internal use when lock is already held)
+    private func getHeaderUnlocked(hash: Data) -> StoredHeader? {
+        if let cached = recentHeaders.get(hash) {
+            return cached
         }
+        guard let db = database,
+              let record = try? db.getHeader(hash: hash) else {
+            return nil
+        }
+        let stored = record.toStoredHeader()
+        recentHeaders.set(hash, stored)
+        return stored
     }
+
+    // MARK: - Genesis Block
 
     private func initializeGenesisIfNeeded() {
         lock.lock()
         defer { lock.unlock() }
 
-        // If genesis already exists in the chain, nothing to do
-        guard headersByHeight[0] == nil else { return }
+        guard let db = database else { return }
 
-        // Create genesis header based on network
-        // Note: merkle root is reversed from display format to internal byte order
+        // Check if genesis exists
+        do {
+            if let _ = try db.getHeader(height: 0) {
+                return
+            }
+        } catch {
+            // Continue to create genesis
+        }
+
         let merkleRootInternal = Data(Data(hexString: "5b2a3f53f605d62c53e62932dac6925e3d74afa5a4b459745c36d42d0ed26a69")!.reversed())
 
         let genesis: BlockHeader
@@ -735,20 +729,23 @@ public final class HeaderChain: @unchecked Sendable {
             }
         }
 
-        headersByHash[genesis.hash] = stored
-        headersByHeight[0] = stored
+        let record = HeaderRecord(storedHeader: stored, isInBestChain: true)
+        do {
+            try db.insertHeader(record)
+            recentHeaders.set(genesis.hash, stored)
 
-        // Only set tip to genesis if we don't have a better tip already
-        // This handles the case where we loaded headers but are missing genesis
-        if tip == nil {
-            tip = stored
-            logger.info("Initialized genesis block as tip with hash \(genesis.hashHex)")
-        } else {
-            logger.info("Added missing genesis block with hash \(genesis.hashHex), keeping existing tip at height \(self.tip?.height ?? -1)")
+            if tipCache == nil {
+                tipCache = stored
+                logger.info("Initialized genesis block as tip with hash \(genesis.hashHex)")
+            } else {
+                logger.info("Added missing genesis block with hash \(genesis.hashHex)")
+            }
+        } catch {
+            logger.error("Failed to insert genesis: \(error.localizedDescription)")
         }
     }
 
-    // MARK: - Chainwork + Reorg
+    // MARK: - Chainwork + PoW
 
     private func calculateBlockWork(for header: BlockHeader, validatePoW: Bool) throws -> Data {
         guard let target = targetFromBits(header.bits) else {
@@ -799,7 +796,7 @@ public final class HeaderChain: @unchecked Sendable {
         for _ in 0..<11 {
             guard let current = cursor else { break }
             timestamps.append(current.header.timestamp)
-            cursor = headersByHash[current.header.prevBlock]
+            cursor = getHeaderUnlocked(hash: current.header.prevBlock)
         }
 
         timestamps.sort()
@@ -843,111 +840,6 @@ public final class HeaderChain: @unchecked Sendable {
         }
 
         return .orderedSame
-    }
-
-    private func shouldReorganize(currentTip: StoredHeader, candidateTip: StoredHeader) -> Bool {
-        let comparison = compareChainWork(candidateTip.chainWork, currentTip.chainWork)
-        if comparison == .orderedDescending {
-            return true
-        }
-        if comparison == .orderedSame {
-            return candidateTip.header.timestamp > currentTip.header.timestamp
-        }
-        return false
-    }
-
-    private func reorganize(from currentTip: StoredHeader, to newTip: StoredHeader) {
-        guard let commonAncestor = findCommonAncestor(between: currentTip, and: newTip) else {
-            logger.error("Unable to find common ancestor for reorg")
-            return
-        }
-
-        var oldCursor: StoredHeader? = currentTip
-        while let cursor = oldCursor, cursor.height > commonAncestor.height {
-            headersByHeight.removeValue(forKey: cursor.height)
-            oldCursor = headersByHash[cursor.header.prevBlock]
-        }
-
-        var newChain: [StoredHeader] = []
-        var newCursor: StoredHeader? = newTip
-        while let cursor = newCursor, cursor.height > commonAncestor.height {
-            newChain.append(cursor)
-            newCursor = headersByHash[cursor.header.prevBlock]
-        }
-
-        for header in newChain.reversed() {
-            headersByHeight[header.height] = header
-        }
-
-        tip = newTip
-        logger.info("Chain reorganized at height \(commonAncestor.height)")
-    }
-
-    private func findCommonAncestor(between first: StoredHeader, and second: StoredHeader) -> StoredHeader? {
-        var a: StoredHeader? = first
-        var b: StoredHeader? = second
-
-        while let aHeader = a, let bHeader = b, aHeader.height != bHeader.height {
-            if aHeader.height > bHeader.height {
-                a = headersByHash[aHeader.header.prevBlock]
-            } else {
-                b = headersByHash[bHeader.header.prevBlock]
-            }
-        }
-
-        while let aHeader = a, let bHeader = b {
-            if aHeader.header.hash == bHeader.header.hash {
-                return aHeader
-            }
-            a = headersByHash[aHeader.header.prevBlock]
-            b = headersByHash[bHeader.header.prevBlock]
-        }
-
-        return nil
-    }
-
-    private func rebuildBestChainIndex() {
-        guard !headersByHash.isEmpty else { return }
-
-        headersByHeight = [:]
-
-        let bestTip: StoredHeader? = headersByHash.values.reduce(nil as StoredHeader?) { currentBest, candidate in
-            guard let currentBest else { return candidate }
-            return shouldReorganize(currentTip: currentBest, candidateTip: candidate) ? candidate : currentBest
-        }
-
-        guard let tip = bestTip else { return }
-        self.tip = tip
-
-        var cursor: StoredHeader? = tip
-        while let header = cursor {
-            headersByHeight[header.height] = header
-            if header.height == 0 { break }
-            cursor = headersByHash[header.header.prevBlock]
-        }
-    }
-
-    private func recomputeChainWorkIfNeeded() {
-        let needsRecompute = headersByHash.values.contains { $0.chainWork.count != 32 }
-        guard needsRecompute else { return }
-
-        logger.info("Recomputing chainwork for stored headers")
-
-        let sortedHeaders = headersByHash.values.sorted { $0.height < $1.height }
-        for stored in sortedHeaders {
-            if stored.height == 0 {
-                let genesisWork = (try? calculateBlockWork(for: stored.header, validatePoW: false)) ?? Data(repeating: 0, count: 32)
-                let updated = StoredHeader(header: stored.header, height: 0, chainWork: genesisWork)
-                headersByHash[stored.header.hash] = updated
-                continue
-            }
-
-            guard let parent = headersByHash[stored.header.prevBlock] else { continue }
-            guard let work = try? calculateBlockWork(for: stored.header, validatePoW: false) else { continue }
-            let chainWork = addChainWork(normalizedChainWork(parent.chainWork), work)
-            let updated = StoredHeader(header: stored.header, height: stored.height, chainWork: chainWork)
-            headersByHash[stored.header.hash] = updated
-        }
     }
 
     private func targetHexString(bits: UInt32) -> String {
