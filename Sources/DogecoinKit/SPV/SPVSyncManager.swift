@@ -17,6 +17,9 @@ public protocol SPVSyncDelegate: AnyObject, Sendable {
 
     /// Called when a transaction changes state (unconfirmed, confirmed, or reorged)
     func spvSync(_ manager: SPVSyncManager, didUpdateTransaction transaction: TxMessage, state: SPVTransactionState)
+
+    /// Called when a filtered block is processed (for tracking bloom filter scan progress)
+    func spvSync(_ manager: SPVSyncManager, didProcessFilteredBlock height: Int32, targetHeight: Int32)
 }
 
 /// Synchronization state
@@ -715,6 +718,11 @@ extension SPVSyncManager: PeerManagerDelegate {
             delegate?.spvSync(self, didUpdateTransaction: event.0, state: event.1)
         }
 
+        // Report filtered block scan progress
+        if let height = height {
+            delegate?.spvSync(self, didProcessFilteredBlock: height, targetHeight: targetHeight)
+        }
+
         withTxLock { state in
             state.filteredBlocksInFlight = max(0, state.filteredBlocksInFlight - 1)
         }
@@ -907,4 +915,5 @@ extension SPVSyncState: Equatable {
 
 public extension SPVSyncDelegate {
     func spvSync(_ manager: SPVSyncManager, didUpdateTransaction transaction: TxMessage, state: SPVTransactionState) {}
+    func spvSync(_ manager: SPVSyncManager, didProcessFilteredBlock height: Int32, targetHeight: Int32) {}
 }
