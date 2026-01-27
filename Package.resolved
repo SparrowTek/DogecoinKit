@@ -1,5 +1,5 @@
 {
-  "originHash" : "5332a9c9331854f6d2d9173771ff7eb316bd0f0507c549d0f4781a515be8119b",
+  "originHash" : "9787508cd7585090a1a3dd2eb4ab0b284e699f243bab1cd227893d99be33dae1",
   "pins" : [
     {
       "identity" : "grdb.swift",
@@ -8,6 +8,15 @@
       "state" : {
         "revision" : "aa0079aeb82a4bf00324561a40bffe68c6fe1c26",
         "version" : "7.9.0"
+      }
+    },
+    {
+      "identity" : "libdogecoin",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/radmakr/libdogecoin",
+      "state" : {
+        "branch" : "ios",
+        "revision" : "e2136e552b2b3255241b4ad64f91a17ee36e7c32"
       }
     }
   ],

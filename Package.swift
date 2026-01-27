@@ -15,9 +15,8 @@ let package = Package(
         )
     ],
     dependencies: [
-        // Local dependency on libdogecoin C library
-        .package(path: "../libdogecoin"),
-        // SQLite database via GRDB
+//        .package(path: "../libdogecoin"),
+        .package(url: "https://github.com/radmakr/libdogecoin", branch: "ios"),
         .package(url: "https://github.com/groue/GRDB.swift", from: "7.0.0"),
     ],
     targets: [
