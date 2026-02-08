@@ -272,6 +272,28 @@ public final class SPVSyncManager: @unchecked Sendable {
         self.headerChain = HeaderChain(network: network, storageDirectory: storageDirectory, bundledCacheDirectory: bundledCacheDirectory)
     }
 
+    /// Create an SPV sync manager asynchronously, offloading the heavy
+    /// `HeaderChain` initialization to a background thread.
+    ///
+    /// Use this from `@MainActor` contexts to avoid blocking the UI.
+    /// - Parameters:
+    ///   - network: The Dogecoin network (mainnet or testnet)
+    ///   - storageDirectory: Optional custom storage directory for header cache
+    ///   - bundledCacheDirectory: Optional directory containing pre-bundled headers.bin.lzfse and metadata.json
+    public static func create(
+        network: DogecoinNetwork = .mainnet,
+        storageDirectory: URL? = nil,
+        bundledCacheDirectory: URL? = nil
+    ) async -> SPVSyncManager {
+        await Task.detached {
+            SPVSyncManager(
+                network: network,
+                storageDirectory: storageDirectory,
+                bundledCacheDirectory: bundledCacheDirectory
+            )
+        }.value
+    }
+
     /// Start synchronization
     public func start() {
         let canStart = withLock { state in

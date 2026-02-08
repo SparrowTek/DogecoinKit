@@ -27,6 +27,9 @@ public final class ElectrumSyncManager: @unchecked Sendable {
 
     private let serverList: [ElectrumServer]
 
+    /// Per-server connection timeout in seconds
+    private let connectionTimeout: TimeInterval = 10
+
     // MARK: - Initialization
 
     public init(network: DogecoinNetwork) {
@@ -270,6 +273,21 @@ public final class ElectrumSyncManager: @unchecked Sendable {
 
     // MARK: - Private Methods
 
+    private func connectWithTimeout(_ client: ElectrumClient) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await client.connect()
+            }
+            group.addTask { [connectionTimeout] in
+                try await Task.sleep(for: .seconds(connectionTimeout))
+                throw ElectrumError.connectionTimeout
+            }
+            // First task to complete wins; cancel the other.
+            _ = try await group.next()
+            group.cancelAll()
+        }
+    }
+
     private func connectedClient() throws -> ElectrumClient {
         try lock.withLock {
             guard let client = _client else {
@@ -297,7 +315,7 @@ public final class ElectrumSyncManager: @unchecked Sendable {
             print("[ElectrumSyncManager] Trying server \(index + 1)/\(serverList.count): \(server.host):\(server.port)")
             let candidateClient = ElectrumClient(server: server)
             do {
-                try await candidateClient.connect()
+                try await connectWithTimeout(candidateClient)
 
                 lock.withLock {
                     _client = candidateClient
