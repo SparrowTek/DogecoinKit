@@ -2,36 +2,30 @@ import Foundation
 
 public final class ElectrumSyncManager: @unchecked Sendable {
 
-    private actor RunState {
-        private var isRunning = false
-
-        func startIfNeeded() -> Bool {
-            guard !isRunning else { return false }
-            isRunning = true
-            return true
-        }
-
-        func stop() {
-            isRunning = false
-        }
-    }
-
     // MARK: - Public Properties
 
     public let network: DogecoinNetwork
     public weak var delegate: BlockchainSyncDelegate?
 
-    public private(set) var state: ElectrumSyncState = .disconnected
-    public private(set) var currentHeight: Int32 = 0
-    public private(set) var progress: Double = 0
-    public private(set) var connectedServer: ElectrumServer?
+    public var state: ElectrumSyncState { lock.withLock { _state } }
+    public var currentHeight: Int32 { lock.withLock { _currentHeight } }
+    public var progress: Double { lock.withLock { _progress } }
+    public var connectedServer: ElectrumServer? { lock.withLock { _connectedServer } }
 
-    // MARK: - Private Properties
+    // MARK: - Private State (protected by lock)
 
-    private var client: ElectrumClient?
-    private let runState = RunState()
-    private var addressSubscriptions: Set<String> = []
-    private var serverList: [ElectrumServer]
+    private let lock = NSLock()
+    private var _state: ElectrumSyncState = .disconnected
+    private var _currentHeight: Int32 = 0
+    private var _progress: Double = 0
+    private var _connectedServer: ElectrumServer?
+    private var _client: ElectrumClient?
+    private var _addressSubscriptions: Set<String> = []
+    private var _isRunning = false
+
+    // MARK: - Immutable
+
+    private let serverList: [ElectrumServer]
 
     // MARK: - Initialization
 
@@ -48,7 +42,13 @@ public final class ElectrumSyncManager: @unchecked Sendable {
     // MARK: - Public Methods
 
     public func start() async throws {
-        guard await runState.startIfNeeded() else {
+        let shouldStart = lock.withLock {
+            guard !_isRunning else { return false }
+            _isRunning = true
+            return true
+        }
+
+        guard shouldStart else {
             print("[ElectrumSyncManager] Already running, skipping start")
             return
         }
@@ -56,88 +56,33 @@ public final class ElectrumSyncManager: @unchecked Sendable {
         do {
             try await startSync()
         } catch {
-            await runState.stop()
+            lock.withLock { _isRunning = false }
             throw error
         }
-    }
-
-    private func startSync() async throws {
-        guard !serverList.isEmpty else {
-            let error = ElectrumError.noServersAvailable
-            state = .error(error.localizedDescription)
-            delegate?.syncManager(self, didEncounterError: error)
-            throw error
-        }
-
-        print("[ElectrumSyncManager] Starting sync for \(network) network")
-        print("[ElectrumSyncManager] Server list: \(serverList.map { "\($0.host):\($0.port)" })")
-        state = .connecting
-
-        // Try servers until one connects
-        var lastError: Error?
-        for (index, server) in serverList.enumerated() {
-            print("[ElectrumSyncManager] Trying server \(index + 1)/\(serverList.count): \(server.host):\(server.port)")
-            let candidateClient = ElectrumClient(server: server)
-            do {
-                try await candidateClient.connect()
-                self.client = candidateClient
-                self.connectedServer = server
-
-                print("[ElectrumSyncManager] Connected! Subscribing to headers...")
-                // Subscribe to block headers (updates on new blocks)
-                let header = try await candidateClient.subscribeHeaders { [weak self] header in
-                    guard let self else { return }
-                    self.currentHeight = Int32(header.height)
-                    self.progress = 1.0
-                    self.delegate?.syncManager(self, progressUpdated: self.progress, height: self.currentHeight)
-                }
-                currentHeight = Int32(header.height)
-                progress = 1.0
-
-                print("[ElectrumSyncManager] Current block height: \(currentHeight)")
-                state = .connected
-                delegate?.syncManager(self, progressUpdated: progress, height: currentHeight)
-                delegate?.syncManagerDidComplete(self)
-                return
-
-            } catch {
-                print("[ElectrumSyncManager] Server \(server.host) failed: \(error)")
-                await candidateClient.disconnect()
-                lastError = error
-                continue
-            }
-        }
-
-        print("[ElectrumSyncManager] All servers failed!")
-        let message = lastError?.localizedDescription ?? ElectrumError.noServersAvailable.localizedDescription
-        state = .error(message)
-        delegate?.syncManager(self, didEncounterError: lastError ?? ElectrumError.noServersAvailable)
-        throw lastError ?? ElectrumError.noServersAvailable
     }
 
     public func stop() {
-        let existingClient = client
-
-        client = nil
-        connectedServer = nil
-        state = .disconnected
-        addressSubscriptions.removeAll()
+        let existingClient: ElectrumClient? = lock.withLock {
+            let client = _client
+            _client = nil
+            _connectedServer = nil
+            _state = .disconnected
+            _addressSubscriptions.removeAll()
+            _isRunning = false
+            return client
+        }
 
         Task {
-            await runState.stop()
             await existingClient?.disconnect()
         }
     }
 
     public func refreshBalance(for addresses: [String]) async throws -> Int64 {
-        guard let client = client else {
-            print("[ElectrumSyncManager] refreshBalance failed: not connected")
-            throw ElectrumError.serverDisconnected
-        }
+        let client = try connectedClient()
 
         print("[ElectrumSyncManager] Refreshing balance for \(addresses.count) addresses (parallel)...")
 
-        // Pre-compute script hashes on main thread to catch errors early
+        // Pre-compute script hashes
         let scriptHashes = try addresses.map { address in
             (address: address, scriptHash: try ElectrumScriptHash(address: address, network: network))
         }
@@ -176,10 +121,7 @@ public final class ElectrumSyncManager: @unchecked Sendable {
     }
 
     public func fetchTransactionHistory(for addresses: [String]) async throws -> [ElectrumHistoryItem] {
-        guard let client = client else {
-            print("[ElectrumSyncManager] fetchTransactionHistory failed: not connected")
-            throw ElectrumError.serverDisconnected
-        }
+        let client = try connectedClient()
 
         print("[ElectrumSyncManager] Fetching transaction history for \(addresses.count) addresses (parallel)")
 
@@ -227,10 +169,7 @@ public final class ElectrumSyncManager: @unchecked Sendable {
     }
 
     public func fetchUTXOs(for addresses: [String]) async throws -> [(address: String, utxo: ElectrumUTXO)] {
-        guard let client = client else {
-            print("[ElectrumSyncManager] fetchUTXOs failed: not connected")
-            throw ElectrumError.serverDisconnected
-        }
+        let client = try connectedClient()
 
         print("[ElectrumSyncManager] Fetching UTXOs for \(addresses.count) addresses (parallel)")
 
@@ -269,28 +208,25 @@ public final class ElectrumSyncManager: @unchecked Sendable {
     }
 
     public func getTransaction(txid: String) async throws -> String {
-        guard let client = client else {
-            throw ElectrumError.serverDisconnected
-        }
-
+        let client = try connectedClient()
         return try await client.getTransaction(txHash: txid)
     }
 
     public func broadcastTransaction(_ rawHex: String) async throws -> String {
-        guard let client = client else {
-            throw ElectrumError.serverDisconnected
-        }
-
+        let client = try connectedClient()
         return try await client.broadcastTransaction(rawHex: rawHex)
     }
 
     public func subscribeToAddresses(_ addresses: [String]) async throws {
-        guard let client = client else {
-            throw ElectrumError.serverDisconnected
+        let (client, existingSubscriptions) = try lock.withLock {
+            guard let client = _client else {
+                throw ElectrumError.serverDisconnected
+            }
+            return (client, _addressSubscriptions)
         }
 
         // Filter to only addresses not already subscribed
-        let newAddresses = addresses.filter { !addressSubscriptions.contains($0) }
+        let newAddresses = addresses.filter { !existingSubscriptions.contains($0) }
         guard !newAddresses.isEmpty else { return }
 
         print("[ElectrumSyncManager] Subscribing to \(newAddresses.count) addresses (parallel)")
@@ -320,7 +256,7 @@ public final class ElectrumSyncManager: @unchecked Sendable {
 
             // Collect subscribed addresses
             for try await address in group {
-                addressSubscriptions.insert(address)
+                lock.withLock { _ = _addressSubscriptions.insert(address) }
             }
         }
 
@@ -328,11 +264,83 @@ public final class ElectrumSyncManager: @unchecked Sendable {
     }
 
     public func estimateFee(blocks: Int = 6) async throws -> Double {
-        guard let client = client else {
-            throw ElectrumError.serverDisconnected
+        let client = try connectedClient()
+        return try await client.estimateFee(blocks: blocks)
+    }
+
+    // MARK: - Private Methods
+
+    private func connectedClient() throws -> ElectrumClient {
+        try lock.withLock {
+            guard let client = _client else {
+                throw ElectrumError.serverDisconnected
+            }
+            return client
+        }
+    }
+
+    private func startSync() async throws {
+        guard !serverList.isEmpty else {
+            let error = ElectrumError.noServersAvailable
+            lock.withLock { _state = .error(error.localizedDescription) }
+            delegate?.syncManager(self, didEncounterError: error)
+            throw error
         }
 
-        return try await client.estimateFee(blocks: blocks)
+        print("[ElectrumSyncManager] Starting sync for \(network) network")
+        print("[ElectrumSyncManager] Server list: \(serverList.map { "\($0.host):\($0.port)" })")
+        lock.withLock { _state = .connecting }
+
+        // Try servers until one connects
+        var lastError: Error?
+        for (index, server) in serverList.enumerated() {
+            print("[ElectrumSyncManager] Trying server \(index + 1)/\(serverList.count): \(server.host):\(server.port)")
+            let candidateClient = ElectrumClient(server: server)
+            do {
+                try await candidateClient.connect()
+
+                lock.withLock {
+                    _client = candidateClient
+                    _connectedServer = server
+                }
+
+                print("[ElectrumSyncManager] Connected! Subscribing to headers...")
+                // Subscribe to block headers (updates on new blocks)
+                let header = try await candidateClient.subscribeHeaders { [weak self] header in
+                    guard let self else { return }
+                    let (height, prog) = self.lock.withLock {
+                        self._currentHeight = Int32(header.height)
+                        self._progress = 1.0
+                        return (self._currentHeight, self._progress)
+                    }
+                    self.delegate?.syncManager(self, progressUpdated: prog, height: height)
+                }
+
+                let (height, prog) = lock.withLock {
+                    _currentHeight = Int32(header.height)
+                    _progress = 1.0
+                    _state = .connected
+                    return (_currentHeight, _progress)
+                }
+
+                print("[ElectrumSyncManager] Current block height: \(height)")
+                delegate?.syncManager(self, progressUpdated: prog, height: height)
+                delegate?.syncManagerDidComplete(self)
+                return
+
+            } catch {
+                print("[ElectrumSyncManager] Server \(server.host) failed: \(error)")
+                await candidateClient.disconnect()
+                lastError = error
+                continue
+            }
+        }
+
+        print("[ElectrumSyncManager] All servers failed!")
+        let message = lastError?.localizedDescription ?? ElectrumError.noServersAvailable.localizedDescription
+        lock.withLock { _state = .error(message) }
+        delegate?.syncManager(self, didEncounterError: lastError ?? ElectrumError.noServersAvailable)
+        throw lastError ?? ElectrumError.noServersAvailable
     }
 }
 
