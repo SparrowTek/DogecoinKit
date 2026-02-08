@@ -3,7 +3,7 @@ import Network
 import os.log
 
 /// Delegate for peer events
-public protocol PeerDelegate: AnyObject, Sendable {
+public protocol PeerDelegate: AnyObject {
     /// Called when the peer connection state changes
     func peer(_ peer: Peer, didChangeState state: Peer.State)
 

@@ -9,7 +9,7 @@ public enum SyncState: Sendable {
 }
 
 /// Protocol that both SPVSyncManager and ElectrumSyncManager conform to
-public protocol BlockchainSyncManager: AnyObject, Sendable {
+public protocol BlockchainSyncManager: AnyObject {
     var network: DogecoinNetwork { get }
     var syncState: SyncState { get }
     var currentHeight: Int32 { get }
@@ -18,7 +18,7 @@ public protocol BlockchainSyncManager: AnyObject, Sendable {
 }
 
 /// Delegate protocol for sync events
-public protocol BlockchainSyncDelegate: AnyObject, Sendable {
+public protocol BlockchainSyncDelegate: AnyObject {
     func syncManager(_ manager: any BlockchainSyncManager, progressUpdated progress: Double, height: Int32)
     func syncManagerDidComplete(_ manager: any BlockchainSyncManager)
     func syncManager(_ manager: any BlockchainSyncManager, didEncounterError error: Error)

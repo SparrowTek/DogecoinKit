@@ -259,8 +259,13 @@ public actor HeaderCacheManager {
                     throw HeaderCacheError.chainValidationFailed(height: state.headerCount, reason: "Chain linkage broken")
                 }
 
-                // Calculate chain work
-                let blockWork = calculateBlockWork(bits: header.bits)
+                // Calculate chain work from compact difficulty bits
+                guard let blockWork = Self.blockWork(bits: header.bits) else {
+                    throw HeaderCacheError.chainValidationFailed(
+                        height: state.headerCount,
+                        reason: "Invalid difficulty bits: \(header.bits)"
+                    )
+                }
                 state.cumulativeChainWork = addWork(state.cumulativeChainWork, blockWork)
 
                 // Create record
@@ -345,11 +350,47 @@ public actor HeaderCacheManager {
         }
     }
 
-    private func calculateBlockWork(bits: UInt32) -> Data {
-        // Simplified work calculation
-        var work = Data(repeating: 0, count: 32)
-        work[0] = 1
-        return work
+    nonisolated static func blockWork(bits: UInt32) -> Data? {
+        guard let target = targetFromBits(bits) else { return nil }
+
+        let targetValue = UInt256(data: target)
+        let targetPlusOne = targetValue.adding(.one)
+        let negTarget = targetValue.bitwiseNot()
+        let hashes = negTarget.divided(by: targetPlusOne)
+        let work = hashes.adding(.one)
+        return work.data
+    }
+
+    nonisolated private static func targetFromBits(_ bits: UInt32) -> Data? {
+        let size = Int(bits >> 24)
+        var word = bits & 0x007fffff
+
+        if word == 0 {
+            return nil
+        }
+
+        let negative = (bits & 0x00800000) != 0
+        let overflow = word != 0 && (size > 34 || (word > 0xff && size > 33) || (word > 0xffff && size > 32))
+        if negative || overflow {
+            return nil
+        }
+
+        var target = Data(repeating: 0, count: 32)
+        if size <= 3 {
+            let shift = 8 * (3 - size)
+            word >>= UInt32(shift)
+            target[0] = UInt8(word & 0xff)
+            target[1] = UInt8((word >> 8) & 0xff)
+            target[2] = UInt8((word >> 16) & 0xff)
+        } else {
+            let offset = size - 3
+            guard offset + 2 < 32 else { return nil }
+            target[offset] = UInt8(word & 0xff)
+            target[offset + 1] = UInt8((word >> 8) & 0xff)
+            target[offset + 2] = UInt8((word >> 16) & 0xff)
+        }
+
+        return target
     }
 
     private func addWork(_ a: Data, _ b: Data) -> Data {
@@ -367,5 +408,140 @@ public actor HeaderCacheManager {
 
     private func normalizedHex(_ value: String) -> String {
         value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+}
+
+private struct UInt256: Sendable, Equatable {
+    static let zero = UInt256(words: Array(repeating: 0, count: 8))
+    static let one = UInt256(words: [1, 0, 0, 0, 0, 0, 0, 0])
+
+    var words: [UInt32]
+
+    init(words: [UInt32]) {
+        var padded = words
+        if padded.count < 8 {
+            padded.append(contentsOf: Array(repeating: 0, count: 8 - padded.count))
+        }
+        self.words = Array(padded.prefix(8))
+    }
+
+    init(data: Data) {
+        var values = Array(repeating: UInt32(0), count: 8)
+        let bytes = [UInt8](data.prefix(32))
+        for index in 0..<8 {
+            let base = index * 4
+            if base + 3 < bytes.count {
+                let word = UInt32(bytes[base])
+                    | (UInt32(bytes[base + 1]) << 8)
+                    | (UInt32(bytes[base + 2]) << 16)
+                    | (UInt32(bytes[base + 3]) << 24)
+                values[index] = word
+            }
+        }
+        self.words = values
+    }
+
+    var data: Data {
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(32)
+        for word in words {
+            bytes.append(UInt8(word & 0xff))
+            bytes.append(UInt8((word >> 8) & 0xff))
+            bytes.append(UInt8((word >> 16) & 0xff))
+            bytes.append(UInt8((word >> 24) & 0xff))
+        }
+        return Data(bytes)
+    }
+
+    func bitwiseNot() -> UInt256 {
+        UInt256(words: words.map { ~$0 })
+    }
+
+    func adding(_ other: UInt256) -> UInt256 {
+        var result = Array(repeating: UInt32(0), count: 8)
+        var carry: UInt64 = 0
+
+        for index in 0..<8 {
+            let sum = UInt64(words[index]) + UInt64(other.words[index]) + carry
+            result[index] = UInt32(sum & 0xffffffff)
+            carry = sum >> 32
+        }
+
+        return UInt256(words: result)
+    }
+
+    func subtracting(_ other: UInt256) -> UInt256 {
+        var result = Array(repeating: UInt32(0), count: 8)
+        var borrow: UInt64 = 0
+
+        for index in 0..<8 {
+            let lhs = UInt64(words[index])
+            let rhs = UInt64(other.words[index]) + borrow
+            if lhs >= rhs {
+                result[index] = UInt32(lhs - rhs)
+                borrow = 0
+            } else {
+                result[index] = UInt32((1 << 32) + lhs - rhs)
+                borrow = 1
+            }
+        }
+
+        return UInt256(words: result)
+    }
+
+    func divided(by divisor: UInt256) -> UInt256 {
+        guard divisor != .zero else { return .zero }
+
+        var quotient = UInt256.zero
+        var remainder = UInt256.zero
+
+        for bit in stride(from: 255, through: 0, by: -1) {
+            remainder = remainder.shiftedLeftBy1()
+            if bitValue(at: bit) == 1 {
+                remainder.words[0] |= 1
+            }
+
+            if remainder.compare(to: divisor) != .orderedAscending {
+                remainder = remainder.subtracting(divisor)
+                quotient.setBit(bit)
+            }
+        }
+
+        return quotient
+    }
+
+    private func compare(to other: UInt256) -> ComparisonResult {
+        for index in stride(from: 7, through: 0, by: -1) {
+            let left = words[index]
+            let right = other.words[index]
+            if left == right { continue }
+            return left < right ? .orderedAscending : .orderedDescending
+        }
+        return .orderedSame
+    }
+
+    private func bitValue(at index: Int) -> UInt32 {
+        let wordIndex = index / 32
+        let bitIndex = index % 32
+        guard wordIndex < words.count else { return 0 }
+        return (words[wordIndex] >> bitIndex) & 1
+    }
+
+    private mutating func setBit(_ index: Int) {
+        let wordIndex = index / 32
+        let bitIndex = index % 32
+        guard wordIndex < words.count else { return }
+        words[wordIndex] |= (1 << bitIndex)
+    }
+
+    private func shiftedLeftBy1() -> UInt256 {
+        var result = Array(repeating: UInt32(0), count: 8)
+        var carry: UInt32 = 0
+        for index in 0..<8 {
+            let newCarry = (words[index] >> 31) & 1
+            result[index] = (words[index] << 1) | carry
+            carry = newCarry
+        }
+        return UInt256(words: result)
     }
 }

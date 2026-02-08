@@ -1,6 +1,5 @@
 import Foundation
 import Network
-import Security
 
 public actor ElectrumClient {
 
@@ -44,16 +43,7 @@ public actor ElectrumClient {
 
         let parameters: NWParameters
         if server.useSSL {
-            let tlsOptions = NWProtocolTLS.Options()
-            // Disable certificate validation for Electrum servers (they typically use self-signed certs)
-            sec_protocol_options_set_verify_block(
-                tlsOptions.securityProtocolOptions,
-                { _, _, completion in
-                    completion(true)
-                },
-                .main
-            )
-            parameters = NWParameters(tls: tlsOptions)
+            parameters = NWParameters(tls: NWProtocolTLS.Options())
         } else {
             parameters = NWParameters.tcp
         }

@@ -114,6 +114,35 @@ struct DogecoinKitTests {
         #expect(diff.doge == 0.5)
     }
 
+    @Test("Invalid amount strings throw")
+    func testInvalidAmountStrings() {
+        #expect(throws: DogecoinError.self) {
+            _ = try DogecoinAmount(dogeString: "-1")
+        }
+        #expect(throws: DogecoinError.self) {
+            _ = try DogecoinAmount(dogeString: "1.123456789")
+        }
+        #expect(throws: DogecoinError.self) {
+            _ = try DogecoinAmount(dogeString: "abc")
+        }
+    }
+
+    @Test("Amount subtraction saturates at zero")
+    func testAmountSubtractionSaturatesAtZero() {
+        let small = DogecoinAmount(koinu: 100)
+        let large = DogecoinAmount(koinu: 200)
+
+        let result = small - large
+        #expect(result == .zero)
+    }
+
+    @Test("Amount addition saturates at UInt64 max")
+    func testAmountAdditionSaturatesAtMax() {
+        let nearMax = DogecoinAmount(koinu: UInt64.max - 10)
+        let result = nearMax + DogecoinAmount(koinu: 100)
+        #expect(result.koinu == UInt64.max)
+    }
+
     @Test("Transaction builder creation")
     func testTransactionBuilder() throws {
         let builder = try TransactionBuilder()

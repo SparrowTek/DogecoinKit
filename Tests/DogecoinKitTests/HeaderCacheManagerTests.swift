@@ -84,6 +84,29 @@ struct HeaderCacheManagerTests {
         #expect(result == false)
     }
 
+    @Test("Block work is derived from difficulty bits")
+    func testBlockWorkDependsOnBits() {
+        let harderBits: UInt32 = 0x1e0ffff0
+        let easierBits: UInt32 = 0x1f00ffff
+
+        let harderWork = HeaderCacheManager.blockWork(bits: harderBits)
+        let easierWork = HeaderCacheManager.blockWork(bits: easierBits)
+
+        #expect(harderWork != nil)
+        #expect(easierWork != nil)
+        #expect(harderWork != easierWork)
+
+        var placeholder = Data(repeating: 0, count: 32)
+        placeholder[0] = 1
+        #expect(harderWork != placeholder)
+    }
+
+    @Test("Invalid bits fail block work calculation")
+    func testBlockWorkRejectsInvalidBits() {
+        #expect(HeaderCacheManager.blockWork(bits: 0) == nil)
+        #expect(HeaderCacheManager.blockWork(bits: 0x1e800001) == nil)
+    }
+
     private func makeMetadata(headerCount: Int) -> HeaderCacheMetadata {
         HeaderCacheMetadata(
             version: 1,

@@ -2,7 +2,7 @@ import Foundation
 import os.log
 
 /// Delegate for SPV sync events
-public protocol SPVSyncDelegate: AnyObject, Sendable {
+public protocol SPVSyncDelegate: AnyObject {
     /// Called when sync progress updates
     func spvSync(_ manager: SPVSyncManager, progressUpdated progress: Double, height: Int32)
 

@@ -2,7 +2,7 @@ import Foundation
 import os.log
 
 /// Delegate for peer manager events
-public protocol PeerManagerDelegate: AnyObject, Sendable {
+public protocol PeerManagerDelegate: AnyObject {
     /// Called when a peer becomes ready
     func peerManager(_ manager: PeerManager, peerDidBecomeReady peer: Peer)
 
@@ -72,7 +72,7 @@ public final class PeerManager: @unchecked Sendable {
     private let logger = Logger(subsystem: "DogecoinKit", category: "PeerManager")
 
     /// Timer for maintenance tasks
-    private var maintenanceTimer: Timer?
+    private var maintenanceTimer: DispatchSourceTimer?
 
     /// Number of connected peers
     public var connectedPeerCount: Int {
@@ -533,13 +533,19 @@ public final class PeerManager: @unchecked Sendable {
     }
 
     private func startMaintenanceTimer() {
-        maintenanceTimer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
+        stopMaintenanceTimer()
+
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 30, repeating: 30)
+        timer.setEventHandler { [weak self] in
             self?.performMaintenance()
         }
+        maintenanceTimer = timer
+        timer.resume()
     }
 
     private func stopMaintenanceTimer() {
-        maintenanceTimer?.invalidate()
+        maintenanceTimer?.cancel()
         maintenanceTimer = nil
     }
 

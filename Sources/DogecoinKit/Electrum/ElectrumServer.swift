@@ -35,7 +35,11 @@ public struct ElectrumServerList: Sendable {
     // MARK: - Testnet Servers
 
     public static let testnetServers: [ElectrumServer] = [
-        // Add testnet servers when available
+        // Primary servers - SSL
+        ElectrumServer(host: "electrum-testnet.cipig.net", port: 20063, useSSL: true, network: .testnet),
+
+        // Backup servers - TCP (no SSL)
+        ElectrumServer(host: "electrum-testnet.cipig.net", port: 10063, useSSL: false, network: .testnet),
     ]
 
     // MARK: - Server Selection

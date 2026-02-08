@@ -40,12 +40,33 @@ public final class ElectrumSyncManager: @unchecked Sendable {
         self.serverList = ElectrumServerList.servers(for: network).shuffled()
     }
 
+    init(network: DogecoinNetwork, serverList: [ElectrumServer]) {
+        self.network = network
+        self.serverList = serverList
+    }
+
     // MARK: - Public Methods
 
     public func start() async throws {
         guard await runState.startIfNeeded() else {
             print("[ElectrumSyncManager] Already running, skipping start")
             return
+        }
+
+        do {
+            try await startSync()
+        } catch {
+            await runState.stop()
+            throw error
+        }
+    }
+
+    private func startSync() async throws {
+        guard !serverList.isEmpty else {
+            let error = ElectrumError.noServersAvailable
+            state = .error(error.localizedDescription)
+            delegate?.syncManager(self, didEncounterError: error)
+            throw error
         }
 
         print("[ElectrumSyncManager] Starting sync for \(network) network")
@@ -95,13 +116,17 @@ public final class ElectrumSyncManager: @unchecked Sendable {
     }
 
     public func stop() {
-        Task {
-            await runState.stop()
-            await client?.disconnect()
-        }
+        let existingClient = client
+
         client = nil
+        connectedServer = nil
         state = .disconnected
         addressSubscriptions.removeAll()
+
+        Task {
+            await runState.stop()
+            await existingClient?.disconnect()
+        }
     }
 
     public func refreshBalance(for addresses: [String]) async throws -> Int64 {

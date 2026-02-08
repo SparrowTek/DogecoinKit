@@ -1,5 +1,7 @@
 import Testing
 @testable import DogecoinKit
+import CryptoKit
+import Foundation
 
 @Suite("Electrum Client Tests")
 struct ElectrumClientTests {
@@ -9,11 +11,7 @@ struct ElectrumClientTests {
     }
 
     private func requireIntegrationTests() -> Bool {
-        let enabled = ProcessInfo.processInfo.environment["ELECTRUM_INTEGRATION_TESTS"] == "1"
-        if !enabled {
-            Issue.record("Skipping Electrum integration test. Set ELECTRUM_INTEGRATION_TESTS=1 to enable.")
-        }
-        return enabled
+        ProcessInfo.processInfo.environment["ELECTRUM_INTEGRATION_TESTS"] == "1"
     }
 
     @Test("Connect to mainnet server")
@@ -76,17 +74,32 @@ struct ElectrumClientTests {
 
         await client.disconnect()
     }
+
+    @Test("Script hash uses P2PKH scriptPubKey format")
+    func testScriptHashComputation() throws {
+        let address = "D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD"
+        let pubkeyHash = try Address.toPubkeyHash(address)
+        let scriptPubKeyHex = "76a914\(pubkeyHash)88ac"
+        let scriptPubKey = try #require(Data(hexString: scriptPubKeyHex))
+        let expected = Data(SHA256.hash(data: scriptPubKey).reversed()).hexString
+
+        let scriptHash = try ElectrumScriptHash(address: address, network: .mainnet)
+        #expect(scriptHash.scriptHash == expected)
+    }
+
+    @Test("Testnet Electrum server list is populated")
+    func testTestnetServersAvailable() {
+        let servers = ElectrumServerList.servers(for: .testnet)
+        #expect(!servers.isEmpty)
+        #expect(servers.allSatisfy { $0.network == .testnet })
+    }
 }
 
 @Suite("Electrum Sync Manager Tests")
 struct ElectrumSyncManagerTests {
 
     private func requireIntegrationTests() -> Bool {
-        let enabled = ProcessInfo.processInfo.environment["ELECTRUM_INTEGRATION_TESTS"] == "1"
-        if !enabled {
-            Issue.record("Skipping Electrum integration test. Set ELECTRUM_INTEGRATION_TESTS=1 to enable.")
-        }
-        return enabled
+        ProcessInfo.processInfo.environment["ELECTRUM_INTEGRATION_TESTS"] == "1"
     }
 
     @Test("Start and stop sync")
@@ -101,5 +114,18 @@ struct ElectrumSyncManagerTests {
 
         manager.stop()
         #expect(!manager.state.isConnected)
+    }
+
+    @Test("Failed start allows retry")
+    func testFailedStartAllowsRetry() async {
+        let manager = ElectrumSyncManager(network: .mainnet, serverList: [])
+
+        await #expect(throws: ElectrumError.self) {
+            try await manager.start()
+        }
+
+        await #expect(throws: ElectrumError.self) {
+            try await manager.start()
+        }
     }
 }
