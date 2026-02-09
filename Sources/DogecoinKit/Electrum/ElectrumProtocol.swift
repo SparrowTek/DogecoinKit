@@ -82,7 +82,7 @@ public struct ElectrumScriptHash: Sendable {
             print("[ElectrumScriptHash] Failed to get scriptPubKey for \(address): \(error)")
             throw ElectrumError.invalidAddress(address)
         }
-        let scriptPubKeyHex = "76a914\(pubkeyHashHex)88ac"
+        let scriptPubKeyHex = pubkeyHashHex
         guard let scriptPubKey = Data(hexString: scriptPubKeyHex) else {
             print("[ElectrumScriptHash] Invalid scriptPubKey hex: \(scriptPubKeyHex)")
             throw ElectrumError.serializationError("Invalid scriptPubKey")
