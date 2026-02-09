@@ -4,8 +4,8 @@ import Testing
 
 @Suite("AuxPoW Tests")
 struct AuxPoWTests {
-    init() {
-        Dogecoin.initialize()
+    init() async {
+        await Dogecoin.initialize()
     }
 
     // MARK: - Version Detection Tests
@@ -179,12 +179,13 @@ struct AuxPoWTests {
     // MARK: - HeaderChain Integration Tests
 
     @Test("HeaderChain requires AuxPoW for blocks above checkpoint")
-    func testHeaderChainRequiresAuxPoW() throws {
+    func testHeaderChainRequiresAuxPoW() async throws {
         let storageURL = temporaryStorageURL()
         let chain = HeaderChain(network: .mainnet, storageDirectory: storageURL)
+        await chain.setup()
 
         // Get genesis
-        guard let genesis = chain.getHeader(height: 0) else {
+        guard let genesis = await chain.getHeader(height: 0) else {
             Issue.record("Genesis not found")
             return
         }
@@ -202,16 +203,17 @@ struct AuxPoWTests {
 
         // For blocks at height 1 (below checkpoint), AuxPoW is not required
         // The header should be accepted without AuxPoW data since height 1 < 5,400,000
-        let added = chain.addHeader(auxpowHeader, auxpow: nil)
+        let added = await chain.addHeader(auxpowHeader, auxpow: nil)
         #expect(added == true)
     }
 
     @Test("HeaderChain accepts AuxPoW blocks below checkpoint without validation")
-    func testHeaderChainAcceptsAuxPoWBelowCheckpoint() throws {
+    func testHeaderChainAcceptsAuxPoWBelowCheckpoint() async throws {
         let storageURL = temporaryStorageURL()
         let chain = HeaderChain(network: .testnet, storageDirectory: storageURL)
+        await chain.setup()
 
-        guard let genesis = chain.getHeader(height: 0) else {
+        guard let genesis = await chain.getHeader(height: 0) else {
             Issue.record("Genesis not found")
             return
         }
@@ -228,12 +230,13 @@ struct AuxPoWTests {
 
         // Should succeed without AuxPoW data
         do {
-            try chain.addHeaderValidated(header, auxpow: nil)
+            try await chain.addHeaderValidated(header, auxpow: nil)
         } catch {
             Issue.record("Should accept AuxPoW header below checkpoint: \(error)")
         }
 
-        #expect(chain.height == 1)
+        let height = await chain.height
+        #expect(height == 1)
     }
 
     @Test("AuxPoW validation error is properly wrapped in HeaderChain")

@@ -5,44 +5,48 @@ import clibdogecoin
 /// Call `initialize()` before using any cryptographic functions.
 public enum Dogecoin {
 
-    /// Thread-safe initialization state
-    private static let initializationLock = NSLock()
-    nonisolated(unsafe) private static var isInitialized = false
+    private actor InitState {
+        var isInitialized = false
+
+        func initialize() {
+            guard !isInitialized else { return }
+            dogecoin_ecc_start()
+            isInitialized = true
+        }
+
+        func cleanup() {
+            guard isInitialized else { return }
+            dogecoin_ecc_stop()
+            isInitialized = false
+        }
+
+        var initialized: Bool { isInitialized }
+    }
+
+    private static let state = InitState()
 
     /// Initialize the Dogecoin ECC context.
     /// This must be called before using any cryptographic functions.
     /// Safe to call multiple times - subsequent calls are no-ops.
-    public static func initialize() {
-        initializationLock.lock()
-        defer { initializationLock.unlock() }
-
-        guard !isInitialized else { return }
-        dogecoin_ecc_start()
-        isInitialized = true
+    public static func initialize() async {
+        await state.initialize()
     }
 
     /// Clean up the Dogecoin ECC context.
     /// Call this when completely done with cryptographic operations.
     /// After calling this, you must call `initialize()` again before using crypto functions.
-    public static func cleanup() {
-        initializationLock.lock()
-        defer { initializationLock.unlock() }
-
-        guard isInitialized else { return }
-        dogecoin_ecc_stop()
-        isInitialized = false
+    public static func cleanup() async {
+        await state.cleanup()
     }
 
     /// Check if the library is initialized
     public static var initialized: Bool {
-        initializationLock.lock()
-        defer { initializationLock.unlock() }
-        return isInitialized
+        get async { await state.initialized }
     }
 
     /// Ensure the library is initialized, throwing if not
-    internal static func ensureInitialized() throws {
-        guard initialized else {
+    internal static func ensureInitialized() async throws {
+        guard await state.initialized else {
             throw DogecoinError.initializationFailed
         }
     }

@@ -8,41 +8,34 @@ import Foundation
 @Suite("Secure Key Storage Tests")
 struct SecureKeyStorageTests {
 
-    private static let keychainAvailable = SecureKeyStorageTests.checkKeychainAvailability()
-
     let storage: SecureKeyStorage
 
-    init() {
-        Dogecoin.initialize()
+    init() async {
+        await Dogecoin.initialize()
         storage = SecureKeyStorage(serviceName: "com.dogecoinkit.tests")
     }
 
-    private static func checkKeychainAvailability() -> Bool {
-        let probe = SecureKeyStorage(serviceName: "com.dogecoinkit.tests.availability")
+    private func requireKeychain() async -> Bool {
         do {
-            let id = try probe.storeMasterKey("availability", network: .testnet)
-            try probe.deleteMasterKey(id: id)
+            let id = try await storage.storeMasterKey("availability-probe", network: .testnet)
+            try await storage.deleteMasterKey(id: id)
             return true
         } catch {
             return false
         }
     }
 
-    private func requireKeychain() -> Bool {
-        Self.keychainAvailable
-    }
-
     // MARK: - Wallet Credentials Tests
 
     @Test("Store and retrieve wallet credentials")
-    func testStoreAndRetrieveCredentials() throws {
-        guard requireKeychain() else { return }
-        let mnemonic = try generateMnemonic(strength: .words12)
+    func testStoreAndRetrieveCredentials() async throws {
+        guard await requireKeychain() else { return }
+        let mnemonic = try await generateMnemonic(strength: .words12)
         let passphrase = "testpassphrase"
         let network = DogecoinNetwork.testnet
 
         // Store
-        let id = try storage.storeWalletCredentials(
+        let id = try await storage.storeWalletCredentials(
             mnemonic: mnemonic,
             passphrase: passphrase,
             network: network
@@ -51,104 +44,106 @@ struct SecureKeyStorageTests {
         #expect(!id.isEmpty)
 
         // Retrieve
-        let retrieved = try storage.retrieveWalletCredentials(id: id)
+        let retrieved = try await storage.retrieveWalletCredentials(id: id)
 
         #expect(retrieved.mnemonic == mnemonic)
         #expect(retrieved.passphrase == passphrase)
         #expect(retrieved.network == network)
 
         // Cleanup
-        try storage.deleteWalletCredentials(id: id)
+        try await storage.deleteWalletCredentials(id: id)
     }
 
     @Test("Wallet credentials with empty passphrase")
-    func testCredentialsEmptyPassphrase() throws {
-        guard requireKeychain() else { return }
-        let mnemonic = try generateMnemonic(strength: .words12)
+    func testCredentialsEmptyPassphrase() async throws {
+        guard await requireKeychain() else { return }
+        let mnemonic = try await generateMnemonic(strength: .words12)
 
-        let id = try storage.storeWalletCredentials(
+        let id = try await storage.storeWalletCredentials(
             mnemonic: mnemonic,
             network: .mainnet
         )
 
-        let retrieved = try storage.retrieveWalletCredentials(id: id)
+        let retrieved = try await storage.retrieveWalletCredentials(id: id)
 
         #expect(retrieved.passphrase.isEmpty)
         #expect(retrieved.network == .mainnet)
 
-        try storage.deleteWalletCredentials(id: id)
+        try await storage.deleteWalletCredentials(id: id)
     }
 
     @Test("Delete wallet credentials")
-    func testDeleteCredentials() throws {
-        guard requireKeychain() else { return }
-        let mnemonic = try generateMnemonic(strength: .words12)
+    func testDeleteCredentials() async throws {
+        guard await requireKeychain() else { return }
+        let mnemonic = try await generateMnemonic(strength: .words12)
 
-        let id = try storage.storeWalletCredentials(
+        let id = try await storage.storeWalletCredentials(
             mnemonic: mnemonic,
             network: .testnet
         )
 
         // Verify exists
-        #expect(storage.walletCredentialsExist(id: id))
+        let exists = await storage.walletCredentialsExist(id: id)
+        #expect(exists)
 
         // Delete
-        try storage.deleteWalletCredentials(id: id)
+        try await storage.deleteWalletCredentials(id: id)
 
         // Verify gone
-        #expect(!storage.walletCredentialsExist(id: id))
+        let gone = await storage.walletCredentialsExist(id: id)
+        #expect(!gone)
     }
 
     @Test("Retrieve non-existent credentials throws error")
-    func testRetrieveNonExistent() throws {
-        guard requireKeychain() else { return }
+    func testRetrieveNonExistent() async throws {
+        guard await requireKeychain() else { return }
         let fakeID = UUID().uuidString
 
-        #expect(throws: DogecoinError.self) {
-            _ = try storage.retrieveWalletCredentials(id: fakeID)
+        await #expect(throws: DogecoinError.self) {
+            _ = try await storage.retrieveWalletCredentials(id: fakeID)
         }
     }
 
     // MARK: - Master Key Tests
 
     @Test("Store and retrieve master key")
-    func testMasterKeyStorage() throws {
-        guard requireKeychain() else { return }
-        let wallet = try HDWallet.create(strength: .words12, network: .testnet)
+    func testMasterKeyStorage() async throws {
+        guard await requireKeychain() else { return }
+        let wallet = try await HDWallet.create(strength: .words12, network: .testnet)
 
-        let id = try storage.storeMasterKey(wallet.masterKey, network: .testnet)
+        let id = try await storage.storeMasterKey(wallet.masterKey, network: .testnet)
 
-        let (retrievedKey, retrievedNetwork) = try storage.retrieveMasterKey(id: id)
+        let (retrievedKey, retrievedNetwork) = try await storage.retrieveMasterKey(id: id)
 
         #expect(retrievedKey == wallet.masterKey)
         #expect(retrievedNetwork == .testnet)
 
-        try storage.deleteMasterKey(id: id)
+        try await storage.deleteMasterKey(id: id)
     }
 
     // MARK: - Private Key Tests
 
     @Test("Store and retrieve private key")
-    func testPrivateKeyStorage() throws {
-        guard requireKeychain() else { return }
-        let keyPair = try KeyPair.generate(network: .testnet)
+    func testPrivateKeyStorage() async throws {
+        guard await requireKeychain() else { return }
+        let keyPair = try await KeyPair.generate(network: .testnet)
 
-        let id = try storage.storePrivateKey(keyPair.privateKeyWIF, address: keyPair.address)
+        let id = try await storage.storePrivateKey(keyPair.privateKeyWIF, address: keyPair.address)
 
-        let (retrievedKey, retrievedAddress) = try storage.retrievePrivateKey(id: id)
+        let (retrievedKey, retrievedAddress) = try await storage.retrievePrivateKey(id: id)
 
         #expect(retrievedKey == keyPair.privateKeyWIF)
         #expect(retrievedAddress == keyPair.address)
 
-        try storage.deletePrivateKey(id: id)
+        try await storage.deletePrivateKey(id: id)
     }
 
     // MARK: - Convenience Method Tests
 
     @Test("Create and store wallet")
-    func testCreateAndStoreWallet() throws {
-        guard requireKeychain() else { return }
-        let (wallet, keychainID) = try storage.createAndStoreWallet(
+    func testCreateAndStoreWallet() async throws {
+        guard await requireKeychain() else { return }
+        let (wallet, keychainID) = try await storage.createAndStoreWallet(
             strength: .words12,
             network: .testnet
         )
@@ -157,21 +152,21 @@ struct SecureKeyStorageTests {
         #expect(!keychainID.isEmpty)
 
         // Verify we can restore
-        let restored = try storage.restoreWallet(keychainID: keychainID)
+        let restored = try await storage.restoreWallet(keychainID: keychainID)
 
         #expect(restored.mnemonic == wallet.mnemonic)
         #expect(restored.network == wallet.network)
 
         // Cleanup
-        try storage.deleteWalletCredentials(id: keychainID)
+        try await storage.deleteWalletCredentials(id: keychainID)
     }
 
     @Test("Import and store wallet")
-    func testImportAndStoreWallet() throws {
-        guard requireKeychain() else { return }
-        let mnemonic = try generateMnemonic(strength: .words12)
+    func testImportAndStoreWallet() async throws {
+        guard await requireKeychain() else { return }
+        let mnemonic = try await generateMnemonic(strength: .words12)
 
-        let (wallet, keychainID) = try storage.importAndStoreWallet(
+        let (wallet, keychainID) = try await storage.importAndStoreWallet(
             mnemonic: mnemonic,
             passphrase: "mypassphrase",
             network: .mainnet
@@ -181,54 +176,54 @@ struct SecureKeyStorageTests {
         #expect(wallet.network == .mainnet)
 
         // Verify storage
-        let credentials = try storage.retrieveWalletCredentials(id: keychainID)
+        let credentials = try await storage.retrieveWalletCredentials(id: keychainID)
         #expect(credentials.mnemonic == mnemonic)
         #expect(credentials.passphrase == "mypassphrase")
 
         // Cleanup
-        try storage.deleteWalletCredentials(id: keychainID)
+        try await storage.deleteWalletCredentials(id: keychainID)
     }
 
     @Test("Restore wallet from stored credentials")
-    func testRestoreWallet() throws {
-        guard requireKeychain() else { return }
+    func testRestoreWallet() async throws {
+        guard await requireKeychain() else { return }
         // First create and store
-        let originalMnemonic = try generateMnemonic(strength: .words12)
-        let keychainID = try storage.storeWalletCredentials(
+        let originalMnemonic = try await generateMnemonic(strength: .words12)
+        let keychainID = try await storage.storeWalletCredentials(
             mnemonic: originalMnemonic,
             passphrase: "restore-test",
             network: .testnet
         )
 
         // Restore
-        let wallet = try storage.restoreWallet(keychainID: keychainID)
+        let wallet = try await storage.restoreWallet(keychainID: keychainID)
 
         #expect(wallet.mnemonic == originalMnemonic)
         #expect(wallet.network == .testnet)
 
         // Verify we can derive addresses
-        let address = try wallet.deriveAddress(account: 0, index: 0)
+        let address = try await wallet.deriveAddress(account: 0, index: 0)
         #expect(address.hasPrefix("n")) // testnet prefix
 
         // Cleanup
-        try storage.deleteWalletCredentials(id: keychainID)
+        try await storage.deleteWalletCredentials(id: keychainID)
     }
 
     // MARK: - Multiple Storage Tests
 
     @Test("Store multiple wallets with unique IDs")
-    func testMultipleWallets() throws {
-        guard requireKeychain() else { return }
-        let mnemonic1 = try generateMnemonic(strength: .words12)
-        let mnemonic2 = try generateMnemonic(strength: .words12)
+    func testMultipleWallets() async throws {
+        guard await requireKeychain() else { return }
+        let mnemonic1 = try await generateMnemonic(strength: .words12)
+        let mnemonic2 = try await generateMnemonic(strength: .words12)
 
-        let id1 = try storage.storeWalletCredentials(mnemonic: mnemonic1, network: .mainnet)
-        let id2 = try storage.storeWalletCredentials(mnemonic: mnemonic2, network: .testnet)
+        let id1 = try await storage.storeWalletCredentials(mnemonic: mnemonic1, network: .mainnet)
+        let id2 = try await storage.storeWalletCredentials(mnemonic: mnemonic2, network: .testnet)
 
         #expect(id1 != id2)
 
-        let creds1 = try storage.retrieveWalletCredentials(id: id1)
-        let creds2 = try storage.retrieveWalletCredentials(id: id2)
+        let creds1 = try await storage.retrieveWalletCredentials(id: id1)
+        let creds2 = try await storage.retrieveWalletCredentials(id: id2)
 
         #expect(creds1.mnemonic == mnemonic1)
         #expect(creds2.mnemonic == mnemonic2)
@@ -236,8 +231,8 @@ struct SecureKeyStorageTests {
         #expect(creds2.network == .testnet)
 
         // Cleanup
-        try storage.deleteWalletCredentials(id: id1)
-        try storage.deleteWalletCredentials(id: id2)
+        try await storage.deleteWalletCredentials(id: id1)
+        try await storage.deleteWalletCredentials(id: id2)
     }
 
     // MARK: - Network Encoding Tests

@@ -16,8 +16,8 @@ public struct KeyPair: Sendable, Equatable, Hashable {
     /// - Parameter network: The network to generate the key pair for
     /// - Returns: A new KeyPair
     /// - Throws: `DogecoinError.keyGenerationFailed` if generation fails
-    public static func generate(network: DogecoinNetwork = .mainnet) throws -> KeyPair {
-        try Dogecoin.ensureInitialized()
+    public static func generate(network: DogecoinNetwork = .mainnet) async throws -> KeyPair {
+        try await Dogecoin.ensureInitialized()
 
         var privateKey = [CChar](repeating: 0, count: Int(PRIVKEYWIFLEN))
         var address = [CChar](repeating: 0, count: Int(P2PKHLEN))
@@ -65,8 +65,8 @@ public struct KeyPair: Sendable, Equatable, Hashable {
     ///   - network: The network
     /// - Returns: The public key as hex string
     /// - Throws: `DogecoinError.invalidPrivateKey` if the private key is invalid
-    public static func publicKeyHex(from privateKeyWIF: String, network: DogecoinNetwork = .mainnet) throws -> String {
-        try Dogecoin.ensureInitialized()
+    public static func publicKeyHex(from privateKeyWIF: String, network: DogecoinNetwork = .mainnet) async throws -> String {
+        try await Dogecoin.ensureInitialized()
 
         var privKey = Array(privateKeyWIF.utf8CString)
         while privKey.count < Int(PRIVKEYWIFLEN) { privKey.append(0) }

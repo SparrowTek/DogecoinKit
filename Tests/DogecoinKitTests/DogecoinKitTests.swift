@@ -4,18 +4,19 @@ import Testing
 @Suite("Dogecoin Library Tests")
 struct DogecoinKitTests {
 
-    init() {
-        Dogecoin.initialize()
+    init() async {
+        await Dogecoin.initialize()
     }
 
     @Test("Library initialization")
-    func testInitialization() {
-        #expect(Dogecoin.initialized)
+    func testInitialization() async {
+        let initialized = await Dogecoin.initialized
+        #expect(initialized)
     }
 
     @Test("Generate key pair for mainnet")
-    func testGenerateKeyPairMainnet() throws {
-        let keyPair = try KeyPair.generate(network: .mainnet)
+    func testGenerateKeyPairMainnet() async throws {
+        let keyPair = try await KeyPair.generate(network: .mainnet)
 
         #expect(!keyPair.privateKeyWIF.isEmpty)
         #expect(!keyPair.address.isEmpty)
@@ -24,8 +25,8 @@ struct DogecoinKitTests {
     }
 
     @Test("Generate key pair for testnet")
-    func testGenerateKeyPairTestnet() throws {
-        let keyPair = try KeyPair.generate(network: .testnet)
+    func testGenerateKeyPairTestnet() async throws {
+        let keyPair = try await KeyPair.generate(network: .testnet)
 
         #expect(!keyPair.privateKeyWIF.isEmpty)
         #expect(!keyPair.address.isEmpty)
@@ -34,8 +35,8 @@ struct DogecoinKitTests {
     }
 
     @Test("Verify key pair")
-    func testVerifyKeyPair() throws {
-        let keyPair = try KeyPair.generate(network: .testnet)
+    func testVerifyKeyPair() async throws {
+        let keyPair = try await KeyPair.generate(network: .testnet)
 
         let isValid = KeyPair.verify(
             privateKeyWIF: keyPair.privateKeyWIF,
@@ -47,17 +48,17 @@ struct DogecoinKitTests {
     }
 
     @Test("Generate mnemonic")
-    func testGenerateMnemonic() throws {
-        let mnemonic = try generateMnemonic(strength: .words12)
+    func testGenerateMnemonic() async throws {
+        let mnemonic = try await generateMnemonic(strength: .words12)
         let words = mnemonic.split(separator: " ")
 
         #expect(words.count == 12)
     }
 
     @Test("HD wallet from mnemonic")
-    func testHDWalletFromMnemonic() throws {
-        let mnemonic = try generateMnemonic(strength: .words12)
-        let wallet = try HDWallet(mnemonic: mnemonic, network: .testnet)
+    func testHDWalletFromMnemonic() async throws {
+        let mnemonic = try await generateMnemonic(strength: .words12)
+        let wallet = try await HDWallet(mnemonic: mnemonic, network: .testnet)
 
         #expect(!wallet.masterKey.isEmpty)
         #expect(wallet.mnemonic == mnemonic)
@@ -65,12 +66,12 @@ struct DogecoinKitTests {
     }
 
     @Test("Derive addresses from HD wallet")
-    func testDeriveAddresses() throws {
-        let mnemonic = try generateMnemonic(strength: .words12)
-        let wallet = try HDWallet(mnemonic: mnemonic, network: .testnet)
+    func testDeriveAddresses() async throws {
+        let mnemonic = try await generateMnemonic(strength: .words12)
+        let wallet = try await HDWallet(mnemonic: mnemonic, network: .testnet)
 
-        let address0 = try wallet.deriveAddress(account: 0, index: 0)
-        let address1 = try wallet.deriveAddress(account: 0, index: 1)
+        let address0 = try await wallet.deriveAddress(account: 0, index: 0)
+        let address1 = try await wallet.deriveAddress(account: 0, index: 1)
 
         #expect(!address0.isEmpty)
         #expect(!address1.isEmpty)
@@ -144,8 +145,8 @@ struct DogecoinKitTests {
     }
 
     @Test("Transaction builder creation")
-    func testTransactionBuilder() throws {
-        let builder = try TransactionBuilder()
+    func testTransactionBuilder() async throws {
+        let builder = try await TransactionBuilder()
         // Just verify it was created successfully (would throw if failed)
         _ = builder
     }

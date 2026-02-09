@@ -60,8 +60,8 @@ public enum Address {
     ///   - network: The network to generate the address for
     /// - Returns: The P2PKH address
     /// - Throws: `DogecoinError.invalidPublicKey` if the public key is invalid
-    public static func fromPublicKey(_ publicKeyHex: String, network: DogecoinNetwork = .mainnet) throws -> String {
-        try Dogecoin.ensureInitialized()
+    public static func fromPublicKey(_ publicKeyHex: String, network: DogecoinNetwork = .mainnet) async throws -> String {
+        try await Dogecoin.ensureInitialized()
 
         var pubKeyBuffer = Array(publicKeyHex.utf8CString)
         while pubKeyBuffer.count < Int(PUBKEYHEXLEN) { pubKeyBuffer.append(0) }
@@ -108,8 +108,8 @@ public enum Address {
     ///   - network: The network
     /// - Returns: The P2PKH address
     /// - Throws: `DogecoinError.invalidPublicKey` if the hash is invalid
-    public static func fromPubkeyHash(_ pubkeyHash: String, network: DogecoinNetwork = .mainnet) throws -> String {
-        try Dogecoin.ensureInitialized()
+    public static func fromPubkeyHash(_ pubkeyHash: String, network: DogecoinNetwork = .mainnet) async throws -> String {
+        try await Dogecoin.ensureInitialized()
 
         var hashBuffer = Array(pubkeyHash.utf8CString)
         while hashBuffer.count < Int(PUBKEYHASHLEN) { hashBuffer.append(0) }

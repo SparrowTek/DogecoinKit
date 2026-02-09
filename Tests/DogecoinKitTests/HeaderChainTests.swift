@@ -4,37 +4,41 @@ import Testing
 
 @Suite("HeaderChain Tests")
 struct HeaderChainTests {
-    init() {
-        Dogecoin.initialize()
+    init() async {
+        await Dogecoin.initialize()
     }
 
     @Test("Mainnet genesis hash matches expected checkpoint")
-    func testMainnetGenesisHash() {
+    func testMainnetGenesisHash() async {
         let storageURL = temporaryStorageURL()
         let chain = HeaderChain(network: .mainnet, storageDirectory: storageURL)
+        await chain.setup()
 
-        let genesis = chain.getHeader(height: 0)
+        let genesis = await chain.getHeader(height: 0)
         #expect(genesis != nil)
         #expect(genesis?.header.hashHex == "1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691")
     }
 
     @Test("Testnet genesis hash matches expected checkpoint")
-    func testTestnetGenesisHash() {
+    func testTestnetGenesisHash() async {
         let storageURL = temporaryStorageURL()
         let chain = HeaderChain(network: .testnet, storageDirectory: storageURL)
+        await chain.setup()
 
-        let genesis = chain.getHeader(height: 0)
+        let genesis = await chain.getHeader(height: 0)
         #expect(genesis != nil)
         #expect(genesis?.header.hashHex == "bb0a78264637406b6360aad926284d544d7049f45189db5664f3c4d07350559e")
     }
 
     @Test("Median time past validation rejects stale timestamps")
-    func testMedianTimePast() throws {
+    func testMedianTimePast() async throws {
         let storageURL = temporaryStorageURL()
         let chain = HeaderChain(network: .testnet, storageDirectory: storageURL)
+        await chain.setup()
 
-        #expect(chain.getHeader(height: 0) != nil)
-        guard let genesis = chain.getHeader(height: 0) else { return }
+        let genesisResult = await chain.getHeader(height: 0)
+        #expect(genesisResult != nil)
+        guard let genesis = genesisResult else { return }
 
         let header1 = makeHeader(
             prevHash: genesis.header.hash,
@@ -43,7 +47,7 @@ struct HeaderChainTests {
             nonce: 1,
             merkleSeed: 1
         )
-        try chain.addHeaderValidated(header1)
+        try await chain.addHeaderValidated(header1)
 
         let header2 = makeHeader(
             prevHash: header1.hash,
@@ -53,18 +57,20 @@ struct HeaderChainTests {
             merkleSeed: 2
         )
 
-        #expect(throws: HeaderChain.ValidationError.self) {
-            try chain.addHeaderValidated(header2)
+        await #expect(throws: HeaderChain.ValidationError.self) {
+            try await chain.addHeaderValidated(header2)
         }
     }
 
     @Test("Reorg chooses higher chainwork over height")
-    func testReorgByChainwork() throws {
+    func testReorgByChainwork() async throws {
         let storageURL = temporaryStorageURL()
         let chain = HeaderChain(network: .testnet, storageDirectory: storageURL)
+        await chain.setup()
 
-        #expect(chain.getHeader(height: 0) != nil)
-        guard let genesis = chain.getHeader(height: 0) else { return }
+        let genesisResult = await chain.getHeader(height: 0)
+        #expect(genesisResult != nil)
+        guard let genesis = genesisResult else { return }
 
         let chainATime = genesis.header.timestamp + 100
         let a1 = makeHeader(
@@ -74,7 +80,7 @@ struct HeaderChainTests {
             nonce: 10,
             merkleSeed: 10
         )
-        try chain.addHeaderValidated(a1)
+        try await chain.addHeaderValidated(a1)
 
         let a2 = makeHeader(
             prevHash: a1.hash,
@@ -83,9 +89,10 @@ struct HeaderChainTests {
             nonce: 11,
             merkleSeed: 11
         )
-        try chain.addHeaderValidated(a2)
+        try await chain.addHeaderValidated(a2)
 
-        #expect(chain.tip?.header.hash == a2.hash)
+        let tip = await chain.tip
+        #expect(tip?.header.hash == a2.hash)
 
         let chainBTime = genesis.header.timestamp + 10
         let b1 = makeHeader(
@@ -95,7 +102,7 @@ struct HeaderChainTests {
             nonce: 20,
             merkleSeed: 20
         )
-        try chain.addHeaderValidated(b1)
+        try await chain.addHeaderValidated(b1)
 
         let b2 = makeHeader(
             prevHash: b1.hash,
@@ -104,7 +111,7 @@ struct HeaderChainTests {
             nonce: 21,
             merkleSeed: 21
         )
-        try chain.addHeaderValidated(b2)
+        try await chain.addHeaderValidated(b2)
 
         let b3 = makeHeader(
             prevHash: b2.hash,
@@ -113,11 +120,16 @@ struct HeaderChainTests {
             nonce: 22,
             merkleSeed: 22
         )
-        try chain.addHeaderValidated(b3)
+        try await chain.addHeaderValidated(b3)
 
-        #expect(chain.tip?.header.hash == b3.hash)
-        #expect(chain.getHeader(height: 1)?.header.hash == b1.hash)
-        #expect(chain.getHeader(height: 2)?.header.hash == b2.hash)
+        let finalTip = await chain.tip
+        #expect(finalTip?.header.hash == b3.hash)
+
+        let header1 = await chain.getHeader(height: 1)
+        #expect(header1?.header.hash == b1.hash)
+
+        let header2 = await chain.getHeader(height: 2)
+        #expect(header2?.header.hash == b2.hash)
     }
 
     private func temporaryStorageURL() -> URL {

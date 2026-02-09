@@ -9,8 +9,6 @@ import clibdogecoin
 ///   - language: ISO 639-2 language code (default: "eng" for English)
 /// - Returns: true if valid BIP39 mnemonic with correct checksum
 public func verifyMnemonic(_ mnemonic: String, language: String = "eng") -> Bool {
-    Dogecoin.initialize()
-
     let result = mnemonic.withCString { mnemonicPtr in
         language.withCString { langPtr in
             " ".withCString { spacePtr in

@@ -149,16 +149,13 @@ extension DogecoinNetwork: Codable {
 /// // Delete when done
 /// try storage.deleteWalletCredentials(id: id)
 /// ```
-public final class SecureKeyStorage: Sendable {
+public actor SecureKeyStorage {
 
     /// The service name used for Keychain storage
-    public let serviceName: String
+    public nonisolated let serviceName: String
 
     /// Optional access group for Keychain sharing between apps
-    public let accessGroup: String?
-
-    /// Thread-safe lock for operations
-    private let lock = NSLock()
+    public nonisolated let accessGroup: String?
 
     /// Prefix for wallet credential keys
     private static let walletCredentialsPrefix = "wallet.credentials."
@@ -192,10 +189,7 @@ public final class SecureKeyStorage: Sendable {
         passphrase: String = "",
         network: DogecoinNetwork
     ) throws -> String {
-        lock.lock()
-        defer { lock.unlock() }
-
-        let credentials = StoredWalletCredentials(
+let credentials = StoredWalletCredentials(
             mnemonic: mnemonic,
             passphrase: passphrase,
             network: network
@@ -227,10 +221,7 @@ public final class SecureKeyStorage: Sendable {
     /// - Returns: The stored wallet credentials
     /// - Throws: `DogecoinError.keyNotFound` if not found, or `DogecoinError.keychainRetrievalFailed` on error
     public func retrieveWalletCredentials(id: String) throws -> StoredWalletCredentials {
-        lock.lock()
-        defer { lock.unlock() }
-
-        let accountName = Self.walletCredentialsPrefix + id
+let accountName = Self.walletCredentialsPrefix + id
 
         do {
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
@@ -257,10 +248,7 @@ public final class SecureKeyStorage: Sendable {
     /// - Parameter id: The identifier of the credentials to delete
     /// - Throws: `DogecoinError.keychainDeletionFailed` if deletion fails
     public func deleteWalletCredentials(id: String) throws {
-        lock.lock()
-        defer { lock.unlock() }
-
-        let accountName = Self.walletCredentialsPrefix + id
+let accountName = Self.walletCredentialsPrefix + id
 
         do {
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
@@ -291,10 +279,7 @@ public final class SecureKeyStorage: Sendable {
     /// - Returns: A unique identifier for retrieving the key later
     /// - Throws: `DogecoinError.keychainStorageFailed` if storage fails
     public func storeMasterKey(_ masterKey: String, network: DogecoinNetwork) throws -> String {
-        lock.lock()
-        defer { lock.unlock() }
-
-        let id = UUID().uuidString
+let id = UUID().uuidString
         let accountName = Self.masterKeyPrefix + id
 
         // Store as JSON with metadata
@@ -323,10 +308,7 @@ public final class SecureKeyStorage: Sendable {
     /// - Returns: A tuple containing the master key and network
     /// - Throws: `DogecoinError.keyNotFound` if not found
     public func retrieveMasterKey(id: String) throws -> (masterKey: String, network: DogecoinNetwork) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        let accountName = Self.masterKeyPrefix + id
+let accountName = Self.masterKeyPrefix + id
 
         do {
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
@@ -353,10 +335,7 @@ public final class SecureKeyStorage: Sendable {
     /// - Parameter id: The identifier of the key to delete
     /// - Throws: `DogecoinError.keychainDeletionFailed` if deletion fails
     public func deleteMasterKey(id: String) throws {
-        lock.lock()
-        defer { lock.unlock() }
-
-        let accountName = Self.masterKeyPrefix + id
+let accountName = Self.masterKeyPrefix + id
 
         do {
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
@@ -375,10 +354,7 @@ public final class SecureKeyStorage: Sendable {
     /// - Returns: A unique identifier for retrieving the key later
     /// - Throws: `DogecoinError.keychainStorageFailed` if storage fails
     public func storePrivateKey(_ privateKeyWIF: String, address: String) throws -> String {
-        lock.lock()
-        defer { lock.unlock() }
-
-        let id = UUID().uuidString
+let id = UUID().uuidString
         let accountName = Self.privateKeyPrefix + id
 
         let payload = PrivateKeyPayload(privateKeyWIF: privateKeyWIF, address: address, storedAt: Date())
@@ -406,10 +382,7 @@ public final class SecureKeyStorage: Sendable {
     /// - Returns: A tuple containing the private key WIF and associated address
     /// - Throws: `DogecoinError.keyNotFound` if not found
     public func retrievePrivateKey(id: String) throws -> (privateKeyWIF: String, address: String) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        let accountName = Self.privateKeyPrefix + id
+let accountName = Self.privateKeyPrefix + id
 
         do {
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
@@ -436,10 +409,7 @@ public final class SecureKeyStorage: Sendable {
     /// - Parameter id: The identifier of the key to delete
     /// - Throws: `DogecoinError.keychainDeletionFailed` if deletion fails
     public func deletePrivateKey(id: String) throws {
-        lock.lock()
-        defer { lock.unlock() }
-
-        let accountName = Self.privateKeyPrefix + id
+let accountName = Self.privateKeyPrefix + id
 
         do {
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
@@ -481,9 +451,9 @@ extension SecureKeyStorage {
         strength: MnemonicStrength = .words12,
         passphrase: String = "",
         network: DogecoinNetwork = .mainnet
-    ) throws -> (wallet: HDWallet, keychainID: String) {
+    ) async throws -> (wallet: HDWallet, keychainID: String) {
         // Create the wallet
-        let wallet = try HDWallet.create(strength: strength, passphrase: passphrase, network: network)
+        let wallet = try await HDWallet.create(strength: strength, passphrase: passphrase, network: network)
 
         // Store credentials securely
         guard let mnemonic = wallet.mnemonic else {
@@ -503,10 +473,10 @@ extension SecureKeyStorage {
     /// - Parameter keychainID: The ID returned from `createAndStoreWallet` or `storeWalletCredentials`
     /// - Returns: The restored HD wallet
     /// - Throws: `DogecoinError` if retrieval or wallet creation fails
-    public func restoreWallet(keychainID: String) throws -> HDWallet {
+    public func restoreWallet(keychainID: String) async throws -> HDWallet {
         let credentials = try retrieveWalletCredentials(id: keychainID)
 
-        return try HDWallet(
+        return try await HDWallet(
             mnemonic: credentials.mnemonic,
             passphrase: credentials.passphrase,
             network: credentials.network
@@ -524,9 +494,9 @@ extension SecureKeyStorage {
         mnemonic: String,
         passphrase: String = "",
         network: DogecoinNetwork = .mainnet
-    ) throws -> (wallet: HDWallet, keychainID: String) {
+    ) async throws -> (wallet: HDWallet, keychainID: String) {
         // Validate and create wallet from mnemonic
-        let wallet = try HDWallet(mnemonic: mnemonic, passphrase: passphrase, network: network)
+        let wallet = try await HDWallet(mnemonic: mnemonic, passphrase: passphrase, network: network)
 
         // Store credentials securely
         let keychainID = try storeWalletCredentials(

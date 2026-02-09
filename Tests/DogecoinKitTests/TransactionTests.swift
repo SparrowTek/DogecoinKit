@@ -4,16 +4,16 @@ import Testing
 
 @Suite("Transaction Builder")
 struct TransactionTests {
-    init() {
-        Dogecoin.initialize()
+    init() async {
+        await Dogecoin.initialize()
     }
 
     @Test("Create transaction validates sums")
-    func testTransactionValidationInsufficientFunds() throws {
+    func testTransactionValidationInsufficientFunds() async throws {
         let mnemonic = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote"
-        let wallet = try HDWallet(mnemonic: mnemonic, passphrase: "", network: .mainnet)
-        let address = try wallet.deriveAddress(account: 0, index: 0, change: false)
-        let key = try wallet.derivePrivateKey(account: 0, index: 0, change: false)
+        let wallet = try await HDWallet(mnemonic: mnemonic, passphrase: "", network: .mainnet)
+        let address = try await wallet.deriveAddress(account: 0, index: 0, change: false)
+        let key = try await wallet.derivePrivateKey(account: 0, index: 0, change: false)
 
         let utxo = UTXO(
             txid: String(repeating: "a", count: 64),
@@ -24,8 +24,8 @@ struct TransactionTests {
             confirmations: 6
         )
 
-        #expect(throws: DogecoinError.self) {
-            _ = try createTransaction(
+        await #expect(throws: DogecoinError.self) {
+            _ = try await createTransaction(
                 inputs: [utxo],
                 outputs: [(address: address, amount: DogecoinAmount(doge: 2))],
                 signingKeysByAddress: [address: key],
@@ -36,10 +36,10 @@ struct TransactionTests {
     }
 
     @Test("Create transaction requires signing keys for inputs")
-    func testTransactionValidationMissingSigningKey() throws {
+    func testTransactionValidationMissingSigningKey() async throws {
         let mnemonic = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote"
-        let wallet = try HDWallet(mnemonic: mnemonic, passphrase: "", network: .mainnet)
-        let address = try wallet.deriveAddress(account: 0, index: 0, change: false)
+        let wallet = try await HDWallet(mnemonic: mnemonic, passphrase: "", network: .mainnet)
+        let address = try await wallet.deriveAddress(account: 0, index: 0, change: false)
 
         let utxo = UTXO(
             txid: String(repeating: "b", count: 64),
@@ -50,8 +50,8 @@ struct TransactionTests {
             confirmations: 6
         )
 
-        #expect(throws: DogecoinError.self) {
-            _ = try createTransaction(
+        await #expect(throws: DogecoinError.self) {
+            _ = try await createTransaction(
                 inputs: [utxo],
                 outputs: [(address: "DFbJ8uS9Q2c8E7yVX7p2XfX9wRkN8qVZ3m", amount: DogecoinAmount(doge: 1))],
                 signingKeysByAddress: [:],
@@ -62,14 +62,14 @@ struct TransactionTests {
     }
 
     @Test("Create transaction signs all inputs with per-address keys")
-    func testTransactionSigningMultipleInputs() throws {
+    func testTransactionSigningMultipleInputs() async throws {
         let mnemonic = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote"
-        let wallet = try HDWallet(mnemonic: mnemonic, passphrase: "", network: .mainnet)
+        let wallet = try await HDWallet(mnemonic: mnemonic, passphrase: "", network: .mainnet)
 
-        let address1 = try wallet.deriveAddress(account: 0, index: 0, change: false)
-        let address2 = try wallet.deriveAddress(account: 0, index: 1, change: false)
-        let key1 = try wallet.derivePrivateKey(account: 0, index: 0, change: false)
-        let key2 = try wallet.derivePrivateKey(account: 0, index: 1, change: false)
+        let address1 = try await wallet.deriveAddress(account: 0, index: 0, change: false)
+        let address2 = try await wallet.deriveAddress(account: 0, index: 1, change: false)
+        let key1 = try await wallet.derivePrivateKey(account: 0, index: 0, change: false)
+        let key2 = try await wallet.derivePrivateKey(account: 0, index: 1, change: false)
 
         let utxos = [
             UTXO(
@@ -90,7 +90,7 @@ struct TransactionTests {
             )
         ]
 
-        let signedTx = try createTransaction(
+        let signedTx = try await createTransaction(
             inputs: utxos,
             outputs: [(address: address1, amount: DogecoinAmount(doge: 7))],
             signingKeysByAddress: [
@@ -106,10 +106,10 @@ struct TransactionTests {
     }
 
     @Test("Planning folds dust change into fee")
-    func testPlanDropsDustChange() throws {
+    func testPlanDropsDustChange() async throws {
         let mnemonic = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote"
-        let wallet = try HDWallet(mnemonic: mnemonic, passphrase: "", network: .mainnet)
-        let address = try wallet.deriveAddress(account: 0, index: 0, change: false)
+        let wallet = try await HDWallet(mnemonic: mnemonic, passphrase: "", network: .mainnet)
+        let address = try await wallet.deriveAddress(account: 0, index: 0, change: false)
 
         let input = UTXO(
             txid: String(repeating: "e", count: 64),
@@ -133,10 +133,10 @@ struct TransactionTests {
     }
 
     @Test("Planning enforces standard size limits")
-    func testPlanRejectsOversizedTransaction() throws {
+    func testPlanRejectsOversizedTransaction() async throws {
         let mnemonic = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote"
-        let wallet = try HDWallet(mnemonic: mnemonic, passphrase: "", network: .mainnet)
-        let address = try wallet.deriveAddress(account: 0, index: 0, change: false)
+        let wallet = try await HDWallet(mnemonic: mnemonic, passphrase: "", network: .mainnet)
+        let address = try await wallet.deriveAddress(account: 0, index: 0, change: false)
 
         let utxos = (0..<700).map { index in
             UTXO(

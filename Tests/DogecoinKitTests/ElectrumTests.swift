@@ -6,8 +6,8 @@ import Foundation
 @Suite("Electrum Client Tests")
 struct ElectrumClientTests {
 
-    init() {
-        Dogecoin.initialize()
+    init() async {
+        await Dogecoin.initialize()
     }
 
     private func requireIntegrationTests() -> Bool {
@@ -109,11 +109,14 @@ struct ElectrumSyncManagerTests {
         let manager = ElectrumSyncManager(network: .mainnet)
 
         try await manager.start()
-        #expect(manager.state.isConnected)
-        #expect(manager.currentHeight > 0)
+        let state = await manager.state
+        #expect(state.isConnected)
+        let height = await manager.currentHeight
+        #expect(height > 0)
 
-        manager.stop()
-        #expect(!manager.state.isConnected)
+        await manager.stop()
+        let stoppedState = await manager.state
+        #expect(!stoppedState.isConnected)
     }
 
     @Test("Failed start allows retry")

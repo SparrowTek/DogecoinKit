@@ -215,7 +215,7 @@ public actor HeaderCacheManager {
         progressHandler: (@Sendable (Double) -> Void)?
     ) async throws {
         // Use a class to hold mutable state for safe capture in closure
-        final class DecompressState: @unchecked Sendable {
+        final class DecompressState {
             var leftover = Data()
             var headerCount = 0
             var previousHash: Data?
@@ -229,7 +229,8 @@ public actor HeaderCacheManager {
         let progressBase = 0.1
         let progressRange = 0.85
 
-        try LZFSEDecompressor.decompress(from: compressedURL) { [self] chunk in
+        let addWorkFn = self.addWork
+        try LZFSEDecompressor.decompress(from: compressedURL) { chunk in
             let combined: Data
             if state.leftover.isEmpty {
                 combined = chunk
@@ -266,7 +267,7 @@ public actor HeaderCacheManager {
                         reason: "Invalid difficulty bits: \(header.bits)"
                     )
                 }
-                state.cumulativeChainWork = addWork(state.cumulativeChainWork, blockWork)
+                state.cumulativeChainWork = addWorkFn(state.cumulativeChainWork, blockWork)
 
                 // Create record
                 let record = HeaderRecord(
@@ -393,7 +394,7 @@ public actor HeaderCacheManager {
         return target
     }
 
-    private func addWork(_ a: Data, _ b: Data) -> Data {
+    private nonisolated func addWork(_ a: Data, _ b: Data) -> Data {
         var result = Data(repeating: 0, count: 32)
         var carry: UInt16 = 0
 

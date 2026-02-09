@@ -83,9 +83,9 @@ extension StoredHeader {
 }
 
 /// Manages the chain of block headers for SPV verification
-public final class HeaderChain: @unchecked Sendable {
+public actor HeaderChain {
     /// The network
-    public let network: DogecoinNetwork
+    public nonisolated let network: DogecoinNetwork
 
     /// Storage directory URL
     private let storageURL: URL
@@ -98,9 +98,6 @@ public final class HeaderChain: @unchecked Sendable {
 
     /// Cached tip header
     private var tipCache: StoredHeader?
-
-    /// Lock for thread safety
-    private let lock = NSLock()
 
     /// Logger
     private let logger = Logger(subsystem: "DogecoinKit", category: "HeaderChain")
@@ -190,16 +187,12 @@ public final class HeaderChain: @unchecked Sendable {
 
     /// The tip (highest) header
     public var tip: StoredHeader? {
-        lock.lock()
-        defer { lock.unlock() }
-        return tipCache
+        tipCache
     }
 
     /// Current chain height
     public var height: Int32 {
-        lock.lock()
-        defer { lock.unlock() }
-        return tipCache?.height ?? -1
+        tipCache?.height ?? -1
     }
 
     /// Create a header chain
@@ -217,8 +210,21 @@ public final class HeaderChain: @unchecked Sendable {
             self.storageURL = caches.appendingPathComponent("DogecoinKit/headers/\(network == .mainnet ? "mainnet" : "testnet")")
         }
 
+        self.bundledCacheDirectory = bundledCacheDirectory
+    }
+
+    /// The bundled cache directory passed at init (used by setup)
+    private let bundledCacheDirectory: URL?
+
+    /// Whether setup has been performed
+    private var isSetUp = false
+
+    /// Perform post-init setup: create storage, open database, load state.
+    /// Must be called after init before using the chain. Safe to call multiple times.
+    public func setup() {
+        guard !isSetUp else { return }
+        isSetUp = true
         createStorageDirectory()
-        // Check bundled cache BEFORE opening database (avoids close/reopen issues)
         installBundledCacheIfNeeded(from: bundledCacheDirectory)
         openOrCreateDatabase()
         migrateFromBinaryIfNeeded()
@@ -407,9 +413,6 @@ public final class HeaderChain: @unchecked Sendable {
 
     /// Add a header with validation and optional AuxPoW data
     public func addHeaderValidated(_ header: BlockHeader, auxpow: AuxPoW?) throws {
-        lock.lock()
-        defer { lock.unlock() }
-
         guard let db = database else {
             throw ValidationError.databaseError(HeaderDatabaseError.databaseNotOpen)
         }
@@ -515,9 +518,6 @@ public final class HeaderChain: @unchecked Sendable {
 
     /// Get a header by hash
     public func getHeader(hash: Data) -> StoredHeader? {
-        lock.lock()
-        defer { lock.unlock() }
-
         // Check cache first
         if let cached = recentHeaders.get(hash) {
             return cached
@@ -536,9 +536,6 @@ public final class HeaderChain: @unchecked Sendable {
 
     /// Get a header by height (from best chain)
     public func getHeader(height: Int32) -> StoredHeader? {
-        lock.lock()
-        defer { lock.unlock() }
-
         guard let db = database,
               let record = try? db.getHeader(height: height) else {
             return nil
@@ -551,9 +548,6 @@ public final class HeaderChain: @unchecked Sendable {
 
     /// Check if a header is part of the current best chain
     public func isHeaderInBestChain(_ hash: Data) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-
         guard let db = database,
               let record = try? db.getHeader(hash: hash) else {
             return false
@@ -564,9 +558,6 @@ public final class HeaderChain: @unchecked Sendable {
 
     /// Get block locator hashes for getheaders message
     public func getBlockLocator() -> [Data] {
-        lock.lock()
-        defer { lock.unlock() }
-
         guard let db = database else { return [] }
 
         do {
@@ -647,7 +638,7 @@ public final class HeaderChain: @unchecked Sendable {
         var newChainHashes: [Data] = []
         while let header = cursor, header.height > commonAncestor.height {
             newChainHashes.append(header.header.hash)
-            cursor = getHeaderUnlocked(hash: header.header.prevBlock)
+            cursor = getCachedHeader(hash: header.header.prevBlock)
         }
 
         for hash in newChainHashes {
@@ -664,9 +655,9 @@ public final class HeaderChain: @unchecked Sendable {
 
         while let aHeader = a, let bHeader = b, aHeader.height != bHeader.height {
             if aHeader.height > bHeader.height {
-                a = getHeaderUnlocked(hash: aHeader.header.prevBlock)
+                a = getCachedHeader(hash: aHeader.header.prevBlock)
             } else {
-                b = getHeaderUnlocked(hash: bHeader.header.prevBlock)
+                b = getCachedHeader(hash: bHeader.header.prevBlock)
             }
         }
 
@@ -674,15 +665,14 @@ public final class HeaderChain: @unchecked Sendable {
             if aHeader.header.hash == bHeader.header.hash {
                 return aHeader
             }
-            a = getHeaderUnlocked(hash: aHeader.header.prevBlock)
-            b = getHeaderUnlocked(hash: bHeader.header.prevBlock)
+            a = getCachedHeader(hash: aHeader.header.prevBlock)
+            b = getCachedHeader(hash: bHeader.header.prevBlock)
         }
 
         return nil
     }
 
-    /// Get header without acquiring lock (for internal use when lock is already held)
-    private func getHeaderUnlocked(hash: Data) -> StoredHeader? {
+    private func getCachedHeader(hash: Data) -> StoredHeader? {
         if let cached = recentHeaders.get(hash) {
             return cached
         }
@@ -698,9 +688,6 @@ public final class HeaderChain: @unchecked Sendable {
     // MARK: - Genesis Block
 
     private func initializeGenesisIfNeeded() {
-        lock.lock()
-        defer { lock.unlock() }
-
         guard let db = database else { return }
 
         // Check if genesis exists
@@ -814,7 +801,7 @@ public final class HeaderChain: @unchecked Sendable {
         for _ in 0..<11 {
             guard let current = cursor else { break }
             timestamps.append(current.header.timestamp)
-            cursor = getHeaderUnlocked(hash: current.header.prevBlock)
+            cursor = getCachedHeader(hash: current.header.prevBlock)
         }
 
         timestamps.sort()

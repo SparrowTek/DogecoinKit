@@ -9,24 +9,24 @@ public enum SyncState: Sendable {
 }
 
 /// Protocol that both SPVSyncManager and ElectrumSyncManager conform to
-public protocol BlockchainSyncManager: AnyObject {
-    var network: DogecoinNetwork { get }
+public protocol BlockchainSyncManager: Actor {
+    nonisolated var network: DogecoinNetwork { get }
     var syncState: SyncState { get }
     var currentHeight: Int32 { get }
     var progress: Double { get }
-    var delegate: BlockchainSyncDelegate? { get set }
+    var delegate: (any BlockchainSyncDelegate)? { get set }
 }
 
 /// Delegate protocol for sync events
-public protocol BlockchainSyncDelegate: AnyObject {
-    func syncManager(_ manager: any BlockchainSyncManager, progressUpdated progress: Double, height: Int32)
-    func syncManagerDidComplete(_ manager: any BlockchainSyncManager)
-    func syncManager(_ manager: any BlockchainSyncManager, didEncounterError error: Error)
-    func syncManager(_ manager: any BlockchainSyncManager, didUpdateTransaction txid: String, confirmations: Int)
+public protocol BlockchainSyncDelegate: AnyObject, Sendable {
+    func syncManager(_ manager: any BlockchainSyncManager, progressUpdated progress: Double, height: Int32) async
+    func syncManagerDidComplete(_ manager: any BlockchainSyncManager) async
+    func syncManager(_ manager: any BlockchainSyncManager, didEncounterError error: Error) async
+    func syncManager(_ manager: any BlockchainSyncManager, didUpdateTransaction txid: String, confirmations: Int) async
 }
 
 /// Optional delegate methods with default implementations
 public extension BlockchainSyncDelegate {
-    func syncManager(_ manager: any BlockchainSyncManager, progressUpdated progress: Double, height: Int32) {}
-    func syncManager(_ manager: any BlockchainSyncManager, didUpdateTransaction txid: String, confirmations: Int) {}
+    func syncManager(_ manager: any BlockchainSyncManager, progressUpdated progress: Double, height: Int32) async {}
+    func syncManager(_ manager: any BlockchainSyncManager, didUpdateTransaction txid: String, confirmations: Int) async {}
 }

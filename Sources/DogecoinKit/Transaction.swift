@@ -2,13 +2,10 @@ import Foundation
 import clibdogecoin
 
 /// A Dogecoin transaction builder
-public final class TransactionBuilder: @unchecked Sendable {
+public actor TransactionBuilder {
 
     /// The internal transaction index
     private let txIndex: Int32
-
-    /// Lock for thread safety
-    private let lock = NSLock()
 
     /// Track if transaction has been finalized
     private var isFinalized = false
@@ -17,8 +14,8 @@ public final class TransactionBuilder: @unchecked Sendable {
 
     /// Create a new transaction builder
     /// - Throws: `DogecoinError.transactionCreationFailed` if creation fails
-    public init() throws {
-        try Dogecoin.ensureInitialized()
+    public init() async throws {
+        try await Dogecoin.ensureInitialized()
 
         let index = start_transaction()
         guard index >= 0 else {
@@ -38,9 +35,6 @@ public final class TransactionBuilder: @unchecked Sendable {
     ///   - vout: The output index within the transaction
     /// - Throws: `DogecoinError.addInputFailed` if adding the input fails
     public func addInput(txid: String, vout: Int) throws {
-        lock.lock()
-        defer { lock.unlock() }
-
         guard !isFinalized else {
             throw DogecoinError.internalError("Transaction already finalized")
         }
@@ -71,9 +65,6 @@ public final class TransactionBuilder: @unchecked Sendable {
     ///   - amountString: The amount as a string (e.g., "1.5")
     /// - Throws: `DogecoinError.addOutputFailed` if adding the output fails
     public func addOutput(address: String, amountString: String) throws {
-        lock.lock()
-        defer { lock.unlock() }
-
         guard !isFinalized else {
             throw DogecoinError.internalError("Transaction already finalized")
         }
@@ -102,9 +93,6 @@ public final class TransactionBuilder: @unchecked Sendable {
         totalAmount: DogecoinAmount,
         changeAddress: String? = nil
     ) throws -> String {
-        lock.lock()
-        defer { lock.unlock() }
-
         guard !isFinalized else {
             throw DogecoinError.internalError("Transaction already finalized")
         }
@@ -149,9 +137,6 @@ public final class TransactionBuilder: @unchecked Sendable {
     ///   - privateKeyWIF: The private key in WIF format
     /// - Throws: `DogecoinError.transactionSigningFailed` if signing fails
     public func signInput(index: Int, privateKeyWIF: String) throws {
-        lock.lock()
-        defer { lock.unlock() }
-
         guard index >= 0, index < inputCount else {
             throw DogecoinError.transactionSigningFailed
         }
@@ -170,9 +155,6 @@ public final class TransactionBuilder: @unchecked Sendable {
     ///   - privateKeyWIF: The private key in WIF format
     /// - Throws: `DogecoinError.transactionSigningFailed` if signing fails
     public func sign(scriptPubKey: String, privateKeyWIF: String) throws {
-        lock.lock()
-        defer { lock.unlock() }
-
         var scriptBuffer = Array(scriptPubKey.utf8CString)
         var privKeyBuffer = Array(privateKeyWIF.utf8CString)
 
@@ -187,9 +169,6 @@ public final class TransactionBuilder: @unchecked Sendable {
     /// - Returns: The raw transaction as hex string
     /// - Throws: `DogecoinError.transactionCreationFailed` if retrieval fails
     public func getRawTransaction() throws -> String {
-        lock.lock()
-        defer { lock.unlock() }
-
         guard let rawTx = get_raw_transaction(txIndex) else {
             throw DogecoinError.transactionCreationFailed
         }
@@ -290,13 +269,13 @@ public func createTransaction(
     privateKey: String,
     changeAddress: String? = nil,
     fee: DogecoinAmount
-) throws -> SignedTransaction {
+) async throws -> SignedTransaction {
     let uniqueAddresses = Set(inputs.map { $0.address })
     guard uniqueAddresses.count <= 1 else {
         throw DogecoinError.transactionValidationFailed("Multiple input addresses require per-input signing keys")
     }
 
-    return try createTransaction(
+    return try await createTransaction(
         inputs: inputs,
         outputs: outputs,
         signingKeysByAddress: [inputs.first?.address ?? "": privateKey],
@@ -320,7 +299,7 @@ public func createTransaction(
     signingKeysByAddress: [String: String],
     changeAddress: String? = nil,
     fee: DogecoinAmount
-) throws -> SignedTransaction {
+) async throws -> SignedTransaction {
     let plan = try planTransaction(
         inputs: inputs,
         outputs: outputs,
@@ -328,14 +307,14 @@ public func createTransaction(
         changeAddress: changeAddress
     )
 
-    let builder = try TransactionBuilder()
+    let builder = try await TransactionBuilder()
 
     for input in inputs {
-        try builder.addInput(txid: input.txid, vout: input.vout)
+        try await builder.addInput(txid: input.txid, vout: input.vout)
     }
 
     for output in outputs {
-        try builder.addOutput(address: output.address, amount: output.amount)
+        try await builder.addOutput(address: output.address, amount: output.amount)
     }
 
     let totalInput = inputs.reduce(DogecoinAmount.zero) { $0 + $1.amount }
@@ -344,7 +323,7 @@ public func createTransaction(
         throw DogecoinError.transactionCreationFailed
     }
 
-    _ = try builder.finalize(
+    _ = try await builder.finalize(
         destinationAddress: firstOutput.address,
         fee: plan.fee,
         totalAmount: totalInput,
@@ -355,10 +334,10 @@ public func createTransaction(
         guard let privateKey = signingKeysByAddress[input.address] else {
             throw DogecoinError.transactionValidationFailed("Missing signing key for address \(input.address)")
         }
-        try builder.signInput(index: index, privateKeyWIF: privateKey)
+        try await builder.signInput(index: index, privateKeyWIF: privateKey)
     }
 
-    let rawHex = try builder.getRawTransaction()
+    let rawHex = try await builder.getRawTransaction()
     return SignedTransaction(rawHex: rawHex, fee: plan.fee)
 }
 

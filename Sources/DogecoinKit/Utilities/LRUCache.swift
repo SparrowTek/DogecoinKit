@@ -1,15 +1,17 @@
 import Foundation
 
-/// Thread-safe LRU (Least Recently Used) cache with fixed capacity
+/// LRU (Least Recently Used) cache with fixed capacity
 ///
 /// When the cache reaches capacity, the least recently accessed item is evicted
 /// to make room for new entries. Access operations (get) move items to the
 /// most recently used position.
-public final class LRUCache<Key: Hashable, Value>: @unchecked Sendable {
+///
+/// This type is not thread-safe on its own. It is intended to be owned
+/// by an actor which provides isolation.
+public final class LRUCache<Key: Hashable, Value> {
     private var cache: [Key: Value] = [:]
     private var order: [Key] = []
     private let capacity: Int
-    private let lock = NSLock()
 
     /// Create a new LRU cache with the specified capacity
     /// - Parameter capacity: Maximum number of items to store
@@ -24,9 +26,6 @@ public final class LRUCache<Key: Hashable, Value>: @unchecked Sendable {
     /// - Parameter key: The key to look up
     /// - Returns: The value if found, nil otherwise
     public func get(_ key: Key) -> Value? {
-        lock.lock()
-        defer { lock.unlock() }
-
         guard let value = cache[key] else { return nil }
 
         // Move to end (most recently used)
@@ -47,9 +46,6 @@ public final class LRUCache<Key: Hashable, Value>: @unchecked Sendable {
     ///   - key: The key to store
     ///   - value: The value to store
     public func set(_ key: Key, _ value: Value) {
-        lock.lock()
-        defer { lock.unlock() }
-
         if cache[key] != nil {
             // Update existing
             cache[key] = value
@@ -74,9 +70,6 @@ public final class LRUCache<Key: Hashable, Value>: @unchecked Sendable {
     /// - Returns: The removed value if it existed, nil otherwise
     @discardableResult
     public func remove(_ key: Key) -> Value? {
-        lock.lock()
-        defer { lock.unlock() }
-
         guard let value = cache.removeValue(forKey: key) else { return nil }
         if let index = order.firstIndex(of: key) {
             order.remove(at: index)
@@ -86,8 +79,6 @@ public final class LRUCache<Key: Hashable, Value>: @unchecked Sendable {
 
     /// Remove all items from the cache
     public func clear() {
-        lock.lock()
-        defer { lock.unlock() }
         cache.removeAll()
         order.removeAll()
     }
@@ -96,23 +87,17 @@ public final class LRUCache<Key: Hashable, Value>: @unchecked Sendable {
     /// - Parameter key: The key to check
     /// - Returns: true if the key exists
     public func contains(_ key: Key) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return cache[key] != nil
+        cache[key] != nil
     }
 
     /// Current number of items in the cache
     public var count: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return cache.count
+        cache.count
     }
 
     /// Whether the cache is empty
     public var isEmpty: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return cache.isEmpty
+        cache.isEmpty
     }
 
     /// The maximum capacity of the cache

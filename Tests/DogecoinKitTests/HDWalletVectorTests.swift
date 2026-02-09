@@ -5,8 +5,8 @@ import clibdogecoin
 
 @Suite("HD Wallet Vectors")
 struct HDWalletVectorTests {
-    init() {
-        Dogecoin.initialize()
+    init() async {
+        await Dogecoin.initialize()
     }
 
     @Test("Mnemonic seed with passphrase matches known vector")
@@ -33,29 +33,29 @@ struct HDWalletVectorTests {
     }
 
     @Test("HD wallet derived from mnemonic matches known vectors")
-    func testHDWalletVectors() throws {
+    func testHDWalletVectors() async throws {
         let mnemonic = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote"
 
-        let testnetWallet = try HDWallet(mnemonic: mnemonic, passphrase: "", network: .testnet)
+        let testnetWallet = try await HDWallet(mnemonic: mnemonic, passphrase: "", network: .testnet)
         #expect(testnetWallet.masterKey == "tprv8ZgxMBicQKsPd66qSfNTYkdM76NsJ368nHs7r1WnKhmUbdx4Gwkhk175pvpe2A652Xzszhg2qf55w8qpRzNBwMboA3R6PoABT36eHV89dRZ")
 
-        let testnetAddress = try testnetWallet.deriveAddress(account: 0, index: 0, change: false)
+        let testnetAddress = try await testnetWallet.deriveAddress(account: 0, index: 0, change: false)
         #expect(testnetAddress == "naTzLkBZLpUVXykb3sSP1Wzzz9GzzM4BVU")
 
-        let mainnetWallet = try HDWallet(mnemonic: mnemonic, passphrase: "", network: .mainnet)
-        let mainnetAddress = try mainnetWallet.deriveAddress(account: 0, index: 0, change: false)
+        let mainnetWallet = try await HDWallet(mnemonic: mnemonic, passphrase: "", network: .mainnet)
+        let mainnetAddress = try await mainnetWallet.deriveAddress(account: 0, index: 0, change: false)
         #expect(mainnetAddress == "DTdKu8YgcxoXyjFCDtCeKimaZzsK27rcwT")
     }
 
     @Test("Derived private keys match known vectors")
-    func testDerivedPrivateKeyVectors() throws {
+    func testDerivedPrivateKeyVectors() async throws {
         let mnemonic = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote"
-        let wallet = try HDWallet(mnemonic: mnemonic, passphrase: "", network: .mainnet)
+        let wallet = try await HDWallet(mnemonic: mnemonic, passphrase: "", network: .mainnet)
 
-        let externalKey = try wallet.derivePrivateKey(account: 1, index: 1, change: false)
+        let externalKey = try await wallet.derivePrivateKey(account: 1, index: 1, change: false)
         #expect(externalKey == "QPhPcYBCZPPc73Ldrdj6Ubc8SiiRqwRns6nuEqgzshiqJA6WEp62")
 
-        let changeKey = try wallet.derivePrivateKey(account: 1, index: 1, change: true)
+        let changeKey = try await wallet.derivePrivateKey(account: 1, index: 1, change: true)
         #expect(changeKey == "QQiHajxrYwkCK1zkbmt2ZTKSQyy64jUPVbw4CDYJBchg975TRBJu")
     }
 }
