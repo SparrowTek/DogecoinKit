@@ -274,7 +274,13 @@ public actor ElectrumSyncManager {
                 throw ElectrumError.connectionTimeout
             }
             // First task to complete wins; cancel the other.
-            _ = try await group.next()
+            do {
+                _ = try await group.next()
+            } catch is CancellationError {
+                // The timeout task's sleep was cancelled (e.g., parent task cancelled
+                // by SwiftUI's .refreshable). Wait for the connect task instead.
+                _ = try await group.next()
+            }
             group.cancelAll()
         }
     }
