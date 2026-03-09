@@ -341,25 +341,40 @@ public actor PeerManager {
             let seeds = NetworkConstants.seeds(for: network)
             self.logger.info("Discovering peers from \(seeds.count) DNS seeds")
 
-            // Resolve DNS seeds concurrently off the actor to avoid blocking it
-            let resolvedAddresses = await withTaskGroup(of: [(String, UInt16)].self) { group in
+            let dnsTimeout: Duration = .seconds(10)
+
+            // Resolve DNS seeds concurrently, connecting as each seed resolves
+            // rather than waiting for all seeds (dead seeds block CFHost indefinitely)
+            await withTaskGroup(of: [(String, UInt16)].self) { group in
                 let port = NetworkConstants.port(for: network)
                 for seed in seeds {
                     group.addTask {
-                        Self.resolveHostOffActor(seed, port: port)
+                        // Race DNS resolution against a timeout so a dead seed
+                        // cannot stall peer discovery indefinitely
+                        await withTaskGroup(of: [(String, UInt16)]?.self) { inner in
+                            inner.addTask {
+                                Self.resolveHostOffActor(seed, port: port)
+                            }
+                            inner.addTask {
+                                try? await Task.sleep(for: dnsTimeout)
+                                return nil
+                            }
+                            for await result in inner {
+                                inner.cancelAll()
+                                return result ?? []
+                            }
+                            return []
+                        }
                     }
                 }
-                var all: [(String, UInt16)] = []
                 for await batch in group {
-                    all.append(contentsOf: batch)
+                    guard !batch.isEmpty else { continue }
+                    for (host, port) in batch {
+                        await self.addDiscoveredAddress(host: host, port: port)
+                    }
+                    await self.connectToDiscoveredPeers()
                 }
-                return all
             }
-
-            for (host, port) in resolvedAddresses {
-                await self.addDiscoveredAddress(host: host, port: port)
-            }
-            await self.connectToDiscoveredPeers()
 
             // If DNS resolution failed, use hardcoded fallback nodes
             try? await Task.sleep(for: .seconds(3))
