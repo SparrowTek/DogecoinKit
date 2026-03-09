@@ -78,8 +78,8 @@ struct ElectrumClientTests {
     @Test("Script hash uses P2PKH scriptPubKey format")
     func testScriptHashComputation() throws {
         let address = "D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD"
-        let pubkeyHash = try Address.toPubkeyHash(address)
-        let scriptPubKeyHex = "76a914\(pubkeyHash)88ac"
+        // toPubkeyHash already returns the full P2PKH scriptPubKey hex (76a914...88ac)
+        let scriptPubKeyHex = try Address.toPubkeyHash(address)
         let scriptPubKey = try #require(Data(hexString: scriptPubKeyHex))
         let expected = Data(SHA256.hash(data: scriptPubKey).reversed()).hexString
 
