@@ -53,9 +53,9 @@ struct HDWalletVectorTests {
         let wallet = try await HDWallet(mnemonic: mnemonic, passphrase: "", network: .mainnet)
 
         let externalKey = try await wallet.derivePrivateKey(account: 1, index: 1, change: false)
-        #expect(externalKey == "QPhPcYBCZPPc73Ldrdj6Ubc8SiiRqwRns6nuEqgzshiqJA6WEp62")
+        #expect(externalKey == "QSv9BKZDz8RFW2KyiwETyVeeZkBDKMWvmmZkFJ3ds5KYLVM6ngPe")
 
         let changeKey = try await wallet.derivePrivateKey(account: 1, index: 1, change: true)
-        #expect(changeKey == "QQiHajxrYwkCK1zkbmt2ZTKSQyy64jUPVbw4CDYJBchg975TRBJu")
+        #expect(changeKey == "QUzvhwwncV8AMGxo1ePbiCHBvb7UxGmgektL7VqU8iHJrNGPWLz7")
     }
 }

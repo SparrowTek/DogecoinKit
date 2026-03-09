@@ -68,6 +68,13 @@ public struct ElectrumScriptHash: Sendable {
         self.scriptHash = try Self.computeScriptHash(for: address, network: network)
     }
 
+    // P2PKH script opcodes
+    private static let opDup: UInt8 = 0x76
+    private static let opHash160: UInt8 = 0xa9
+    private static let pushBytes20: UInt8 = 0x14
+    private static let opEqualVerify: UInt8 = 0x88
+    private static let opCheckSig: UInt8 = 0xac
+
     private static func computeScriptHash(for address: String, network: DogecoinNetwork) throws -> String {
         guard let detectedNetwork = Address.detectNetwork(address),
               detectedNetwork == network else {
@@ -82,15 +89,21 @@ public struct ElectrumScriptHash: Sendable {
             print("[ElectrumScriptHash] Failed to get scriptPubKey for \(address): \(error)")
             throw ElectrumError.invalidAddress(address)
         }
-        let scriptPubKeyHex = pubkeyHashHex
-        guard let scriptPubKey = Data(hexString: scriptPubKeyHex) else {
-            print("[ElectrumScriptHash] Invalid scriptPubKey hex: \(scriptPubKeyHex)")
-            throw ElectrumError.serializationError("Invalid scriptPubKey")
+        guard let pubkeyHash = Data(hexString: pubkeyHashHex) else {
+            print("[ElectrumScriptHash] Invalid pubkey hash hex: \(pubkeyHashHex)")
+            throw ElectrumError.serializationError("Invalid pubkey hash")
         }
 
-        let hash = SHA256.hash(data: scriptPubKey)
-        let result = Data(hash.reversed()).hexString
-        return result
+        // Build the P2PKH scriptPubKey: OP_DUP OP_HASH160 <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG
+        var scriptPubKey = Data(capacity: 25)
+        scriptPubKey.append(opDup)
+        scriptPubKey.append(opHash160)
+        scriptPubKey.append(pushBytes20)
+        scriptPubKey.append(pubkeyHash)
+        scriptPubKey.append(opEqualVerify)
+        scriptPubKey.append(opCheckSig)
+
+        return Data(SHA256.hash(data: scriptPubKey).reversed()).hexString
     }
 }
 
