@@ -334,21 +334,38 @@ public actor PeerManager {
     // MARK: - Private Methods
 
     private func discoverPeers() {
+        let network = self.network
         Task { [weak self] in
             guard let self else { return }
 
-            let seeds = NetworkConstants.seeds(for: self.network)
+            let seeds = NetworkConstants.seeds(for: network)
             self.logger.info("Discovering peers from \(seeds.count) DNS seeds")
 
-            for seed in seeds {
-                await self.resolveHost(seed)
+            // Resolve DNS seeds concurrently off the actor to avoid blocking it
+            let resolvedAddresses = await withTaskGroup(of: [(String, UInt16)].self) { group in
+                let port = NetworkConstants.port(for: network)
+                for seed in seeds {
+                    group.addTask {
+                        Self.resolveHostOffActor(seed, port: port)
+                    }
+                }
+                var all: [(String, UInt16)] = []
+                for await batch in group {
+                    all.append(contentsOf: batch)
+                }
+                return all
             }
+
+            for (host, port) in resolvedAddresses {
+                await self.addDiscoveredAddress(host: host, port: port)
+            }
+            await self.connectToDiscoveredPeers()
 
             // If DNS resolution failed, use hardcoded fallback nodes
             try? await Task.sleep(for: .seconds(3))
             guard !Task.isCancelled else { return }
 
-            if await self.connectedPeerCount == 0 && self.network == .mainnet {
+            if await self.connectedPeerCount == 0 && network == .mainnet {
                 self.logger.info("DNS seeds failed, trying fallback nodes")
                 for node in NetworkConstants.mainnetFallbackNodes {
                     await self.addDiscoveredAddress(host: node.host, port: node.port)
@@ -399,29 +416,28 @@ public actor PeerManager {
         await peer.send(message)
     }
 
-    private func resolveHost(_ hostname: String) {
+    /// Resolve a DNS seed off-actor so the blocking CFHost call doesn't starve the actor.
+    nonisolated private static func resolveHostOffActor(_ hostname: String, port: UInt16) -> [(String, UInt16)] {
         let host = CFHostCreateWithName(nil, hostname as CFString).takeRetainedValue()
         CFHostStartInfoResolution(host, .addresses, nil)
 
         var success: DarwinBoolean = false
         guard let addresses = CFHostGetAddressing(host, &success)?.takeUnretainedValue() as? [Data], success.boolValue else {
-            logger.warning("Failed to resolve \(hostname)")
-            return
+            return []
         }
 
+        var results: [(String, UInt16)] = []
         for addressData in addresses {
             if let address = parseIPv4Address(addressData) {
-                addDiscoveredAddress(host: address, port: NetworkConstants.port(for: network))
+                results.append((address, port))
             } else if let address = parseIPv6Address(addressData) {
-                addDiscoveredAddress(host: address, port: NetworkConstants.port(for: network))
+                results.append((address, port))
             }
         }
-
-        logger.info("Discovered \(addresses.count) addresses from \(hostname)")
-        connectToDiscoveredPeers()
+        return results
     }
 
-    nonisolated private func parseIPv4Address(_ data: Data) -> String? {
+    nonisolated private static func parseIPv4Address(_ data: Data) -> String? {
         guard data.count >= MemoryLayout<sockaddr_in>.size else { return nil }
 
         return data.withUnsafeBytes { bytes -> String? in
@@ -439,7 +455,7 @@ public actor PeerManager {
         }
     }
 
-    nonisolated private func parseIPv6Address(_ data: Data) -> String? {
+    nonisolated private static func parseIPv6Address(_ data: Data) -> String? {
         guard data.count >= MemoryLayout<sockaddr_in6>.size else { return nil }
 
         return data.withUnsafeBytes { bytes -> String? in
@@ -458,10 +474,12 @@ public actor PeerManager {
     }
 
     private func connectToDiscoveredPeers() {
-        let currentPeerCount = peers.count
+        // Count only peers that are still actively connecting or connected,
+        // not ones that have already disconnected and are awaiting cleanup.
+        let activePeerCount = peers.filter { !disconnectedPeerIDs.contains($0.id) }.count
         let addressesToTry = discoveredAddresses
 
-        let needed = maxPeerConnections - currentPeerCount
+        let needed = maxPeerConnections - activePeerCount
         guard needed > 0 else { return }
 
         let candidates = addressesToTry.prefix(needed)
