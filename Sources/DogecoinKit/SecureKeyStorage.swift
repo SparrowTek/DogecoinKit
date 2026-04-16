@@ -40,7 +40,10 @@ private struct KeychainStore {
         return query
     }
 
-    func read() throws -> String {
+    /// Reads the raw data for this keychain item. Callers pass the raw buffer
+    /// directly into a decoder to avoid round-tripping sensitive material
+    /// through a `String`, which is not zeroizable.
+    func readData() throws -> Data {
         var query = baseQuery
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         query[kSecReturnData as String] = kCFBooleanTrue
@@ -49,24 +52,33 @@ private struct KeychainStore {
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         guard status != errSecItemNotFound else { throw KeychainStoreError.notFound }
         guard status == errSecSuccess else { throw KeychainStoreError.unhandled(status: status) }
-        guard let data = item as? Data,
-              let value = String(data: data, encoding: .utf8) else {
+        guard let data = item as? Data else {
             throw KeychainStoreError.invalidData
         }
-        return value
+        return data
     }
 
-    func save(_ value: String) throws {
-        let data = value.data(using: .utf8) ?? Data()
+    /// Writes a raw `Data` buffer. Use this path for sensitive credentials so
+    /// we do not materialize intermediate Swift `String` copies that the
+    /// language cannot zeroize on drop.
+    ///
+    /// The item is written non-synchronizable (never leaves this device,
+    /// never reaches iCloud Keychain) and with
+    /// `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` so it is inaccessible
+    /// until the user has unlocked the device at least once and is never
+    /// migrated to a new device via encrypted backups.
+    func saveData(_ data: Data) throws {
         var newItem = baseQuery
         newItem[kSecValueData as String] = data
         newItem[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        newItem[kSecAttrSynchronizable as String] = kCFBooleanFalse
 
         let status = SecItemAdd(newItem as CFDictionary, nil)
         if status == errSecDuplicateItem {
             let attributes: [String: Any] = [
                 kSecValueData as String: data,
-                kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+                kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+                kSecAttrSynchronizable as String: kCFBooleanFalse as Any
             ]
             let updateStatus = SecItemUpdate(baseQuery as CFDictionary, attributes as CFDictionary)
             guard updateStatus == errSecSuccess else {
@@ -189,7 +201,7 @@ public actor SecureKeyStorage {
         passphrase: String = "",
         network: DogecoinNetwork
     ) throws -> String {
-let credentials = StoredWalletCredentials(
+        let credentials = StoredWalletCredentials(
             mnemonic: mnemonic,
             passphrase: passphrase,
             network: network
@@ -200,12 +212,9 @@ let credentials = StoredWalletCredentials(
 
         do {
             let jsonData = try JSONEncoder().encode(credentials)
-            guard let jsonString = String(data: jsonData, encoding: .utf8) else {
-                throw DogecoinError.keychainStorageFailed("Failed to encode credentials")
-            }
 
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
-            try store.save(jsonString)
+            try store.saveData(jsonData)
             return id
         } catch let error as DogecoinError {
             throw error
@@ -221,16 +230,11 @@ let credentials = StoredWalletCredentials(
     /// - Returns: The stored wallet credentials
     /// - Throws: `DogecoinError.keyNotFound` if not found, or `DogecoinError.keychainRetrievalFailed` on error
     public func retrieveWalletCredentials(id: String) throws -> StoredWalletCredentials {
-let accountName = Self.walletCredentialsPrefix + id
+        let accountName = Self.walletCredentialsPrefix + id
 
         do {
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
-            let jsonString = try store.read()
-
-            guard let jsonData = jsonString.data(using: .utf8) else {
-                throw DogecoinError.keychainRetrievalFailed("Failed to decode stored data")
-            }
-
+            let jsonData = try store.readData()
             let credentials = try JSONDecoder().decode(StoredWalletCredentials.self, from: jsonData)
             return credentials
         } catch let error as DogecoinError {
@@ -248,7 +252,7 @@ let accountName = Self.walletCredentialsPrefix + id
     /// - Parameter id: The identifier of the credentials to delete
     /// - Throws: `DogecoinError.keychainDeletionFailed` if deletion fails
     public func deleteWalletCredentials(id: String) throws {
-let accountName = Self.walletCredentialsPrefix + id
+        let accountName = Self.walletCredentialsPrefix + id
 
         do {
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
@@ -279,7 +283,7 @@ let accountName = Self.walletCredentialsPrefix + id
     /// - Returns: A unique identifier for retrieving the key later
     /// - Throws: `DogecoinError.keychainStorageFailed` if storage fails
     public func storeMasterKey(_ masterKey: String, network: DogecoinNetwork) throws -> String {
-let id = UUID().uuidString
+        let id = UUID().uuidString
         let accountName = Self.masterKeyPrefix + id
 
         // Store as JSON with metadata
@@ -287,12 +291,9 @@ let id = UUID().uuidString
 
         do {
             let jsonData = try JSONEncoder().encode(payload)
-            guard let jsonString = String(data: jsonData, encoding: .utf8) else {
-                throw DogecoinError.keychainStorageFailed("Failed to encode master key")
-            }
 
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
-            try store.save(jsonString)
+            try store.saveData(jsonData)
             return id
         } catch let error as DogecoinError {
             throw error
@@ -308,16 +309,11 @@ let id = UUID().uuidString
     /// - Returns: A tuple containing the master key and network
     /// - Throws: `DogecoinError.keyNotFound` if not found
     public func retrieveMasterKey(id: String) throws -> (masterKey: String, network: DogecoinNetwork) {
-let accountName = Self.masterKeyPrefix + id
+        let accountName = Self.masterKeyPrefix + id
 
         do {
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
-            let jsonString = try store.read()
-
-            guard let jsonData = jsonString.data(using: .utf8) else {
-                throw DogecoinError.keychainRetrievalFailed("Failed to decode stored data")
-            }
-
+            let jsonData = try store.readData()
             let payload = try JSONDecoder().decode(MasterKeyPayload.self, from: jsonData)
             return (payload.masterKey, payload.network)
         } catch let error as DogecoinError {
@@ -335,7 +331,7 @@ let accountName = Self.masterKeyPrefix + id
     /// - Parameter id: The identifier of the key to delete
     /// - Throws: `DogecoinError.keychainDeletionFailed` if deletion fails
     public func deleteMasterKey(id: String) throws {
-let accountName = Self.masterKeyPrefix + id
+        let accountName = Self.masterKeyPrefix + id
 
         do {
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
@@ -354,19 +350,16 @@ let accountName = Self.masterKeyPrefix + id
     /// - Returns: A unique identifier for retrieving the key later
     /// - Throws: `DogecoinError.keychainStorageFailed` if storage fails
     public func storePrivateKey(_ privateKeyWIF: String, address: String) throws -> String {
-let id = UUID().uuidString
+        let id = UUID().uuidString
         let accountName = Self.privateKeyPrefix + id
 
         let payload = PrivateKeyPayload(privateKeyWIF: privateKeyWIF, address: address, storedAt: Date())
 
         do {
             let jsonData = try JSONEncoder().encode(payload)
-            guard let jsonString = String(data: jsonData, encoding: .utf8) else {
-                throw DogecoinError.keychainStorageFailed("Failed to encode private key")
-            }
 
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
-            try store.save(jsonString)
+            try store.saveData(jsonData)
             return id
         } catch let error as DogecoinError {
             throw error
@@ -382,16 +375,11 @@ let id = UUID().uuidString
     /// - Returns: A tuple containing the private key WIF and associated address
     /// - Throws: `DogecoinError.keyNotFound` if not found
     public func retrievePrivateKey(id: String) throws -> (privateKeyWIF: String, address: String) {
-let accountName = Self.privateKeyPrefix + id
+        let accountName = Self.privateKeyPrefix + id
 
         do {
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
-            let jsonString = try store.read()
-
-            guard let jsonData = jsonString.data(using: .utf8) else {
-                throw DogecoinError.keychainRetrievalFailed("Failed to decode stored data")
-            }
-
+            let jsonData = try store.readData()
             let payload = try JSONDecoder().decode(PrivateKeyPayload.self, from: jsonData)
             return (payload.privateKeyWIF, payload.address)
         } catch let error as DogecoinError {
@@ -409,7 +397,7 @@ let accountName = Self.privateKeyPrefix + id
     /// - Parameter id: The identifier of the key to delete
     /// - Throws: `DogecoinError.keychainDeletionFailed` if deletion fails
     public func deletePrivateKey(id: String) throws {
-let accountName = Self.privateKeyPrefix + id
+        let accountName = Self.privateKeyPrefix + id
 
         do {
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)

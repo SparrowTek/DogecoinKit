@@ -43,7 +43,7 @@ public actor ElectrumClient {
 
         let parameters: NWParameters
         if server.useSSL {
-            parameters = NWParameters(tls: NWProtocolTLS.Options())
+            parameters = NWParameters(tls: Self.makeTLSOptions(serverHost: server.host))
         } else {
             parameters = NWParameters.tcp
         }
@@ -143,6 +143,31 @@ public actor ElectrumClient {
         guard !didResumeConnectionContinuation else { return }
         resumeConnectionContinuation(throwing: ElectrumError.connectionTimeout)
         connection?.cancel()
+    }
+
+    // MARK: - TLS
+
+    /// Builds hardened TLS options for Electrum connections.
+    ///
+    /// Hardening applied:
+    /// - Minimum TLS protocol pinned to 1.2 (blocks legacy TLS 1.0/1.1 downgrade).
+    /// - Explicit SNI set to the configured server hostname — ensures the
+    ///   server presents a certificate for the host we intended to reach and
+    ///   prevents accidental matching against an unrelated cert on shared
+    ///   hosting.
+    ///
+    /// Default system trust-chain evaluation remains in place. A future pass
+    /// can layer certificate pinning via `sec_protocol_options_set_verify_block`
+    /// on top of this; for now the defaults plus min-version + SNI are the
+    /// correctness floor we want.
+    private static func makeTLSOptions(serverHost: String) -> NWProtocolTLS.Options {
+        let options = NWProtocolTLS.Options()
+        let securityOptions = options.securityProtocolOptions
+        sec_protocol_options_set_min_tls_protocol_version(securityOptions, .TLSv12)
+        serverHost.withCString { cString in
+            sec_protocol_options_set_tls_server_name(securityOptions, cString)
+        }
+        return options
     }
 
     // MARK: - Send/Receive

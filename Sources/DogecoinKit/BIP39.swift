@@ -143,6 +143,10 @@ public enum MnemonicValidationError: Error, Sendable, Equatable {
     case invalidWordCount
     case invalidWords([Int])
     case invalidChecksum
+    /// The bundled BIP39 wordlist resource could not be loaded. Raised only
+    /// when the wordlist is genuinely missing (e.g., resource bundle broken);
+    /// distinct from `invalidChecksum` so support can tell the two apart.
+    case wordlistUnavailable
 }
 
 /// Validates a mnemonic phrase and returns detailed results
@@ -170,12 +174,42 @@ public func validateMnemonicDetailed(_ mnemonic: String) -> MnemonicValidationRe
         )
     }
 
-    // Use libdogecoin's full validation (includes word and checksum validation)
+    // If the bundled wordlist is missing, we can only partially validate
+    // (libdogecoin's checksum check still works), but we cannot identify
+    // specific bad words, which would otherwise appear to the user as an
+    // indistinguishable "bad checksum." Surface this case distinctly.
+    let wordlistIndex = BIP39Wordlist.englishIndex
+    guard !wordlistIndex.isEmpty else {
+        return MnemonicValidationResult(
+            isValid: false,
+            invalidWordIndices: [],
+            error: .wordlistUnavailable
+        )
+    }
+
+    // Identify any words that aren't in the BIP39 wordlist. This is a stronger
+    // signal than a checksum failure for the user — they can see exactly which
+    // word to retype.
+    var invalidIndices: [Int] = []
+    for (offset, word) in words.enumerated() {
+        let normalized = word.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        if wordlistIndex[normalized] == nil {
+            invalidIndices.append(offset)
+        }
+    }
+
+    if !invalidIndices.isEmpty {
+        return MnemonicValidationResult(
+            isValid: false,
+            invalidWordIndices: invalidIndices,
+            error: .invalidWords(invalidIndices)
+        )
+    }
+
+    // All words are valid BIP39 words — remaining failure must be the checksum.
     let isValid = verifyMnemonic(trimmed)
 
     if !isValid {
-        // Cannot determine specific invalid words without wordlist access
-        // Return generic checksum error
         return MnemonicValidationResult(
             isValid: false,
             invalidWordIndices: [],
