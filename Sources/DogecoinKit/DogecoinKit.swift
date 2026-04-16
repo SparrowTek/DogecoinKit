@@ -78,6 +78,29 @@ public enum DogecoinNetwork: Sendable {
         case .testnet: return "n"
         }
     }
+
+    /// BIP44 coin type used in the derivation path `m/44'/<coinType>'/...`.
+    ///
+    /// Mainnet is coin type **3** per SLIP-0044; SLIP-0044 also reserves
+    /// coin type **1** for every testnet coin. Centralizing these constants
+    /// keeps `HDWallet.deriveAddress`, address-path formatters, and any
+    /// future `m/44'/…/…/…/…` construction in lockstep — one edit away
+    /// from disaster if they drift.
+    public var bip44CoinType: UInt32 {
+        switch self {
+        case .mainnet: return 3
+        case .testnet: return 1
+        }
+    }
+
+    /// Fully-qualified BIP44 derivation path for the given account / chain /
+    /// index. Returns a string of the form `m/44'/<coin>'/<account>'/<chain>/<index>`
+    /// where `chain = 1` for change addresses and `0` for external
+    /// (receive) addresses.
+    public func bip44Path(account: UInt32, change: Bool, index: UInt32) -> String {
+        let chain = change ? 1 : 0
+        return "m/44'/\(bip44CoinType)'/\(account)'/\(chain)/\(index)"
+    }
 }
 
 // MARK: - Utility Extensions

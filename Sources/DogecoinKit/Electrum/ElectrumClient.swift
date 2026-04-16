@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import os.log
 
 public actor ElectrumClient {
 
@@ -19,6 +20,8 @@ public actor ElectrumClient {
     private let connectionTimeout: TimeInterval = 30
     private let requestTimeout: TimeInterval = 60
 
+    private let logger = Logger(subsystem: "DogecoinKit", category: "electrum")
+
     // MARK: - Initialization
 
     public init(server: ElectrumServer) {
@@ -29,12 +32,12 @@ public actor ElectrumClient {
 
     public func connect() async throws {
         guard !isConnected else {
-            print("[ElectrumClient] Already connected, skipping")
+            logger.debug("Already connected to \(self.server.host, privacy: .public), skipping")
             return
         }
         didResumeConnectionContinuation = false
 
-        print("[ElectrumClient] Connecting to \(server.host):\(server.port) (SSL: \(server.useSSL))")
+        logger.info("Connecting to \(self.server.host, privacy: .public):\(self.server.port) (SSL: \(self.server.useSSL))")
 
         let endpoint = NWEndpoint.hostPort(
             host: NWEndpoint.Host(server.host),
@@ -74,13 +77,12 @@ public actor ElectrumClient {
 
         // Perform version handshake
         do {
-            print("[ElectrumClient] Connection established, performing version handshake...")
+            logger.debug("Connection established, performing version handshake")
             let version = try await serverVersion()
-            print("[ElectrumClient] Server version: \(version)")
+            logger.info("Connected to \(self.server.host, privacy: .public) — server version \(version.joined(separator: " "), privacy: .public)")
             isConnected = true
-            print("[ElectrumClient] Successfully connected!")
         } catch {
-            print("[ElectrumClient] Version handshake failed: \(error)")
+            logger.error("Version handshake with \(self.server.host, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
             disconnect()
             throw error
         }
@@ -122,17 +124,16 @@ public actor ElectrumClient {
     }
 
     private func handleStateUpdate(_ state: NWConnection.State) {
-        print("[ElectrumClient] Connection state: \(state)")
+        logger.debug("\(self.server.host, privacy: .public) connection state: \(String(describing: state), privacy: .public)")
 
         switch state {
         case .ready:
-            print("[ElectrumClient] Connection ready!")
             resumeConnectionContinuation()
         case .failed(let error):
-            print("[ElectrumClient] Connection failed: \(error)")
+            logger.error("Connection to \(self.server.host, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
             resumeConnectionContinuation(throwing: ElectrumError.connectionFailed(error.localizedDescription))
         case .cancelled:
-            print("[ElectrumClient] Connection cancelled")
+            logger.info("Connection to \(self.server.host, privacy: .public) cancelled")
             resumeConnectionContinuation(throwing: ElectrumError.serverDisconnected)
         default:
             break
@@ -174,7 +175,7 @@ public actor ElectrumClient {
 
     private func sendRequest<T: Decodable & Sendable>(_ method: ElectrumMethod, params: [ElectrumParam] = []) async throws -> T {
         guard let connection = connection else {
-            print("[ElectrumClient] sendRequest failed: not connected")
+            logger.error("sendRequest(\(method.rawValue, privacy: .public)) failed: not connected")
             throw ElectrumError.serverDisconnected
         }
 
@@ -214,7 +215,7 @@ public actor ElectrumClient {
         let response = try decoder.decode(ElectrumResponse<T>.self, from: responseData)
 
         if let error = response.error {
-            print("[ElectrumClient] Request #\(currentId) error: \(error.code) - \(error.message)")
+            logger.error("Request #\(currentId, privacy: .public) (\(method.rawValue, privacy: .public)) error: \(error.code, privacy: .public) — \(error.message, privacy: .public)")
             throw ElectrumError.requestFailed(code: error.code, message: error.message)
         }
 

@@ -1,5 +1,8 @@
 import Foundation
+import os.log
 import clibdogecoin
+
+private let signLogger = Logger(subsystem: "DogecoinKit", category: "sign")
 
 /// A Dogecoin transaction builder
 public actor TransactionBuilder {
@@ -332,13 +335,21 @@ public func createTransaction(
 
     for (index, input) in inputs.enumerated() {
         guard let privateKey = signingKeysByAddress[input.address] else {
+            signLogger.error("Missing signing key for input \(index, privacy: .public) address=\(input.address, privacy: .private)")
             throw DogecoinError.transactionValidationFailed("Missing signing key for address \(input.address)")
         }
-        try await builder.signInput(index: index, privateKeyWIF: privateKey)
+        do {
+            try await builder.signInput(index: index, privateKeyWIF: privateKey)
+        } catch {
+            signLogger.error("Sign failed for input \(index, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            throw error
+        }
     }
 
     let rawHex = try await builder.getRawTransaction()
-    return SignedTransaction(rawHex: rawHex, fee: plan.fee)
+    let signed = SignedTransaction(rawHex: rawHex, fee: plan.fee)
+    signLogger.info("Signed tx \(signed.txid, privacy: .public) — \(inputs.count, privacy: .public) in, \(outputs.count, privacy: .public) out, fee \(plan.fee.koinu, privacy: .public) koinu")
+    return signed
 }
 
 func planTransaction(

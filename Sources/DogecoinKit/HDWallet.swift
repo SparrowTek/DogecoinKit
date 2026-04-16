@@ -123,8 +123,7 @@ public final class HDWallet: Sendable {
         var masterKeyBuffer = Array(masterKey.utf8CString)
         while masterKeyBuffer.count < Int(HDKEYLEN) { masterKeyBuffer.append(0) }
 
-        let coinType = network == .mainnet ? "3" : "1"
-        let path = "m/44'/\(coinType)'/\(account)'/\(change ? 1 : 0)/\(index)"
+        let path = network.bip44Path(account: account, change: change, index: index)
 
         var pathBuffer = Array(path.utf8CString)
         while pathBuffer.count < Int(KEYPATHMAXLEN) { pathBuffer.append(0) }
@@ -223,11 +222,8 @@ public final class HDWallet: Sendable {
     public func derivePrivateKey(account: UInt32 = 0, index: UInt32 = 0, change: Bool = false) async throws -> String {
         try await Dogecoin.ensureInitialized()
 
-        // Build BIP44 derivation path: m/44'/3'/account'/change/index
-        // For Dogecoin: coin type is 3 (mainnet) or 1 (testnet)
-        let coinType = network == .mainnet ? "3" : "1"
-        let changePath = change ? "1" : "0"
-        let path = "m/44'/\(coinType)'/\(account)'/\(changePath)/\(index)"
+        // Centralized path builder — see DogecoinNetwork.bip44Path.
+        let path = network.bip44Path(account: account, change: change, index: index)
 
         var masterKeyBuffer = Array(masterKey.utf8CString)
         while masterKeyBuffer.count < Int(HDKEYLEN) { masterKeyBuffer.append(0) }

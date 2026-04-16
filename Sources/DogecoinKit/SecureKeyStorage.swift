@@ -1,5 +1,8 @@
 import Foundation
 import Security
+import os.log
+
+private let keychainLogger = Logger(subsystem: "DogecoinKit", category: "keychain")
 
 // MARK: - Stored Credential Types
 
@@ -215,12 +218,16 @@ public actor SecureKeyStorage {
 
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
             try store.saveData(jsonData)
+            keychainLogger.info("Stored wallet credentials id=\(id, privacy: .public) network=\(String(describing: network), privacy: .public)")
             return id
         } catch let error as DogecoinError {
+            keychainLogger.error("Store wallet credentials failed id=\(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
             throw error
         } catch let error as KeychainStoreError {
+            keychainLogger.error("Store wallet credentials failed id=\(id, privacy: .public): \(String(describing: error), privacy: .public)")
             throw DogecoinError.keychainStorageFailed("\(error)")
         } catch {
+            keychainLogger.error("Store wallet credentials failed id=\(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
             throw DogecoinError.keychainStorageFailed(error.localizedDescription)
         }
     }
@@ -236,14 +243,18 @@ public actor SecureKeyStorage {
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
             let jsonData = try store.readData()
             let credentials = try JSONDecoder().decode(StoredWalletCredentials.self, from: jsonData)
+            keychainLogger.debug("Retrieved wallet credentials id=\(id, privacy: .public)")
             return credentials
         } catch let error as DogecoinError {
             throw error
         } catch KeychainStoreError.notFound {
+            keychainLogger.error("Wallet credentials not found id=\(id, privacy: .public)")
             throw DogecoinError.keyNotFound(id)
         } catch let error as KeychainStoreError {
+            keychainLogger.error("Retrieve wallet credentials failed id=\(id, privacy: .public): \(String(describing: error), privacy: .public)")
             throw DogecoinError.keychainRetrievalFailed("\(error)")
         } catch {
+            keychainLogger.error("Retrieve wallet credentials failed id=\(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
             throw DogecoinError.keychainRetrievalFailed(error.localizedDescription)
         }
     }
@@ -257,7 +268,9 @@ public actor SecureKeyStorage {
         do {
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
             try store.delete()
+            keychainLogger.info("Deleted wallet credentials id=\(id, privacy: .public)")
         } catch {
+            keychainLogger.error("Delete wallet credentials failed id=\(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
             throw DogecoinError.keychainDeletionFailed(error.localizedDescription)
         }
     }

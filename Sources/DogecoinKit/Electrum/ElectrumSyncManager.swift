@@ -1,4 +1,5 @@
 import Foundation
+import os.log
 
 public actor ElectrumSyncManager {
 
@@ -30,6 +31,8 @@ public actor ElectrumSyncManager {
     /// Per-server connection timeout in seconds
     private let connectionTimeout: TimeInterval = 10
 
+    private let logger = Logger(subsystem: "DogecoinKit", category: "electrum")
+
     // MARK: - Initialization
 
     public init(network: DogecoinNetwork) {
@@ -46,7 +49,7 @@ public actor ElectrumSyncManager {
 
     public func start() async throws {
         guard !isRunning else {
-            print("[ElectrumSyncManager] Already running, skipping start")
+            logger.debug("Already running, skipping start")
             return
         }
 
@@ -76,7 +79,7 @@ public actor ElectrumSyncManager {
     public func refreshBalance(for addresses: [String]) async throws -> Int64 {
         let client = try connectedClient()
 
-        print("[ElectrumSyncManager] Refreshing balance for \(addresses.count) addresses (parallel)...")
+        logger.debug("Refreshing balance for \(addresses.count, privacy: .public) addresses")
 
         // Pre-compute script hashes
         let scriptHashes = try addresses.map { address in
@@ -106,20 +109,22 @@ public actor ElectrumSyncManager {
             let balanceSum = result.balance.confirmed + result.balance.unconfirmed
             if balanceSum > 0 {
                 addressesWithBalance += 1
-                print("[ElectrumSyncManager] Found balance at \(result.address): \(balanceSum) koinu")
+                // Address hash (privacy: .private) keeps user addresses out of
+                // unredacted device logs — only visible when the log client is
+                // signed with the appropriate entitlement.
+                logger.debug("Balance at \(result.address, privacy: .private): \(balanceSum, privacy: .public) koinu")
             }
             totalBalance += balanceSum
         }
 
-        print("[ElectrumSyncManager] Addresses with balance: \(addressesWithBalance)")
-        print("[ElectrumSyncManager] Total balance: \(totalBalance) koinu (\(Double(totalBalance) / 100_000_000.0) DOGE)")
+        logger.info("Balance refresh complete — \(addressesWithBalance, privacy: .public)/\(addresses.count, privacy: .public) addresses funded, total \(totalBalance, privacy: .public) koinu")
         return totalBalance
     }
 
     public func fetchTransactionHistory(for addresses: [String]) async throws -> [ElectrumHistoryItem] {
         let client = try connectedClient()
 
-        print("[ElectrumSyncManager] Fetching transaction history for \(addresses.count) addresses (parallel)")
+        logger.debug("Fetching transaction history for \(addresses.count, privacy: .public) addresses")
 
         // Pre-compute script hashes
         let scriptHashes = try addresses.map { address in
@@ -154,7 +159,7 @@ public actor ElectrumSyncManager {
             }
         }
 
-        print("[ElectrumSyncManager] Total transactions found: \(allHistory.count)")
+        logger.info("Transaction history: \(allHistory.count, privacy: .public) unique txids across \(addresses.count, privacy: .public) addresses")
 
         // Sort by height (newest first), unconfirmed (height <= 0) at top
         return allHistory.sorted { lhs, rhs in
@@ -167,7 +172,7 @@ public actor ElectrumSyncManager {
     public func fetchUTXOs(for addresses: [String]) async throws -> [(address: String, utxo: ElectrumUTXO)] {
         let client = try connectedClient()
 
-        print("[ElectrumSyncManager] Fetching UTXOs for \(addresses.count) addresses (parallel)")
+        logger.debug("Fetching UTXOs for \(addresses.count, privacy: .public) addresses")
 
         // Pre-compute script hashes
         let scriptHashes = try addresses.map { address in
@@ -194,12 +199,12 @@ public actor ElectrumSyncManager {
 
         for result in results {
             for utxo in result.utxos {
-                print("[ElectrumSyncManager] UTXO found: \(result.address) - \(utxo.value) koinu (\(Double(utxo.value) / 100_000_000.0) DOGE), height=\(utxo.height)")
+                logger.debug("UTXO at \(result.address, privacy: .private) — \(utxo.value, privacy: .public) koinu, height=\(utxo.height, privacy: .public)")
                 allUTXOs.append((address: result.address, utxo: utxo))
             }
         }
 
-        print("[ElectrumSyncManager] Total UTXOs found: \(allUTXOs.count)")
+        logger.info("UTXO fetch complete — \(allUTXOs.count, privacy: .public) outputs across \(addresses.count, privacy: .public) addresses")
         return allUTXOs
     }
 
@@ -222,7 +227,7 @@ public actor ElectrumSyncManager {
         let newAddresses = addresses.filter { !addressSubscriptions.contains($0) }
         guard !newAddresses.isEmpty else { return }
 
-        print("[ElectrumSyncManager] Subscribing to \(newAddresses.count) addresses (parallel)")
+        logger.debug("Subscribing to \(newAddresses.count, privacy: .public) new addresses")
 
         // Pre-compute script hashes
         let scriptHashes = try newAddresses.map { address in
@@ -254,7 +259,7 @@ public actor ElectrumSyncManager {
             }
         }
 
-        print("[ElectrumSyncManager] Subscribed to \(newAddresses.count) addresses")
+        logger.info("Subscribed to \(newAddresses.count, privacy: .public) addresses")
     }
 
     public func estimateFee(blocks: Int = 6) async throws -> Double {
@@ -304,14 +309,13 @@ public actor ElectrumSyncManager {
             throw error
         }
 
-        print("[ElectrumSyncManager] Starting sync for \(network) network")
-        print("[ElectrumSyncManager] Server list: \(serverList.map { "\($0.host):\($0.port)" })")
+        logger.info("Starting sync for \(String(describing: self.network), privacy: .public) — \(self.serverList.count, privacy: .public) candidate servers")
         state = .connecting
 
         // Try servers until one connects
         var lastError: Error?
         for (index, server) in serverList.enumerated() {
-            print("[ElectrumSyncManager] Trying server \(index + 1)/\(serverList.count): \(server.host):\(server.port)")
+            logger.debug("Trying server \(index + 1, privacy: .public)/\(self.serverList.count, privacy: .public): \(server.host, privacy: .public):\(server.port, privacy: .public)")
             let candidateClient = ElectrumClient(server: server)
             do {
                 try await connectWithTimeout(candidateClient)
@@ -319,7 +323,7 @@ public actor ElectrumSyncManager {
                 client = candidateClient
                 connectedServer = server
 
-                print("[ElectrumSyncManager] Connected! Subscribing to headers...")
+                logger.info("Connected to \(server.host, privacy: .public), subscribing to headers")
                 // Subscribe to block headers (updates on new blocks)
                 let header = try await candidateClient.subscribeHeaders { [weak self] header in
                     guard let self else { return }
@@ -332,7 +336,7 @@ public actor ElectrumSyncManager {
                 progress = 1.0
                 state = .connected
 
-                print("[ElectrumSyncManager] Current block height: \(currentHeight)")
+                logger.info("Sync ready at \(server.host, privacy: .public) — current block height \(self.currentHeight, privacy: .public)")
                 let delegate = self.delegate
                 let height = currentHeight
                 let prog = progress
@@ -344,14 +348,14 @@ public actor ElectrumSyncManager {
                 return
 
             } catch {
-                print("[ElectrumSyncManager] Server \(server.host) failed: \(error)")
+                logger.error("Server \(server.host, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
                 await candidateClient.disconnect()
                 lastError = error
                 continue
             }
         }
 
-        print("[ElectrumSyncManager] All servers failed!")
+        logger.error("All \(self.serverList.count, privacy: .public) Electrum servers failed")
         let message = lastError?.localizedDescription ?? ElectrumError.noServersAvailable.localizedDescription
         state = .error(message)
         let delegate = self.delegate

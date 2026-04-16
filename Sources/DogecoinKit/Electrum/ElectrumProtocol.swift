@@ -1,5 +1,8 @@
 import Foundation
 import CryptoKit
+import os.log
+
+private let electrumProtocolLogger = Logger(subsystem: "DogecoinKit", category: "electrum")
 
 // MARK: - JSON-RPC Request
 
@@ -71,7 +74,7 @@ public struct ElectrumScriptHash: Sendable {
     private static func computeScriptHash(for address: String, network: DogecoinNetwork) throws -> String {
         guard let detectedNetwork = Address.detectNetwork(address),
               detectedNetwork == network else {
-            print("[ElectrumScriptHash] Address network mismatch: \(address)")
+            electrumProtocolLogger.error("Address network mismatch: \(address, privacy: .private)")
             throw ElectrumError.invalidAddress(address)
         }
 
@@ -81,11 +84,11 @@ public struct ElectrumScriptHash: Sendable {
         do {
             scriptPubKeyHex = try Address.toPubkeyHash(address)
         } catch {
-            print("[ElectrumScriptHash] Failed to get scriptPubKey for \(address): \(error)")
+            electrumProtocolLogger.error("Failed to get scriptPubKey for \(address, privacy: .private): \(error.localizedDescription, privacy: .public)")
             throw ElectrumError.invalidAddress(address)
         }
         guard let scriptPubKey = Data(hexString: scriptPubKeyHex) else {
-            print("[ElectrumScriptHash] Invalid scriptPubKey hex: \(scriptPubKeyHex)")
+            electrumProtocolLogger.error("Invalid scriptPubKey hex (length \(scriptPubKeyHex.count, privacy: .public))")
             throw ElectrumError.serializationError("Invalid scriptPubKey")
         }
 
