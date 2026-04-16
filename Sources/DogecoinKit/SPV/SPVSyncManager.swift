@@ -89,6 +89,11 @@ public actor SPVSyncManager {
     private var verifiedTransactions: [Data: VerifiedTransaction] = [:]
     private var nextFilteredHeight: Int32?
     private var filteredBlocksInFlight: Int = 0
+    /// First block height of the currently-outstanding filtered-block window.
+    /// When the peer carrying that window disconnects, we rewind
+    /// `nextFilteredHeight` to this value so the new peer re-requests the
+    /// lost range instead of silently skipping it.
+    private var outstandingFilteredWindowStart: Int32?
 
     /// Current sync state
     public var state: SPVSyncState { syncState }
@@ -102,12 +107,25 @@ public actor SPVSyncManager {
     }
 
     /// Sync progress (0.0 to 1.0)
+    ///
+    /// Snapshot both values before dividing: reading the chain height and the
+    /// target via two separate awaits can land on opposite sides of a header
+    /// batch and momentarily yield `progress > 1.0`. Clamp defensively so the
+    /// UI can never display a regressive or overshoot value.
     public var progress: Double {
         get async {
-            guard _targetHeight > 0 else { return 0 }
+            let target = _targetHeight
             let height = await headerChain.height
-            return Double(height) / Double(_targetHeight)
+            return Self.computeProgress(height: height, target: target)
         }
+    }
+
+    /// Clamp-and-snapshot helper used by every progress-reporting path in
+    /// this manager so a single source of truth governs the calculation.
+    nonisolated private static func computeProgress(height: Int32, target: Int32) -> Double {
+        guard target > 0 else { return 0 }
+        let ratio = Double(height) / Double(target)
+        return min(max(ratio, 0), 1)
     }
 
     /// Logger
@@ -180,10 +198,7 @@ public actor SPVSyncManager {
     }
 
     private func handleFilteredBlockTimeout() async {
-        filteredBlocksInFlight = 0
-        filteredBlockRequestTime = nil
-
-        logger.info("Resetting filtered blocks and retrying")
+        abandonOutstandingFilteredBlockWindow(reason: "request timeout")
         await requestFilteredBlocksIfNeeded()
     }
 
@@ -388,11 +403,31 @@ public actor SPVSyncManager {
 
         guard !inventory.isEmpty else { return }
 
+        if outstandingFilteredWindowStart == nil {
+            outstandingFilteredWindowStart = nextHeight
+        }
         nextFilteredHeight = height
         filteredBlocksInFlight += inventory.count
         filteredBlockRequestTime = Date()
 
         await peer.sendGetData(inventory: inventory)
+    }
+
+    /// Reset the filtered-block in-flight state when the peer carrying the
+    /// outstanding window is lost. Rewinds `nextFilteredHeight` so the next
+    /// peer re-requests blocks that never arrived.
+    private func abandonOutstandingFilteredBlockWindow(reason: String) {
+        guard filteredBlocksInFlight > 0 || outstandingFilteredWindowStart != nil else {
+            return
+        }
+        if let windowStart = outstandingFilteredWindowStart {
+            let current = nextFilteredHeight ?? windowStart
+            nextFilteredHeight = min(current, windowStart)
+        }
+        logger.info("Abandoning \(self.filteredBlocksInFlight) filtered blocks in flight (\(reason)); rewinding to height \(self.nextFilteredHeight ?? -1)")
+        filteredBlocksInFlight = 0
+        outstandingFilteredWindowStart = nil
+        filteredBlockRequestTime = nil
     }
 
     /// Request headers from a peer
@@ -455,8 +490,8 @@ public actor SPVSyncManager {
             }
         }
 
-        // Update progress
-        let prog = _targetHeight > 0 ? Double(chainHeight) / Double(_targetHeight) : 0
+        // Update progress (snapshot target + clamp through the shared helper)
+        let prog = Self.computeProgress(height: chainHeight, target: _targetHeight)
         let delegate = self.delegate
         Task { [weak self] in
             guard let self else { return }
@@ -497,6 +532,7 @@ extension SPVSyncManager: PeerManagerDelegate {
         }
 
         if let filter = bloomFilter {
+            logger.info("Sending bloom filter to \(peer.host) before requesting filtered blocks")
             await peer.sendFilterLoad(filter)
             await requestFilteredBlocksIfNeeded()
         }
@@ -504,6 +540,11 @@ extension SPVSyncManager: PeerManagerDelegate {
 
     public func peerManager(_ manager: PeerManager, peerDidDisconnect peer: Peer) async {
         logger.info("Peer disconnected: \(peer.host)")
+
+        // Filtered-block requests were routed to this peer or the sync peer.
+        // Either way, any in-flight window is now lost — rewind so the next
+        // peer re-requests the missing range rather than silently skipping it.
+        abandonOutstandingFilteredBlockWindow(reason: "peer \(peer.host) disconnected")
 
         guard peer == syncPeer else { return }
         syncPeer = nil
@@ -686,6 +727,10 @@ extension SPVSyncManager: PeerManagerDelegate {
         }
 
         filteredBlocksInFlight = max(0, filteredBlocksInFlight - 1)
+        if filteredBlocksInFlight == 0 {
+            outstandingFilteredWindowStart = nil
+            filteredBlockRequestTime = nil
+        }
         await requestFilteredBlocksIfNeeded()
     }
 
@@ -715,14 +760,22 @@ extension SPVSyncManager: PeerManagerDelegate {
             }
 
             events.append((txMessage, .confirmed(blockHash: blockHash, height: height)))
-        } else {
+        } else if let filter = bloomFilter {
+            // Unsolicited (mempool) transaction — a peer can send arbitrary
+            // `tx` messages; BIP 37 only guarantees that the server *attempts*
+            // to filter, it does not guarantee correctness. Re-check matches
+            // on our side before surfacing anything to the delegate, otherwise
+            // a hostile or buggy peer could inject transactions unrelated to
+            // the wallet as "incoming."
+            guard Self.transactionMatchesBloomFilter(txMessage.rawData, filter: filter) else {
+                logger.debug("Dropping unsolicited tx from \(peer.host) — no bloom match")
+                return
+            }
+
             if pendingTransactions[txid] == nil {
                 pendingTransactions[txid] = txMessage
             }
-
-            if bloomFilter != nil {
-                events.append((txMessage, .unconfirmed))
-            }
+            events.append((txMessage, .unconfirmed))
         }
 
         let delegate = self.delegate
@@ -731,6 +784,135 @@ extension SPVSyncManager: PeerManagerDelegate {
                 guard let self else { return }
                 await delegate?.spvSync(self, didUpdateTransaction: event.0, state: event.1)
             }
+        }
+    }
+
+    /// Returns `true` if the raw transaction contains **any** element that
+    /// matches the given bloom filter. Follows BIP 37 matching for P2PKH:
+    ///
+    /// - input outpoints (32-byte prev-txid ‖ 4-byte vout, little-endian)
+    /// - each data push inside every output's scriptPubKey
+    /// - the entire scriptPubKey bytes for every output
+    ///
+    /// Returns `false` if parsing fails — a malformed tx is definitely not a
+    /// hit and should be dropped.
+    nonisolated static func transactionMatchesBloomFilter(_ raw: Data, filter: BloomFilter) -> Bool {
+        var offset = 0
+        let bytes = raw
+
+        // version (4)
+        guard bytes.count >= offset + 4 else { return false }
+        offset += 4
+
+        // input count
+        guard let (inputCount, inputCountSize) = readVarInt(bytes, at: offset) else { return false }
+        offset += inputCountSize
+
+        for _ in 0..<inputCount {
+            // prev txid (32) + vout (4)
+            guard bytes.count >= offset + 36 else { return false }
+            let outpoint = bytes.subdata(in: offset..<(offset + 36))
+            if filter.contains(outpoint) { return true }
+            offset += 36
+
+            // script length + script
+            guard let (scriptLen, scriptLenSize) = readVarInt(bytes, at: offset) else { return false }
+            offset += scriptLenSize
+            guard bytes.count >= offset + Int(scriptLen) else { return false }
+            offset += Int(scriptLen)
+
+            // sequence (4)
+            guard bytes.count >= offset + 4 else { return false }
+            offset += 4
+        }
+
+        // output count
+        guard let (outputCount, outputCountSize) = readVarInt(bytes, at: offset) else { return false }
+        offset += outputCountSize
+
+        for _ in 0..<outputCount {
+            // value (8)
+            guard bytes.count >= offset + 8 else { return false }
+            offset += 8
+
+            // script length + script
+            guard let (scriptLen, scriptLenSize) = readVarInt(bytes, at: offset) else { return false }
+            offset += scriptLenSize
+            let scriptEnd = offset + Int(scriptLen)
+            guard bytes.count >= scriptEnd else { return false }
+
+            let script = bytes.subdata(in: offset..<scriptEnd)
+            if filter.contains(script) { return true }
+            for push in scriptDataPushes(in: script) where filter.contains(push) {
+                return true
+            }
+
+            offset = scriptEnd
+        }
+
+        return false
+    }
+
+    /// Extracts each data push from a Bitcoin script. Recognizes direct
+    /// pushes (opcodes 0x01..0x4b) and `OP_PUSHDATA1/2/4` (0x4c/0x4d/0x4e).
+    /// Other opcodes are skipped. Stops early on malformed script rather
+    /// than throwing — a malformed script simply yields no matches.
+    nonisolated private static func scriptDataPushes(in script: Data) -> [Data] {
+        var pushes: [Data] = []
+        var i = script.startIndex
+        while i < script.endIndex {
+            let op = script[i]
+            i += 1
+            let pushLen: Int
+            if op >= 0x01 && op <= 0x4b {
+                pushLen = Int(op)
+            } else if op == 0x4c {
+                guard i < script.endIndex else { return pushes }
+                pushLen = Int(script[i])
+                i += 1
+            } else if op == 0x4d {
+                guard script.endIndex - i >= 2 else { return pushes }
+                pushLen = Int(script[i]) | (Int(script[i + 1]) << 8)
+                i += 2
+            } else if op == 0x4e {
+                guard script.endIndex - i >= 4 else { return pushes }
+                pushLen = Int(script[i])
+                    | (Int(script[i + 1]) << 8)
+                    | (Int(script[i + 2]) << 16)
+                    | (Int(script[i + 3]) << 24)
+                i += 4
+            } else {
+                continue
+            }
+            guard pushLen >= 0, script.endIndex - i >= pushLen else { return pushes }
+            pushes.append(script.subdata(in: i..<(i + pushLen)))
+            i += pushLen
+        }
+        return pushes
+    }
+
+    /// Offset-aware VarInt read over a raw `Data`. Returns `(value, bytesConsumed)`.
+    nonisolated private static func readVarInt(_ data: Data, at offset: Int) -> (UInt64, Int)? {
+        guard offset < data.count else { return nil }
+        let first = data[data.startIndex + offset]
+        switch first {
+        case ..<0xFD:
+            return (UInt64(first), 1)
+        case 0xFD:
+            guard data.count - offset >= 3 else { return nil }
+            let lo = UInt16(data[data.startIndex + offset + 1])
+            let hi = UInt16(data[data.startIndex + offset + 2]) << 8
+            return (UInt64(lo | hi), 3)
+        case 0xFE:
+            guard data.count - offset >= 5 else { return nil }
+            var v: UInt32 = 0
+            for j in 0..<4 { v |= UInt32(data[data.startIndex + offset + 1 + j]) << (8 * j) }
+            return (UInt64(v), 5)
+        default:
+            guard data.count - offset >= 9 else { return nil }
+            var v: UInt64 = 0
+            for j in 0..<8 { v |= UInt64(data[data.startIndex + offset + 1 + j]) << (8 * j) }
+            return (v, 9)
         }
     }
 

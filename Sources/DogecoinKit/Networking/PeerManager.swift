@@ -77,6 +77,20 @@ public actor PeerManager {
     private var readyPeerIDs: Set<UUID> = []
     private var disconnectedPeerIDs: Set<UUID> = []
 
+    /// Sliding-window budget for `addr` messages. Caps how many entries a
+    /// single peer can inject into the discovery table per minute, guarding
+    /// against a hostile peer flooding random addresses.
+    private struct AddrBudget: Sendable {
+        static let windowInterval: TimeInterval = 60
+        static let entriesPerWindow: Int = 1000
+
+        var windowStart: Date
+        var entriesThisWindow: Int
+
+        static let initial = AddrBudget(windowStart: Date(), entriesThisWindow: 0)
+    }
+    private var addrBudgetByPeer: [UUID: AddrBudget] = [:]
+
     /// Pending transactions waiting to be requested by peers
     private var pendingTransactions: [Data: TxMessage] = [:]
 
@@ -169,6 +183,7 @@ public actor PeerManager {
         peers.removeAll { $0 == peer }
         readyPeerIDs.remove(peer.id)
         disconnectedPeerIDs.insert(peer.id)
+        addrBudgetByPeer.removeValue(forKey: peer.id)
         await peer.disconnect()
     }
 
@@ -393,20 +408,42 @@ public actor PeerManager {
     private func handleAddrMessage(_ message: AddrMessage, from peer: Peer) {
         guard !message.entries.isEmpty else { return }
 
+        let now = Date()
+        var budget = addrBudgetByPeer[peer.id] ?? .initial
+        if now.timeIntervalSince(budget.windowStart) >= AddrBudget.windowInterval {
+            budget = AddrBudget(windowStart: now, entriesThisWindow: 0)
+        }
+        let remaining = max(0, AddrBudget.entriesPerWindow - budget.entriesThisWindow)
+        if remaining == 0 {
+            logger.info("Rate-limiting addr entries from \(peer.host) (\(AddrBudget.entriesPerWindow)/min budget exhausted)")
+            addrBudgetByPeer[peer.id] = budget
+            return
+        }
+
         var added = 0
-        for entry in message.entries {
+        var considered = 0
+        var seenInBatch = Set<String>()
+        for entry in message.entries where considered < remaining {
+            considered += 1
             guard entry.address.isRoutable,
                   let host = entry.address.addressString,
                   entry.address.port > 0 else {
                 continue
             }
 
+            // Dedupe within this single addr batch so a peer spamming the
+            // same host repeatedly burns budget only once per unique host.
+            guard seenInBatch.insert(host).inserted else { continue }
+
             addDiscoveredAddress(host: host, port: entry.address.port)
             added += 1
         }
 
+        budget.entriesThisWindow += considered
+        addrBudgetByPeer[peer.id] = budget
+
         if added > 0 {
-            logger.info("Added \(added) addresses from \(peer.host)")
+            logger.info("Added \(added) addresses from \(peer.host) (\(considered)/\(AddrBudget.entriesPerWindow) budget this window)")
             if connectedPeerCount < minPeerConnections {
                 connectToDiscoveredPeers()
             }
