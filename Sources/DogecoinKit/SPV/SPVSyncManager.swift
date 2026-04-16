@@ -122,7 +122,7 @@ public actor SPVSyncManager {
 
     /// Clamp-and-snapshot helper used by every progress-reporting path in
     /// this manager so a single source of truth governs the calculation.
-    nonisolated private static func computeProgress(height: Int32, target: Int32) -> Double {
+    nonisolated static func computeProgress(height: Int32, target: Int32) -> Double {
         guard target > 0 else { return 0 }
         let ratio = Double(height) / Double(target)
         return min(max(ratio, 0), 1)
