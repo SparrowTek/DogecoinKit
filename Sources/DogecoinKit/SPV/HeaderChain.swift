@@ -1052,8 +1052,13 @@ extension Data {
         var index = hex.startIndex
 
         while index < hex.endIndex {
-            let nextIndex = hex.index(index, offsetBy: 2)
-            guard nextIndex <= hex.endIndex else { return nil }
+            // `String.index(_:offsetBy:limitedBy:)` returns nil instead of
+            // trapping when the offset would move past `endIndex`. Using the
+            // unlimited overload here would crash on odd-length input — we
+            // want a clean nil return to signal "not valid hex."
+            guard let nextIndex = hex.index(index, offsetBy: 2, limitedBy: hex.endIndex) else {
+                return nil
+            }
 
             let byteString = String(hex[index..<nextIndex])
             guard let byte = UInt8(byteString, radix: 16) else { return nil }
