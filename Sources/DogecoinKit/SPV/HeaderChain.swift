@@ -699,7 +699,12 @@ public actor HeaderChain {
             // Continue to create genesis
         }
 
-        let merkleRootInternal = Data(Data(hexString: "5b2a3f53f605d62c53e62932dac6925e3d74afa5a4b459745c36d42d0ed26a69")!.reversed())
+        let genesisMerkleRootHex = "5b2a3f53f605d62c53e62932dac6925e3d74afa5a4b459745c36d42d0ed26a69"
+        guard let merkleRootBigEndian = Data(hexString: genesisMerkleRootHex) else {
+            logger.error("Failed to decode genesis merkle root hex — skipping genesis insert")
+            return
+        }
+        let merkleRootInternal = Data(merkleRootBigEndian.reversed())
 
         let genesis: BlockHeader
         if network == .mainnet {
@@ -861,7 +866,12 @@ public actor HeaderChain {
         }
 
         let negative = (bits & 0x00800000) != 0
-        let overflow = word != 0 && (size > 34 || (word > 0xff && size > 33) || (word > 0xffff && size > 32))
+
+        let overflowBySize = size > 34
+        let overflowByByte = word > 0xff && size > 33
+        let overflowByWord = word > 0xffff && size > 32
+        let overflow = overflowBySize || overflowByByte || overflowByWord
+
         if negative || overflow {
             return nil
         }

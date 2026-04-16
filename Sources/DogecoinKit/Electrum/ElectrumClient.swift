@@ -90,14 +90,10 @@ public actor ElectrumClient {
         connection?.cancel()
         connection = nil
         isConnected = false
-        didResumeConnectionContinuation = false
         headersHandler = nil
         subscriptionHandlers.removeAll()
         receiveBuffer.removeAll()
-        if let continuation = connectionContinuation {
-            continuation.resume(throwing: ElectrumError.serverDisconnected)
-            connectionContinuation = nil
-        }
+        resumeConnectionContinuation(throwing: ElectrumError.serverDisconnected)
 
         // Cancel all pending requests
         for (_, continuation) in pendingRequests {
@@ -106,27 +102,38 @@ public actor ElectrumClient {
         pendingRequests.removeAll()
     }
 
+    /// Single point of resume for `connectionContinuation`. Guarantees that the
+    /// checked continuation is resumed at most once across `connect()`'s three
+    /// concurrent completion paths (state updates, timeout task, and
+    /// `disconnect()`). Calling after the continuation has already been
+    /// resumed is a no-op.
+    private func resumeConnectionContinuation(throwing error: Error? = nil) {
+        guard !didResumeConnectionContinuation,
+              let continuation = connectionContinuation else {
+            return
+        }
+        didResumeConnectionContinuation = true
+        connectionContinuation = nil
+        if let error {
+            continuation.resume(throwing: error)
+        } else {
+            continuation.resume()
+        }
+    }
+
     private func handleStateUpdate(_ state: NWConnection.State) {
         print("[ElectrumClient] Connection state: \(state)")
-        guard !didResumeConnectionContinuation else { return }
-        guard let continuation = connectionContinuation else { return }
 
         switch state {
         case .ready:
             print("[ElectrumClient] Connection ready!")
-            didResumeConnectionContinuation = true
-            connectionContinuation = nil
-            continuation.resume()
+            resumeConnectionContinuation()
         case .failed(let error):
             print("[ElectrumClient] Connection failed: \(error)")
-            didResumeConnectionContinuation = true
-            connectionContinuation = nil
-            continuation.resume(throwing: ElectrumError.connectionFailed(error.localizedDescription))
+            resumeConnectionContinuation(throwing: ElectrumError.connectionFailed(error.localizedDescription))
         case .cancelled:
             print("[ElectrumClient] Connection cancelled")
-            didResumeConnectionContinuation = true
-            connectionContinuation = nil
-            continuation.resume(throwing: ElectrumError.serverDisconnected)
+            resumeConnectionContinuation(throwing: ElectrumError.serverDisconnected)
         default:
             break
         }
@@ -134,11 +141,7 @@ public actor ElectrumClient {
 
     private func handleConnectionTimeout() {
         guard !didResumeConnectionContinuation else { return }
-        guard let continuation = connectionContinuation else { return }
-
-        didResumeConnectionContinuation = true
-        connectionContinuation = nil
-        continuation.resume(throwing: ElectrumError.connectionTimeout)
+        resumeConnectionContinuation(throwing: ElectrumError.connectionTimeout)
         connection?.cancel()
     }
 
