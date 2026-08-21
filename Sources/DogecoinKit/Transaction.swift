@@ -19,6 +19,7 @@ public actor TransactionBuilder {
     /// - Throws: `DogecoinError.transactionCreationFailed` if creation fails
     public init() async throws {
         try await Dogecoin.ensureInitialized()
+        ECC.armCurrentThread()
 
         let index = start_transaction()
         guard index >= 0 else {
@@ -144,6 +145,7 @@ public actor TransactionBuilder {
             throw DogecoinError.transactionSigningFailed
         }
 
+        ECC.armCurrentThread()
         var privKeyBuffer = Array(privateKeyWIF.utf8CString)
         let result = sign_transaction_w_privkey(txIndex, Int32(index), &privKeyBuffer)
 
@@ -158,6 +160,7 @@ public actor TransactionBuilder {
     ///   - privateKeyWIF: The private key in WIF format
     /// - Throws: `DogecoinError.transactionSigningFailed` if signing fails
     public func sign(scriptPubKey: String, privateKeyWIF: String) throws {
+        ECC.armCurrentThread()
         var scriptBuffer = Array(scriptPubKey.utf8CString)
         var privKeyBuffer = Array(privateKeyWIF.utf8CString)
 

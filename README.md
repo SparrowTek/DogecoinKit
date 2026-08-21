@@ -8,10 +8,11 @@ DogecoinKit provides a complete toolkit for creating SPV (Simplified Payment Ver
 
 - **HD Wallet Support** — BIP32/39/44 compliant hierarchical deterministic wallets
 - **Mnemonic Phrases** — Generate and restore wallets using 12-24 word recovery phrases
-- **Address Management** — P2PKH address generation, validation, and derivation
+- **Address Management** — P2PKH address generation and derivation; P2PKH + P2SH validation
 - **Transaction Building** — Create, sign, and serialize Dogecoin transactions
-- **SPV Networking** — Native Swift P2P networking using Network.framework
-- **Header Sync** — Download and validate block headers for lightweight verification
+- **Electrum + SPV Networking** — Electrum protocol client (SSL) and native Swift P2P networking using Network.framework
+- **Header Sync** — Download and validate block headers (scrypt PoW, AuxPoW, checkpoints) for lightweight verification
+- **Secure Storage** — Keychain-backed mnemonic storage (`SecureKeyStorage`)
 - **Swift 6 Ready** — Full concurrency support with Sendable conformance
 - **Cross-Platform** — iOS 17+ and macOS 14+
 
@@ -54,7 +55,7 @@ Then add the dependency to your target:
 
 ### Initialize the Library
 
-Call `Dogecoin.initialize()` once when your app launches:
+`Dogecoin.initialize()` is async — kick it off once when your app launches:
 
 ```swift
 import DogecoinKit
@@ -62,7 +63,7 @@ import DogecoinKit
 @main
 struct MyApp: App {
     init() {
-        Dogecoin.initialize()
+        Task { await Dogecoin.initialize() }
     }
 
     var body: some Scene {
@@ -73,17 +74,21 @@ struct MyApp: App {
 }
 ```
 
+Every API that touches libdogecoin awaits initialization internally, so it is safe to call wallet APIs immediately.
+
 ### Create a New Wallet
 
 ```swift
 // Generate a new HD wallet with a 12-word mnemonic
-let wallet = try HDWallet.create(strength: .words12, network: .mainnet)
+let wallet = try await HDWallet.create(strength: .words12, network: .mainnet)
 
 // IMPORTANT: Back up the mnemonic phrase securely!
-print("Recovery phrase: \(wallet.mnemonic!)")
+if let mnemonic = wallet.mnemonic {
+    print("Recovery phrase: \(mnemonic)")
+}
 
 // Derive your first receiving address
-let address = try wallet.deriveAddress(account: 0, index: 0)
+let address = try await wallet.deriveAddress(account: 0, index: 0)
 print("Your Dogecoin address: \(address)")
 ```
 
@@ -91,10 +96,26 @@ print("Your Dogecoin address: \(address)")
 
 ```swift
 let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
-let wallet = try HDWallet(mnemonic: mnemonic, network: .mainnet)
+let wallet = try await HDWallet(mnemonic: mnemonic, network: .mainnet)
 
-// Derive multiple addresses
-let addresses = try wallet.deriveAddresses(count: 10, account: 0)
+// Derive multiple addresses (external chain, starting at index 0)
+let addresses = try await wallet.deriveAddresses(count: 10, account: 0, change: false, startIndex: 0)
+```
+
+### Store Credentials in the Keychain
+
+```swift
+let storage = SecureKeyStorage(serviceName: "com.example.mywallet")
+
+// Import a mnemonic, persist it, and get a wallet plus its keychain ID
+let (wallet, keychainID) = try await storage.importAndStoreWallet(
+    mnemonic: mnemonic,
+    passphrase: "",
+    network: .mainnet
+)
+
+// Later — rebuild the wallet from the Keychain
+let restored = try await storage.restoreWallet(keychainID: keychainID)
 ```
 
 ### Validate Addresses
@@ -106,6 +127,13 @@ if Address.isValid(address) {
     if Address.isMainnet(address) {
         print("Valid mainnet address")
     }
+}
+
+// Distinguish P2PKH from P2SH
+switch Address.kind(address) {
+case .p2pkh: print("Pay-to-public-key-hash")
+case .p2sh: print("Pay-to-script-hash")
+case nil: print("Invalid address")
 }
 
 // Or use the type-safe wrapper
@@ -131,62 +159,93 @@ print(total.formatted(decimals: 2))  // "175.50"
 
 ### Build Transactions
 
+The simplest path is the `createTransaction` convenience, which plans the fee
+and change, builds, and signs in one call:
+
 ```swift
-// Create a transaction builder
-let tx = try TransactionBuilder()
+let utxo = UTXO(
+    txid: "abc123...",
+    vout: 0,
+    address: "DMyAddress...",
+    amount: DogecoinAmount(doge: 100),
+    scriptPubKey: "76a914...88ac",
+    confirmations: 12
+)
 
-// Add inputs (UTXOs you're spending)
-try tx.addInput(txid: "abc123...", vout: 0)
-try tx.addInput(txid: "def456...", vout: 1)
+let signed = try await createTransaction(
+    inputs: [utxo],
+    outputs: [(address: "DRecipientAddress...", amount: DogecoinAmount(doge: 50))],
+    signingKeysByAddress: ["DMyAddress...": "QPrivateKeyInWIF..."],
+    changeAddress: "DMyChangeAddress...",
+    fee: FeeEstimation.estimateSendFee(inputCount: 1)
+)
 
-// Add outputs (recipients)
-try tx.addOutput(address: "DRecipientAddress...", amount: DogecoinAmount(doge: 50))
+print("Broadcast this hex: \(signed.rawHex)")
+print("txid: \(signed.txid)")
+```
 
-// Finalize with fee and change address
-let rawTx = try tx.finalize(
+Or drive the `TransactionBuilder` actor directly:
+
+```swift
+let tx = try await TransactionBuilder()
+
+try await tx.addInput(txid: "abc123...", vout: 0)
+try await tx.addOutput(address: "DRecipientAddress...", amount: DogecoinAmount(doge: 50))
+
+_ = try await tx.finalize(
     destinationAddress: "DRecipientAddress...",
     fee: DogecoinAmount(doge: 1),
     totalAmount: DogecoinAmount(doge: 100),
     changeAddress: "DMyChangeAddress..."
 )
 
-// Sign with your private key
-try tx.sign(privateKeyWIF: "QPrivateKeyInWIF...")
-
-// Get the signed transaction hex for broadcasting
-let signedHex = try tx.getRawTransaction()
+try await tx.sign(privateKeyWIF: "QPrivateKeyInWIF...")
+let signedHex = try await tx.getRawTransaction()
 ```
 
 ### Sync with the Network
 
+`SPVSyncManager` is an actor and its delegate methods are async:
+
 ```swift
-class WalletManager: SPVSyncDelegate {
+final class WalletSync: SPVSyncDelegate {
     let syncManager = SPVSyncManager(network: .mainnet)
 
-    func startSync() {
-        syncManager.delegate = self
-        syncManager.start()
+    func startSync() async {
+        await syncManager.setDelegate(self)
+        await syncManager.start()
     }
 
     // MARK: - SPVSyncDelegate
 
-    func spvSync(_ manager: SPVSyncManager, progressUpdated progress: Double, height: Int32) {
+    func spvSync(_ manager: SPVSyncManager, progressUpdated progress: Double, height: Int32) async {
         print("Sync: \(Int(progress * 100))% (height \(height))")
     }
 
-    func spvSyncDidComplete(_ manager: SPVSyncManager) {
+    func spvSyncDidComplete(_ manager: SPVSyncManager) async {
         print("Blockchain sync complete!")
     }
 
-    func spvSync(_ manager: SPVSyncManager, didReceiveHeader header: BlockHeader, height: Int32) {
+    func spvSync(_ manager: SPVSyncManager, didReceiveHeader header: BlockHeader, height: Int32) async {
         // New block header received
     }
 
-    func spvSync(_ manager: SPVSyncManager, didEncounterError error: Error) {
+    func spvSync(_ manager: SPVSyncManager, didEncounterError error: Error) async {
         print("Sync error: \(error)")
+    }
+
+    func spvSync(_ manager: SPVSyncManager, didUpdateTransaction transaction: TxMessage, state: SPVTransactionState) async {
+        // A transaction relevant to the bloom filter was confirmed/unconfirmed/reorged
+    }
+
+    func spvSync(_ manager: SPVSyncManager, didProcessFilteredBlock height: Int32, targetHeight: Int32) async {
+        // Filtered-block scan progress
     }
 }
 ```
+
+For the default lightweight mode, `ElectrumSyncManager` speaks the Electrum
+protocol over SSL and exposes balance, UTXO, history, and broadcast APIs.
 
 ## Architecture
 
@@ -260,29 +319,23 @@ actor WalletState {
 ## Security Considerations
 
 - **Never** log or display private keys or mnemonic phrases in production
-- Store mnemonic phrases in the iOS Keychain with appropriate protection levels
-- Use `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` for sensitive data
-- Consider using Secure Enclave for additional key protection on supported devices
+- Store mnemonic phrases with `SecureKeyStorage` — it writes to the iOS Keychain
+  as `WhenUnlockedThisDeviceOnly`, non-synchronizable, and reads raw `Data` to
+  avoid leaving non-zeroizable `String` copies around
+- Use the **same `serviceName`** for every `SecureKeyStorage` you construct in
+  an app — the Keychain scopes items by service, so mismatched names read as
+  "key not found"
 - Validate all addresses before sending transactions
 
 ```swift
 // Example: Secure mnemonic storage
-import Security
-
-func storeMnemonic(_ mnemonic: String, identifier: String) throws {
-    let data = Data(mnemonic.utf8)
-    let query: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrAccount as String: identifier,
-        kSecValueData as String: data,
-        kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-    ]
-
-    let status = SecItemAdd(query as CFDictionary, nil)
-    guard status == errSecSuccess else {
-        throw WalletError.keychainError(status)
-    }
-}
+let storage = SecureKeyStorage(serviceName: "com.example.mywallet")
+let (wallet, keychainID) = try await storage.importAndStoreWallet(
+    mnemonic: mnemonic,
+    passphrase: "",
+    network: .mainnet
+)
+// Persist `keychainID` (not the mnemonic!) in your app's database
 ```
 
 ## Error Handling

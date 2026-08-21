@@ -1,6 +1,28 @@
 import Foundation
 import clibdogecoin
 
+/// Arms libdogecoin's ECC state for the current thread.
+///
+/// libdogecoin ≥ 0.1.5 keeps its secp256k1 context in **thread-local**
+/// storage: `dogecoin_ecc_start()` creates a context only for the calling
+/// thread, and ECC-backed functions assert (crash) on any thread that never
+/// called it. Swift concurrency schedules continuations across a pool of
+/// threads, so every synchronous stretch that reaches an ECC-backed C
+/// function must arm its current thread first — with no `await` between
+/// arming and the C calls. After the first call on a given thread this is a
+/// dictionary lookup. Pool threads are long-lived, so the handful of
+/// per-thread contexts persists for the life of the process.
+enum ECC {
+    private static let armedKey = "com.sparrowtek.DogecoinKit.eccArmed"
+
+    static func armCurrentThread() {
+        let threadDictionary = Thread.current.threadDictionary
+        guard threadDictionary[armedKey] == nil else { return }
+        dogecoin_ecc_start()
+        threadDictionary[armedKey] = true
+    }
+}
+
 /// Main entry point for the Dogecoin library.
 /// Call `initialize()` before using any cryptographic functions.
 public enum Dogecoin {
@@ -10,7 +32,7 @@ public enum Dogecoin {
 
         func initialize() {
             guard !isInitialized else { return }
-            dogecoin_ecc_start()
+            ECC.armCurrentThread()
             isInitialized = true
         }
 

@@ -20,26 +20,19 @@ public struct ElectrumServerList: Sendable {
 
     // MARK: - Mainnet Servers
 
+    // SSL only. Plaintext TCP fallbacks are deliberately excluded: an active
+    // network attacker could otherwise MITM balances, history, and headers on
+    // roughly every other connection when servers are picked at random.
     public static let mainnetServers: [ElectrumServer] = [
-        // Primary servers - SSL
         ElectrumServer(host: "electrum1.cipig.net", port: 20060, useSSL: true, network: .mainnet),
         ElectrumServer(host: "electrum2.cipig.net", port: 20060, useSSL: true, network: .mainnet),
         ElectrumServer(host: "electrum3.cipig.net", port: 20060, useSSL: true, network: .mainnet),
-
-        // Backup servers - TCP (no SSL)
-        ElectrumServer(host: "electrum1.cipig.net", port: 10060, useSSL: false, network: .mainnet),
-        ElectrumServer(host: "electrum2.cipig.net", port: 10060, useSSL: false, network: .mainnet),
-        ElectrumServer(host: "electrum3.cipig.net", port: 10060, useSSL: false, network: .mainnet),
     ]
 
     // MARK: - Testnet Servers
 
     public static let testnetServers: [ElectrumServer] = [
-        // Primary servers - SSL
         ElectrumServer(host: "electrum-testnet.cipig.net", port: 20063, useSSL: true, network: .testnet),
-
-        // Backup servers - TCP (no SSL)
-        ElectrumServer(host: "electrum-testnet.cipig.net", port: 10063, useSSL: false, network: .testnet),
     ]
 
     // MARK: - Server Selection

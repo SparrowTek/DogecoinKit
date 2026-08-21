@@ -210,7 +210,10 @@ public struct HeadersMessage: Sendable {
         return pos
     }
 
-    /// Skip a transaction in the buffer
+    /// Skip a transaction in the buffer.
+    /// Every count and length below is peer-supplied — each one is bounded by
+    /// the remaining bytes before use so a fabricated VarInt can only fail the
+    /// parse, never trap or over-allocate.
     private static func skipTransaction(in data: Data, from offset: Int) -> Int? {
         var pos = offset
 
@@ -218,8 +221,8 @@ public struct HeadersMessage: Sendable {
         guard data.count >= pos + 4 else { return nil }
         pos += 4
 
-        // Input count
-        guard let (inputCount, inputCountSize) = VarInt.parse(from: Data(data[pos...])) else { return nil }
+        // Input count (each input is at least 36 + 1 + 4 bytes)
+        guard let (inputCount, inputCountSize) = data.readBoundedCount(at: pos, minItemSize: 41) else { return nil }
         pos += inputCountSize
 
         // Skip inputs
@@ -228,19 +231,16 @@ public struct HeadersMessage: Sendable {
             guard data.count >= pos + 36 else { return nil }
             pos += 36
 
-            // Script length and script
-            guard let (scriptLen, scriptLenSize) = VarInt.parse(from: Data(data[pos...])) else { return nil }
-            pos += scriptLenSize
-            guard data.count >= pos + Int(scriptLen) else { return nil }
-            pos += Int(scriptLen)
+            // Script length and script (sequence follows)
+            guard let (scriptLen, scriptStart) = data.readBoundedLength(at: pos, trailing: 4) else { return nil }
+            pos = scriptStart + scriptLen
 
             // Sequence (4 bytes)
-            guard data.count >= pos + 4 else { return nil }
             pos += 4
         }
 
-        // Output count
-        guard let (outputCount, outputCountSize) = VarInt.parse(from: Data(data[pos...])) else { return nil }
+        // Output count (each output is at least 8 + 1 bytes)
+        guard let (outputCount, outputCountSize) = data.readBoundedCount(at: pos, minItemSize: 9) else { return nil }
         pos += outputCountSize
 
         // Skip outputs
@@ -250,10 +250,8 @@ public struct HeadersMessage: Sendable {
             pos += 8
 
             // Script length and script
-            guard let (scriptLen, scriptLenSize) = VarInt.parse(from: Data(data[pos...])) else { return nil }
-            pos += scriptLenSize
-            guard data.count >= pos + Int(scriptLen) else { return nil }
-            pos += Int(scriptLen)
+            guard let (scriptLen, scriptStart) = data.readBoundedLength(at: pos) else { return nil }
+            pos = scriptStart + scriptLen
         }
 
         // Lock time (4 bytes)
@@ -267,14 +265,10 @@ public struct HeadersMessage: Sendable {
     private static func skipMerkleBranch(in data: Data, from offset: Int) -> Int? {
         var pos = offset
 
-        // Branch length
-        guard let (branchLen, branchLenSize) = VarInt.parse(from: Data(data[pos...])) else { return nil }
+        // Branch length, bounded by remaining bytes (32 bytes per hash)
+        guard let (branchLen, branchLenSize) = data.readBoundedCount(at: pos, minItemSize: 32) else { return nil }
         pos += branchLenSize
-
-        // Skip hashes (32 bytes each)
-        let hashesSize = Int(branchLen) * 32
-        guard data.count >= pos + hashesSize else { return nil }
-        pos += hashesSize
+        pos += branchLen * 32
 
         // Branch side mask (4 bytes)
         guard data.count >= pos + 4 else { return nil }
@@ -285,10 +279,13 @@ public struct HeadersMessage: Sendable {
 
     /// Parse from Data
     public static func parse(from data: Data) -> HeadersMessage? {
-        guard let (count, varIntSize) = VarInt.parse(from: data) else { return nil }
+        // Bound the peer-supplied header count by the remaining bytes
+        // (each entry is at least an 80-byte header).
+        guard let (count, varIntSize) = data.readBoundedCount(at: 0, minItemSize: BlockHeader.size) else { return nil }
 
         var offset = varIntSize
         var headers: [BlockHeader] = []
+        headers.reserveCapacity(count)
 
         for _ in 0..<count {
             guard data.count >= offset + BlockHeader.size else { return nil }

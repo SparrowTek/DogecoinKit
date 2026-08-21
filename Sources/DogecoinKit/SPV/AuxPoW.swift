@@ -176,8 +176,15 @@ public struct AuxPoW: Sendable, Equatable {
             throw ValidationError.invalidChainMerkleProof
         }
 
-        // Verify chain ID from merkle index
-        let chainID = chainMerkleIndex / (1 << chainMerkleBranch.count)
+        // Verify chain ID from merkle index. The branch count is
+        // peer-supplied: a count of 32+ would make `UInt32(1) << count`
+        // over-shift to 0 and trap on division, so reject oversized branches
+        // outright (the merged-mining spec caps the chain merkle tree well
+        // below this).
+        guard chainMerkleBranch.count < 32 else {
+            throw ValidationError.invalidChainMerkleProof
+        }
+        let chainID = chainMerkleIndex / (UInt32(1) << UInt32(chainMerkleBranch.count))
         if chainID != Self.dogecoinChainID && chainMerkleBranch.count > 0 {
             // Chain ID validation - only for multi-aux-chain scenarios
             // For single chain (empty branch), any index is valid
@@ -228,15 +235,10 @@ public struct AuxPoW: Sendable, Equatable {
         guard coinbaseTx.count >= pos + 36 else { return nil }
         pos += 36
 
-        // Parse scriptSig length
-        guard let (scriptLength, scriptLengthSize) = VarInt.parse(from: Data(coinbaseTx[pos...])) else { return nil }
-        pos += scriptLengthSize
+        // Parse scriptSig length (peer-supplied — bound by remaining bytes)
+        guard let (scriptLen, scriptStart) = coinbaseTx.readBoundedLength(at: pos) else { return nil }
 
-        // Extract scriptSig
-        let scriptLen = Int(scriptLength)
-        guard coinbaseTx.count >= pos + scriptLen else { return nil }
-
-        return Data(coinbaseTx[pos..<pos + scriptLen])
+        return Data(coinbaseTx[scriptStart..<scriptStart + scriptLen])
     }
 
     // MARK: - Helper Functions
@@ -347,8 +349,12 @@ public struct AuxPoW: Sendable, Equatable {
             pos += 2
         }
 
-        // Input count
-        guard let (inputCount, inputSize) = VarInt.parse(from: Data(data[pos...])) else { return nil }
+        // Every count and length below is peer-supplied — bound each by the
+        // remaining bytes before use so a fabricated VarInt can only fail the
+        // parse, never trap on Int conversion or overflow.
+
+        // Input count (each input is at least 36 + 1 + 4 bytes)
+        guard let (inputCount, inputSize) = data.readBoundedCount(at: pos, minItemSize: 41) else { return nil }
         pos += inputSize
 
         // Inputs
@@ -356,16 +362,12 @@ public struct AuxPoW: Sendable, Equatable {
             guard data.count >= pos + 36 else { return nil }
             pos += 36 // prevout
 
-            guard let (scriptLen, scriptSize) = VarInt.parse(from: Data(data[pos...])) else { return nil }
-            pos += scriptSize
-
-            let scriptBytes = Int(scriptLen)
-            guard data.count >= pos + scriptBytes + 4 else { return nil }
-            pos += scriptBytes + 4 // script + sequence
+            guard let (scriptBytes, scriptStart) = data.readBoundedLength(at: pos, trailing: 4) else { return nil }
+            pos = scriptStart + scriptBytes + 4 // script + sequence
         }
 
-        // Output count
-        guard let (outputCount, outputSize) = VarInt.parse(from: Data(data[pos...])) else { return nil }
+        // Output count (each output is at least 8 + 1 bytes)
+        guard let (outputCount, outputSize) = data.readBoundedCount(at: pos, minItemSize: 9) else { return nil }
         pos += outputSize
 
         // Outputs
@@ -373,27 +375,19 @@ public struct AuxPoW: Sendable, Equatable {
             guard data.count >= pos + 8 else { return nil }
             pos += 8 // value
 
-            guard let (scriptLen, scriptSize) = VarInt.parse(from: Data(data[pos...])) else { return nil }
-            pos += scriptSize
-
-            let scriptBytes = Int(scriptLen)
-            guard data.count >= pos + scriptBytes else { return nil }
-            pos += scriptBytes
+            guard let (scriptBytes, scriptStart) = data.readBoundedLength(at: pos) else { return nil }
+            pos = scriptStart + scriptBytes
         }
 
         // Witness data (SegWit only)
         if isSegWit {
             for _ in 0..<inputCount {
-                guard let (stackCount, stackCountSize) = VarInt.parse(from: Data(data[pos...])) else { return nil }
+                guard let (stackCount, stackCountSize) = data.readBoundedCount(at: pos, minItemSize: 1) else { return nil }
                 pos += stackCountSize
 
                 for _ in 0..<stackCount {
-                    guard let (itemLen, itemLenSize) = VarInt.parse(from: Data(data[pos...])) else { return nil }
-                    pos += itemLenSize
-
-                    let itemBytes = Int(itemLen)
-                    guard data.count >= pos + itemBytes else { return nil }
-                    pos += itemBytes
+                    guard let (itemBytes, itemStart) = data.readBoundedLength(at: pos) else { return nil }
+                    pos = itemStart + itemBytes
                 }
             }
         }
@@ -405,18 +399,17 @@ public struct AuxPoW: Sendable, Equatable {
         return (Data(data[start..<pos]), pos)
     }
 
-    /// Parse merkle branch from data
+    /// Parse merkle branch from data.
+    /// The count is peer-supplied — bound it by the remaining bytes before
+    /// reserving capacity so a fabricated count cannot force a huge allocation.
     private static func parseMerkleBranch(from data: Data, at offset: Int) -> ([Data], Int)? {
-        var pos = 0
-
-        guard let (count, countSize) = VarInt.parse(from: Data(data[offset...])) else { return nil }
-        pos += countSize
+        guard let (count, countSize) = data.readBoundedCount(at: offset, minItemSize: 32) else { return nil }
+        var pos = countSize
 
         var branch: [Data] = []
-        branch.reserveCapacity(Int(count))
+        branch.reserveCapacity(count)
 
         for _ in 0..<count {
-            guard data.count >= offset + pos + 32 else { return nil }
             branch.append(Data(data[offset + pos..<offset + pos + 32]))
             pos += 32
         }

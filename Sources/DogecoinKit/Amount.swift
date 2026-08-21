@@ -61,7 +61,7 @@ public struct DogecoinAmount: Sendable, Equatable, Hashable, Comparable {
     public var dogeString: String {
         var buffer = [CChar](repeating: 0, count: Int(KOINU_STRINGLEN))
 
-        let result = koinu_to_coins_str(koinu, &buffer)
+        let result = koinu_to_coins_str(koinu, &buffer, buffer.count)
 
         guard result == 1 else {
             // Fallback to manual conversion

@@ -20,6 +20,12 @@ public actor ElectrumClient {
     private let connectionTimeout: TimeInterval = 30
     private let requestTimeout: TimeInterval = 60
 
+    /// Upper bound for a single newline-delimited JSON-RPC line. A server (or
+    /// MITM on the wire) that streams data without ever sending a newline
+    /// would otherwise grow `receiveBuffer` without limit until the app is
+    /// killed for memory. Large-wallet history responses fit comfortably.
+    private let maxReceiveBufferBytes = 8 * 1024 * 1024
+
     private let logger = Logger(subsystem: "DogecoinKit", category: "electrum")
 
     // MARK: - Initialization
@@ -264,11 +270,34 @@ public actor ElectrumClient {
                 receiveBuffer.append(data)
                 await processReceiveBuffer()
 
+                // A line that exceeds the cap without a newline is a protocol
+                // violation (or an attack) — drop the connection instead of
+                // buffering until out-of-memory.
+                if receiveBuffer.count > maxReceiveBufferBytes {
+                    logger.error("\(self.server.host, privacy: .public) exceeded \(self.maxReceiveBufferBytes) byte line limit — disconnecting")
+                    handleReceiveFailure()
+                    break
+                }
+
             } catch {
-                isConnected = false
+                // The connection is dead: fail every in-flight request now
+                // rather than leaving callers to stall on the 60 s timeout.
+                handleReceiveFailure()
                 break
             }
         }
+    }
+
+    private func handleReceiveFailure() {
+        isConnected = false
+        connection?.cancel()
+        connection = nil
+        receiveBuffer.removeAll()
+
+        for (_, continuation) in pendingRequests {
+            continuation.resume(throwing: ElectrumError.serverDisconnected)
+        }
+        pendingRequests.removeAll()
     }
 
     private func processReceiveBuffer() async {

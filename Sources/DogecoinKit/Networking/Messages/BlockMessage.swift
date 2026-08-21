@@ -36,12 +36,13 @@ public struct BlockMessage: Sendable {
             offset = newOffset
         }
 
-        guard let (txCount, txCountSize) = VarInt.parse(from: Data(data[offset...])) else { return nil }
-        guard txCount <= UInt64(Int.max) else { return nil }
+        // Transaction count is peer-supplied — bound it by the remaining bytes
+        // (a minimal transaction is 10 bytes) before reserving capacity.
+        guard let (txCount, txCountSize) = data.readBoundedCount(at: offset, minItemSize: 10) else { return nil }
         offset += txCountSize
 
         var transactions: [Data] = []
-        transactions.reserveCapacity(Int(txCount))
+        transactions.reserveCapacity(txCount)
 
         for _ in 0..<txCount {
             guard let tx = TransactionParser.parseTransaction(from: data, offset: &offset) else { return nil }
@@ -87,9 +88,12 @@ struct TransactionParser {
             offset += 2  // Skip marker and flag
         }
 
-        // Input count
-        guard let (inputCount, inputSize) = VarInt.parse(from: Data(data[offset...])) else { return nil }
-        guard inputCount <= UInt64(Int.max) else { return nil }
+        // Every count and length below is peer-supplied — bound each by the
+        // remaining bytes before use so a fabricated VarInt can only fail the
+        // parse, never trap on Int conversion, overflow, or over-allocation.
+
+        // Input count (each input is at least 36 + 1 + 4 bytes)
+        guard let (inputCount, inputSize) = data.readBoundedCount(at: offset, minItemSize: 41) else { return nil }
         offset += inputSize
 
         // Inputs
@@ -98,19 +102,13 @@ struct TransactionParser {
             guard data.count >= offset + 36 else { return nil }
             offset += 36
 
-            // Script sig length and script
-            guard let (scriptLength, scriptSize) = VarInt.parse(from: Data(data[offset...])) else { return nil }
-            guard scriptLength <= UInt64(Int.max) else { return nil }
-            offset += scriptSize
-
-            let scriptBytes = Int(scriptLength)
-            guard data.count >= offset + scriptBytes + 4 else { return nil }
-            offset += scriptBytes + 4  // script + sequence
+            // Script sig length and script (sequence follows)
+            guard let (scriptBytes, scriptStart) = data.readBoundedLength(at: offset, trailing: 4) else { return nil }
+            offset = scriptStart + scriptBytes + 4  // script + sequence
         }
 
-        // Output count
-        guard let (outputCount, outputSize) = VarInt.parse(from: Data(data[offset...])) else { return nil }
-        guard outputCount <= UInt64(Int.max) else { return nil }
+        // Output count (each output is at least 8 + 1 bytes)
+        guard let (outputCount, outputSize) = data.readBoundedCount(at: offset, minItemSize: 9) else { return nil }
         offset += outputSize
 
         // Outputs
@@ -120,31 +118,22 @@ struct TransactionParser {
             offset += 8
 
             // Script pubkey length and script
-            guard let (scriptLength, scriptSize) = VarInt.parse(from: Data(data[offset...])) else { return nil }
-            guard scriptLength <= UInt64(Int.max) else { return nil }
-            offset += scriptSize
-
-            let scriptBytes = Int(scriptLength)
-            guard data.count >= offset + scriptBytes else { return nil }
-            offset += scriptBytes
+            guard let (scriptBytes, scriptStart) = data.readBoundedLength(at: offset) else { return nil }
+            offset = scriptStart + scriptBytes
         }
 
         // Witness data (only for SegWit transactions)
         if isSegWit {
             // One witness per input
             for _ in 0..<inputCount {
-                // Number of stack items for this input
-                guard let (stackItemCount, stackItemCountSize) = VarInt.parse(from: Data(data[offset...])) else { return nil }
+                // Number of stack items for this input (each is at least 1 byte)
+                guard let (stackItemCount, stackItemCountSize) = data.readBoundedCount(at: offset, minItemSize: 1) else { return nil }
                 offset += stackItemCountSize
 
                 // Each stack item
                 for _ in 0..<stackItemCount {
-                    guard let (itemLength, itemLengthSize) = VarInt.parse(from: Data(data[offset...])) else { return nil }
-                    offset += itemLengthSize
-
-                    let itemBytes = Int(itemLength)
-                    guard data.count >= offset + itemBytes else { return nil }
-                    offset += itemBytes
+                    guard let (itemBytes, itemStart) = data.readBoundedLength(at: offset) else { return nil }
+                    offset = itemStart + itemBytes
                 }
             }
         }

@@ -804,8 +804,9 @@ extension SPVSyncManager: PeerManagerDelegate {
         guard bytes.count >= offset + 4 else { return false }
         offset += 4
 
-        // input count
-        guard let (inputCount, inputCountSize) = readVarInt(bytes, at: offset) else { return false }
+        // input count — peer-supplied, bounded by remaining bytes so a
+        // fabricated VarInt can only fail the match, never trap.
+        guard let (inputCount, inputCountSize) = bytes.readBoundedCount(at: offset, minItemSize: 41) else { return false }
         offset += inputCountSize
 
         for _ in 0..<inputCount {
@@ -815,19 +816,16 @@ extension SPVSyncManager: PeerManagerDelegate {
             if filter.contains(outpoint) { return true }
             offset += 36
 
-            // script length + script
-            guard let (scriptLen, scriptLenSize) = readVarInt(bytes, at: offset) else { return false }
-            offset += scriptLenSize
-            guard bytes.count >= offset + Int(scriptLen) else { return false }
-            offset += Int(scriptLen)
+            // script length + script (sequence follows)
+            guard let (scriptLen, scriptStart) = bytes.readBoundedLength(at: offset, trailing: 4) else { return false }
+            offset = scriptStart + scriptLen
 
             // sequence (4)
-            guard bytes.count >= offset + 4 else { return false }
             offset += 4
         }
 
         // output count
-        guard let (outputCount, outputCountSize) = readVarInt(bytes, at: offset) else { return false }
+        guard let (outputCount, outputCountSize) = bytes.readBoundedCount(at: offset, minItemSize: 9) else { return false }
         offset += outputCountSize
 
         for _ in 0..<outputCount {
@@ -836,10 +834,9 @@ extension SPVSyncManager: PeerManagerDelegate {
             offset += 8
 
             // script length + script
-            guard let (scriptLen, scriptLenSize) = readVarInt(bytes, at: offset) else { return false }
-            offset += scriptLenSize
-            let scriptEnd = offset + Int(scriptLen)
-            guard bytes.count >= scriptEnd else { return false }
+            guard let (scriptLen, scriptStart) = bytes.readBoundedLength(at: offset) else { return false }
+            offset = scriptStart
+            let scriptEnd = offset + scriptLen
 
             let script = bytes.subdata(in: offset..<scriptEnd)
             if filter.contains(script) { return true }
@@ -889,31 +886,6 @@ extension SPVSyncManager: PeerManagerDelegate {
             i += pushLen
         }
         return pushes
-    }
-
-    /// Offset-aware VarInt read over a raw `Data`. Returns `(value, bytesConsumed)`.
-    nonisolated private static func readVarInt(_ data: Data, at offset: Int) -> (UInt64, Int)? {
-        guard offset < data.count else { return nil }
-        let first = data[data.startIndex + offset]
-        switch first {
-        case ..<0xFD:
-            return (UInt64(first), 1)
-        case 0xFD:
-            guard data.count - offset >= 3 else { return nil }
-            let lo = UInt16(data[data.startIndex + offset + 1])
-            let hi = UInt16(data[data.startIndex + offset + 2]) << 8
-            return (UInt64(lo | hi), 3)
-        case 0xFE:
-            guard data.count - offset >= 5 else { return nil }
-            var v: UInt32 = 0
-            for j in 0..<4 { v |= UInt32(data[data.startIndex + offset + 1 + j]) << (8 * j) }
-            return (UInt64(v), 5)
-        default:
-            guard data.count - offset >= 9 else { return nil }
-            var v: UInt64 = 0
-            for j in 0..<8 { v |= UInt64(data[data.startIndex + offset + 1 + j]) << (8 * j) }
-            return (v, 9)
-        }
     }
 
     private func handleBlock(_ block: BlockMessage, from peer: Peer) async {

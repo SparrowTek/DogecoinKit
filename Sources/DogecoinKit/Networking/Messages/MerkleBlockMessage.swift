@@ -60,23 +60,19 @@ public struct MerkleBlockMessage: Sendable {
         guard data.count >= pos + 32 else { return nil }
         pos += 32
 
-        // Skip coinbase merkle branch (varint count + 32*count bytes)
-        guard let (branchCount1, branchSize1) = VarInt.parse(from: Data(data[pos...])) else { return nil }
-        pos += branchSize1
-        let branch1Bytes = Int(branchCount1) * 32
-        guard data.count >= pos + branch1Bytes else { return nil }
-        pos += branch1Bytes
+        // Skip coinbase merkle branch (varint count + 32*count bytes).
+        // The count is peer-supplied; bound it by the remaining bytes so a
+        // fabricated VarInt cannot trap on Int conversion or multiplication.
+        guard let (branchCount1, branchSize1) = data.readBoundedCount(at: pos, minItemSize: 32) else { return nil }
+        pos += branchSize1 + branchCount1 * 32
 
         // Skip nIndex (4 bytes)
         guard data.count >= pos + 4 else { return nil }
         pos += 4
 
         // Skip chain merkle branch (varint count + 32*count bytes)
-        guard let (branchCount2, branchSize2) = VarInt.parse(from: Data(data[pos...])) else { return nil }
-        pos += branchSize2
-        let branch2Bytes = Int(branchCount2) * 32
-        guard data.count >= pos + branch2Bytes else { return nil }
-        pos += branch2Bytes
+        guard let (branchCount2, branchSize2) = data.readBoundedCount(at: pos, minItemSize: 32) else { return nil }
+        pos += branchSize2 + branchCount2 * 32
 
         // Skip nChainIndex (4 bytes)
         guard data.count >= pos + 4 else { return nil }
@@ -104,23 +100,21 @@ public struct MerkleBlockMessage: Sendable {
         let totalTransactions = UInt32(littleEndian: totalRaw)
         offset += 4
 
-        guard let (hashCount, hashCountSize) = VarInt.parse(from: Data(data[offset...])) else { return nil }
-        guard hashCount <= UInt64(Int.max) else { return nil }
+        // Hash count is peer-supplied — bound it by the remaining bytes before
+        // reserving capacity so a fabricated count cannot force a huge allocation.
+        guard let (hashCount, hashCountSize) = data.readBoundedCount(at: offset, minItemSize: 32) else { return nil }
         offset += hashCountSize
 
         var hashes: [Data] = []
-        hashes.reserveCapacity(Int(hashCount))
+        hashes.reserveCapacity(hashCount)
         for _ in 0..<hashCount {
             guard data.count >= offset + 32 else { return nil }
             hashes.append(Data(data[offset..<offset + 32]))
             offset += 32
         }
 
-        guard let (flagCount, flagSize) = VarInt.parse(from: Data(data[offset...])) else { return nil }
-        guard flagCount <= UInt64(Int.max) else { return nil }
-        offset += flagSize
-        guard data.count >= offset + Int(flagCount) else { return nil }
-        let flags = Data(data[offset..<offset + Int(flagCount)])
+        guard let (flagCount, flagStart) = data.readBoundedLength(at: offset) else { return nil }
+        let flags = Data(data[flagStart..<flagStart + flagCount])
 
         return MerkleBlockMessage(
             header: header,

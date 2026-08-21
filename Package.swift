@@ -16,7 +16,7 @@ let package = Package(
     ],
     dependencies: [
 //        .package(path: "../libdogecoin"),
-        .package(url: "https://github.com/radmakr/libdogecoin", branch: "ios"),
+        .package(url: "https://github.com/radmakr/libdogecoin", branch: "0.1.5-dev-swiftpm"),
         .package(url: "https://github.com/groue/GRDB.swift", from: "7.0.0"),
     ],
     targets: [
