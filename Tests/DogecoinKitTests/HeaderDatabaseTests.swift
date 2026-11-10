@@ -284,20 +284,76 @@ struct HeaderDatabaseTests {
         #expect(locator.isEmpty)
     }
 
-    // MARK: - Merkle Root Lookup
+    // MARK: - Schema
 
-    @Test("Get header by merkle root")
-    func testGetHeaderByMerkleRoot() throws {
-        let db = try HeaderDatabase()
+    @Test("A new database carries only the indexes its queries use")
+    func testIndexes() throws {
+        let indexes = try HeaderDatabase().indexNames()
 
-        var record = makeTestRecord(height: 0)
-        let uniqueMerkleRoot = Data(repeating: 0xCD, count: 32)
-        record.merkleRoot = uniqueMerkleRoot
-        try db.insertHeader(record)
+        #expect(indexes.contains("idx_headers_best_chain_height"))
+        #expect(indexes.contains("headers_on_height"))
+        #expect(!indexes.contains("headers_on_prevBlockHash"))
+        #expect(!indexes.contains("idx_headers_merkle_root"))
+    }
 
-        let found = try db.getHeader(merkleRoot: uniqueMerkleRoot)
-        #expect(found != nil)
-        #expect(found?.height == 0)
+    @Test("Opening an older database drops the unused indexes and keeps its headers")
+    func testMigrationDropsUnusedIndexes() throws {
+        let directory = TestDirectories.unique()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let path = directory.appendingPathComponent("headers.sqlite").path
+
+        do {
+            // Put a database back the way the first schema version left it.
+            let database = try HeaderDatabase(path: path)
+            try database.insertHeaders([makeTestRecord(height: 0), makeTestRecord(height: 1, prevHeight: 0)])
+            try database.executeWithoutTransaction("CREATE INDEX headers_on_prevBlockHash ON headers(prevBlockHash)")
+            try database.executeWithoutTransaction("CREATE INDEX idx_headers_merkle_root ON headers(merkleRoot)")
+            try database.executeWithoutTransaction("DELETE FROM grdb_migrations WHERE identifier = 'v2_drop_unused_indexes'")
+            #expect(try database.indexNames().contains("idx_headers_merkle_root"))
+        }
+
+        let reopened = try HeaderDatabase(path: path)
+        let indexes = try reopened.indexNames()
+
+        #expect(!indexes.contains("headers_on_prevBlockHash"))
+        #expect(!indexes.contains("idx_headers_merkle_root"))
+        #expect(indexes.contains("idx_headers_best_chain_height"))
+        #expect(try reopened.getHeaderCount() == 2)
+        #expect(try reopened.getTip()?.height == 1)
+    }
+
+    @Test("A read-only database can be read but not changed")
+    func testReadOnlyOpen() throws {
+        let directory = TestDirectories.unique()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let path = directory.appendingPathComponent("headers.sqlite").path
+
+        do {
+            let database = try HeaderDatabase(path: path)
+            try database.insertHeader(makeTestRecord(height: 0))
+        }
+
+        let readOnly = try HeaderDatabase(readOnlyPath: path)
+        #expect(try readOnly.getTip()?.height == 0)
+        #expect(try readOnly.getHeaderCount() == 1)
+        #expect(throws: (any Error).self) {
+            try readOnly.insertHeader(makeTestRecord(height: 1, prevHeight: 0))
+        }
+    }
+
+    @Test("Opening something that is not a database fails as unreadable")
+    func testUnreadableFile() throws {
+        let directory = TestDirectories.unique()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("headers.sqlite")
+        try Data("version https://git-lfs.github.com/spec/v1\n".utf8).write(to: url)
+
+        do {
+            _ = try HeaderDatabase(readOnlyPath: url.path).getTip()
+            Issue.record("A text file opened as a header database")
+        } catch {
+            #expect(HeaderDatabase.indicatesUnreadableFile(error))
+        }
     }
 
     // MARK: - Conversion Tests

@@ -10,7 +10,7 @@ struct HDWalletVectorTests {
     }
 
     @Test("Mnemonic seed with passphrase matches known vector")
-    func testSeedWithPassphraseVector() {
+    func testSeedWithPassphraseVector() throws {
         let mnemonic = "chief prevent advice search broccoli dish pride grow evidence bicycle cushion lady"
         let passphrase = "TREZOR"
         let expectedHex = "31113f96716b7d5b8d58a49c5e1f6d6300ff307b35eef3cecfdb97869e514ad330f0a7dcec4ed2feeebf8d2267ebfefeb149df84642ca091befd25ea15d36076"
@@ -25,10 +25,7 @@ struct HDWalletVectorTests {
         }
 
         #expect(result == 0)
-        guard let expected = Data(hexString: expectedHex) else {
-            #expect(Bool(false))
-            return
-        }
+        let expected = try #require(Data(hexString: expectedHex))
         #expect(Data(seed) == expected)
     }
 

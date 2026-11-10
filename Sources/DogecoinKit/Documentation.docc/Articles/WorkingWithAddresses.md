@@ -4,7 +4,6 @@ Validate, create, and manage Dogecoin addresses.
 
 @Metadata {
     @PageKind(article)
-    @PageImage(purpose: card, source: "address-card", alt: "Working with Dogecoin addresses")
 }
 
 ## Overview
@@ -69,18 +68,18 @@ if let network = Address.detectNetwork(address) {
 When accepting addresses from users, validate thoroughly:
 
 ```swift
+enum AddressError: Error {
+    case invalid
+    case wrongNetwork(expected: DogecoinNetwork, got: DogecoinNetwork)
+}
+
 func validateRecipientAddress(_ input: String, expectedNetwork: DogecoinNetwork) -> Result<String, AddressError> {
     // Trim whitespace
     let address = input.trimmingCharacters(in: .whitespacesAndNewlines)
 
-    // Check if valid
-    guard Address.isValid(address) else {
-        return .failure(.invalid)
-    }
-
-    // Check network matches
+    // A valid address always has a network, so one check covers both
     guard let network = Address.detectNetwork(address) else {
-        return .failure(.unknownNetwork)
+        return .failure(.invalid)
     }
 
     guard network == expectedNetwork else {
@@ -99,8 +98,6 @@ case .failure(.invalid):
     showError("Please enter a valid Dogecoin address")
 case .failure(.wrongNetwork(let expected, let got)):
     showError("Expected a \(expected) address, but got a \(got) address")
-case .failure(.unknownNetwork):
-    showError("Unable to determine address network")
 }
 ```
 
@@ -259,8 +256,6 @@ The gap limit (typically 20) determines how many consecutive unused addresses to
 Addresses are commonly shared via QR codes. Here's how to integrate with a QR scanner:
 
 ```swift
-import AVFoundation
-
 func handleScannedQRCode(_ content: String) {
     // Handle dogecoin: URI scheme
     if content.lowercased().hasPrefix("dogecoin:") {

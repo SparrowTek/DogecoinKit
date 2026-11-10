@@ -4,6 +4,10 @@ import Testing
 
 /// Runs every job on a brand-new thread — the worst case of the cooperative
 /// pool resuming an actor on a different thread after each suspension point.
+///
+/// Task executors arrived after the package's minimum OS versions, so this
+/// and the one test that uses it are only available from there on.
+@available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *)
 private final class FreshThreadExecutor: TaskExecutor {
     func enqueue(_ job: consuming ExecutorJob) {
         let job = UnownedJob(job)
@@ -137,9 +141,9 @@ struct TransactionBuilderTests {
         ])
     }
 
+    @available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *)
     @Test("Builder steps survive resuming on a different thread after every await")
     func builderSurvivesThreadHops() async throws {
-        guard #available(macOS 15.0, iOS 18.0, *) else { return }
         let keys = try await keys()
 
         // Before the fix, libdogecoin's thread-local transaction table made

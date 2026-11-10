@@ -4,7 +4,6 @@ Add Dogecoin wallet functionality to your iOS or macOS app.
 
 @Metadata {
     @PageKind(article)
-    @PageImage(purpose: card, source: "getting-started-card", alt: "Getting started with DogecoinKit")
 }
 
 ## Overview
@@ -17,7 +16,7 @@ This guide walks you through integrating DogecoinKit into your iOS or macOS proj
 
 1. Open your project in Xcode
 2. Select **File → Add Package Dependencies...**
-3. Enter the DogecoinKit repository URL or navigate to the local package
+3. Enter `https://github.com/SparrowTek/DogecoinKit` and set **Dependency Rule** to **Branch** → `main`, or navigate to a local checkout
 4. Click **Add Package**
 5. Select the **DogecoinKit** library and add it to your target
 
@@ -36,7 +35,7 @@ let package = Package(
         .macOS(.v14)
     ],
     dependencies: [
-        .package(path: "../DogecoinKit")
+        .package(url: "https://github.com/SparrowTek/DogecoinKit", branch: "main")
     ],
     targets: [
         .executableTarget(
@@ -109,10 +108,9 @@ func createWallet() async throws -> (wallet: HDWallet, address: String) {
     )
 
     // The mnemonic is the user's recovery phrase - store it securely!
-    guard let mnemonic = wallet.mnemonic else {
-        throw WalletError.noMnemonic
+    if let mnemonic = wallet.mnemonic {
+        print("Recovery phrase: \(mnemonic)")
     }
-    print("Recovery phrase: \(mnemonic)")
 
     // Derive the first receiving address
     let address = try await wallet.deriveAddress(account: 0, index: 0)
@@ -135,12 +133,12 @@ DogecoinKit uses Hierarchical Deterministic (HD) wallets following industry stan
 The derivation path for Dogecoin addresses follows this structure:
 
 ```
-m / 44' / 3' / account' / change / index
-        │    │          │        │
-        │    │          │        └── Address index (0, 1, 2, ...)
-        │    │          └── 0 for receiving, 1 for change
-        │    └── Account number (0, 1, 2, ...)
-        └── Dogecoin coin type
+m / 44' / coin' / account' / change / index
+        │       │          │        │
+        │       │          │        └── Address index (0, 1, 2, ...)
+        │       │          └── 0 for receiving, 1 for change
+        │       └── Account number (0, 1, 2, ...)
+        └── Coin type: 3 on mainnet, 1 on testnet
 ```
 
 ### Deriving Multiple Addresses
@@ -179,7 +177,7 @@ let testnetWallet = try await HDWallet.create(network: .testnet)
 // Addresses start with 'n'
 ```
 
-> Tip: Always use testnet during development. You can get free testnet DOGE from faucets.
+> Tip: Always use testnet during development. You can get free testnet DOGE from faucets. DogecoinKit's built-in Electrum server list covers mainnet only, so to sync through Electrum on testnet, pass your own servers to ``ElectrumSyncManager/init(network:servers:)``.
 
 ## Next Steps
 

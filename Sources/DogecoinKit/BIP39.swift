@@ -127,7 +127,7 @@ public struct MnemonicValidationResult: Sendable {
 
     /// Returns true if the mnemonic has the correct word count
     public var hasValidWordCount: Bool {
-        error != .invalidWordCount
+        error != .invalidWordCount && error != .emptyMnemonic
     }
 
     /// Returns true if all words are valid BIP39 words

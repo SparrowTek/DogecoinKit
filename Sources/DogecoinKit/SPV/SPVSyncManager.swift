@@ -8,7 +8,9 @@ public protocol SPVSyncDelegate: AnyObject, Sendable {
     /// Called when sync progress updates
     func spvSync(_ manager: SPVSyncManager, progressUpdated progress: Double, height: Int32) async
 
-    /// Called when sync completes
+    /// Called when the chain catches up with its peers, and again each time
+    /// it has grown since. A reply that leaves the height unchanged does not
+    /// repeat it.
     func spvSyncDidComplete(_ manager: SPVSyncManager) async
 
     /// Called when a new block header is received
@@ -125,7 +127,8 @@ public actor SPVSyncManager {
     private var headerRequest: HeaderRequest?
     /// The peer most recently given up on; the next pick prefers anyone else
     private var lastAbandonedPeer: Peer?
-    private var lastProgressTime: Date?
+    /// The chain height last reported as complete
+    private var lastSynchronizedHeight: Int32?
     private var filteredBlockRequestTime: Date?
 
     // MARK: - Transaction State
@@ -150,7 +153,10 @@ public actor SPVSyncManager {
     /// Current sync state
     public var state: SPVSyncState { syncState }
 
-    /// Target height (best height from peers)
+    /// Merkle blocks still waiting for a header or a transaction
+    var pendingMerkleBlockCount: Int { pendingMerkleBlocks.count }
+
+    /// Target height (the median of the heights connected peers announced)
     public var targetHeight: Int32 { _targetHeight }
 
     /// Current synced height
@@ -185,6 +191,14 @@ public actor SPVSyncManager {
 
     private let filteredBlockBatchSize = 32
     private let maxFilteredBlocksInFlight = 128
+
+    /// How many of an announcement's blocks are looked up, newest first. A
+    /// real one names a block or two; the bound keeps a peer from buying
+    /// thousands of database reads with a single message.
+    private static let announcedBlocksChecked = 8
+
+    /// The size of the largest block, which no transaction can exceed
+    private static let maximumTransactionSize = 1_000_000
 
     /// Timeout for header requests (seconds)
     private let headerRequestTimeout: TimeInterval = 60
@@ -319,6 +333,11 @@ public actor SPVSyncManager {
 
     /// Start synchronization
     public func start() async {
+        // A start that failed before syncing may simply be tried again.
+        if case .error = syncState {
+            syncState = .idle
+        }
+
         guard syncState == .idle else {
             logger.warning("Cannot start: already running")
             return
@@ -328,7 +347,6 @@ public actor SPVSyncManager {
         let session = self.session
         isActive = true
         syncState = .connecting
-        lastProgressTime = Date()
 
         logger.info("Starting SPV sync")
 
@@ -338,6 +356,18 @@ public actor SPVSyncManager {
 
         // stop() ran while we were setting up.
         guard self.session == session else { return }
+
+        // Without its database the chain can neither read nor store a
+        // header: every request would time out, peer after peer, with the
+        // state stuck on "syncing". Say so instead.
+        guard await headerChain.isOpen else {
+            let error = DogecoinError.syncFailed("The block header database could not be opened")
+            logger.error("Cannot start: \(error.localizedDescription)")
+            isActive = false
+            syncState = .error(error)
+            delegateEvents.yield(.failure(error))
+            return
+        }
 
         startTimeoutTask()
         await peerManager.start()
@@ -361,6 +391,7 @@ public actor SPVSyncManager {
 
         peerStartHeights.removeAll()
         filteredBlockRequestTime = nil
+        lastSynchronizedHeight = nil
         syncState = .idle
     }
 
@@ -545,7 +576,7 @@ public actor SPVSyncManager {
             if !entries.isEmpty {
                 let result = await headerChain.addHeaders(entries)
                 if result.added > 0 {
-                    await didAddHeaders(entries)
+                    await didAddHeaders(entries, replacingChainAbove: result.forkHeight)
                 }
                 await penalizeIfInvalid(result.failure, from: peer)
             }
@@ -553,7 +584,6 @@ public actor SPVSyncManager {
         }
 
         headerRequest = nil
-        lastProgressTime = Date()
 
         guard !entries.isEmpty else {
             logger.info("No more headers from \(peer.host)")
@@ -562,7 +592,7 @@ public actor SPVSyncManager {
             guard isFollowing(peer) else { return }
 
             if chainHeight >= _targetHeight {
-                markSynchronized()
+                markSynchronized(at: chainHeight)
             } else {
                 logger.info("Still below target height (\(chainHeight) < \(self._targetHeight)), trying another peer")
                 abandonSyncPeer(peer)
@@ -577,35 +607,51 @@ public actor SPVSyncManager {
         logger.info("Added \(result.added) headers, height now \(chainHeight)")
 
         if result.added > 0 {
-            await didAddHeaders(entries)
+            await didAddHeaders(entries, replacingChainAbove: result.forkHeight)
         }
 
         if let failure = result.failure {
-            await penalizeIfInvalid(failure, from: peer)
-            await retryWithNextPeer(avoiding: peer)
+            if Self.isBannable(failure) {
+                await penalizeIfInvalid(failure, from: peer)
+                await retryWithNextPeer(avoiding: peer)
+            } else {
+                // The cause may be on this side — a wrong clock, a full
+                // disk — and then every peer's headers fail alike. Asking
+                // the next peer at once would loop at network speed, so
+                // the periodic check picks one instead.
+                logger.warning("Headers from \(peer.host) were not accepted: \(String(describing: failure))")
+                abandonSyncPeer(peer)
+            }
             return
         }
 
         guard isFollowing(peer) else { return }
 
-        // Request more headers or mark as synchronized
-        if chainHeight >= _targetHeight {
-            markSynchronized()
-        } else if result.added > 0 {
+        // A full message means the peer has more, whatever height peers
+        // announced when they connected.
+        let peerHasMore = entries.count >= HeadersMessage.maximumEntries
+        if result.added > 0, peerHasMore || chainHeight < _targetHeight {
             syncState = .syncing
             await requestHeaders(from: peer)
+        } else if chainHeight >= _targetHeight {
+            markSynchronized(at: chainHeight)
         } else {
-            // A full batch of headers we already had: the peer is not
-            // helping us advance.
+            // Headers we already had, and still short of the target: the
+            // peer is not helping us advance.
             abandonSyncPeer(peer)
         }
     }
 
     /// Brings transaction state and the delegate up to date after `entries`
-    /// extended (or reorganized) the chain.
-    private func didAddHeaders(_ entries: [HeadersMessage.Entry]) async {
+    /// extended the chain or — when `forkHeight` is set — replaced the part
+    /// of it above that height.
+    private func didAddHeaders(_ entries: [HeadersMessage.Entry], replacingChainAbove forkHeight: Int32?) async {
+        // Before anything is confirmed: a transaction leaves its old block
+        // here and may enter its new one in the very next step.
+        if let forkHeight {
+            await handleReorganization(above: forkHeight)
+        }
         await refreshPendingMerkleBlocks()
-        await refreshVerifiedTransactionsForReorg()
         await requestFilteredBlocksIfNeeded()
 
         for entry in entries {
@@ -618,11 +664,16 @@ public actor SPVSyncManager {
         delegateEvents.yield(.progress(Self.computeProgress(height: chainHeight, target: _targetHeight), height: chainHeight))
     }
 
-    /// Reports completion every time the chain catches up — including after
-    /// each new block — since delegates record the synced height from it.
-    private func markSynchronized() {
+    /// Reports completion when the chain catches up and again each time it
+    /// has grown since — delegates record the synced height from it — but
+    /// not when a peer merely confirms there is nothing new.
+    private func markSynchronized(at height: Int32) {
+        let isNews = syncState != .synchronized || lastSynchronizedHeight != height
         syncState = .synchronized
-        delegateEvents.yield(.completed)
+        lastSynchronizedHeight = height
+        if isNews {
+            delegateEvents.yield(.completed)
+        }
     }
 
     /// Bans a peer whose headers prove it misbehaved.
@@ -671,8 +722,14 @@ extension SPVSyncManager: PeerManagerDelegate {
         }
 
         // Follow this peer if the sync has nobody to follow — at the start,
-        // or after every earlier peer was lost.
-        if isActive, syncPeer == nil, headerRequest == nil {
+        // or after every earlier peer was lost — or if the chain looks
+        // complete and this peer says it is not. The peer being followed
+        // may be the one that is behind.
+        var shouldFollow = syncPeer == nil
+        if !shouldFollow, syncState == .synchronized, let announcedHeight = peerStartHeights[peer.id] {
+            shouldFollow = await announcedHeight > headerChain.height
+        }
+        if isActive, shouldFollow, headerRequest == nil {
             if syncState == .connecting {
                 syncState = .syncing
             }
@@ -786,9 +843,28 @@ extension SPVSyncManager: PeerManagerDelegate {
         let blockInv = inventory.filter { $0.type == .block }
         if !blockInv.isEmpty {
             logger.debug("Received inventory with \(blockInv.count) blocks")
+            await followAnnouncement(of: blockInv, from: peer)
+        }
+    }
 
-            if syncPeer == peer {
+    /// Asks `peer` for headers when it announces a block this chain lacks.
+    ///
+    /// Only the peer being followed used to be asked. If that one stopped
+    /// announcing blocks — stalled, or simply behind — the chain stayed at
+    /// its tip for as long as it remained connected, whatever every other
+    /// peer announced.
+    private func followAnnouncement(of blocks: [InventoryVector], from peer: Peer) async {
+        // Mid-sync, the peer being followed is already delivering the chain.
+        guard isActive, headerRequest == nil,
+              syncPeer == nil || syncPeer == peer || syncState == .synchronized else {
+            return
+        }
+
+        // The newest block comes last.
+        for block in blocks.suffix(Self.announcedBlocksChecked).reversed() {
+            if await headerChain.getHeader(hash: block.hash) == nil {
                 await requestHeaders(from: peer)
+                return
             }
         }
     }
@@ -812,7 +888,12 @@ extension SPVSyncManager: PeerManagerDelegate {
         let blockHash = merkleBlock.header.hash
         let isOnBestChain = await headerChain.isHeaderInBestChain(blockHash)
         let height = await headerChain.getHeader(hash: blockHash)?.height
-        let matchedSet = Set(matches.matchedHashes)
+
+        // Every peer that announces a block sends its merkle block, so the
+        // same one arrives several times. Matches already confirmed in it
+        // are settled; waiting for them again would keep the block pending
+        // forever.
+        let matchedSet = Set(matches.matchedHashes).filter { verifiedTransactions[$0]?.blockHash != blockHash }
 
         var pending = pendingMerkleBlocks[blockHash] ?? PendingMerkleBlock(
             header: merkleBlock.header,
@@ -877,6 +958,13 @@ extension SPVSyncManager: PeerManagerDelegate {
     }
 
     private func handleTransaction(_ txMessage: TxMessage, from peer: Peer) async {
+        // Whatever arrives here is kept, hashed, and handed to the wallet.
+        guard let decoded = Self.decodeRelayedTransaction(txMessage.rawData) else {
+            logger.warning("Banning \(peer.host) for a malformed transaction")
+            await peerManager.banPeer(peer, reason: .invalidTransaction)
+            return
+        }
+
         let txid = txMessage.txidInternal
         guard verifiedTransactions[txid] == nil else { return }
 
@@ -909,7 +997,7 @@ extension SPVSyncManager: PeerManagerDelegate {
             // on our side before surfacing anything to the delegate, otherwise
             // a hostile or buggy peer could inject transactions unrelated to
             // the wallet as "incoming."
-            guard Self.transactionMatchesBloomFilter(txMessage.rawData, filter: filter) else {
+            guard Self.transaction(decoded, withTxid: txid, matches: filter) else {
                 logger.debug("Dropping unsolicited tx from \(peer.host) — no bloom match")
                 return
             }
@@ -925,105 +1013,92 @@ extension SPVSyncManager: PeerManagerDelegate {
         }
     }
 
-    /// Returns `true` if the raw transaction contains **any** element that
-    /// matches the given bloom filter. Follows BIP 37 matching for P2PKH:
-    ///
-    /// - input outpoints (32-byte prev-txid ‖ 4-byte vout, little-endian)
-    /// - each data push inside every output's scriptPubKey
-    /// - the entire scriptPubKey bytes for every output
-    ///
-    /// Returns `false` if parsing fails — a malformed tx is definitely not a
-    /// hit and should be dropped.
-    nonisolated static func transactionMatchesBloomFilter(_ raw: Data, filter: BloomFilter) -> Bool {
-        var offset = 0
-        let bytes = raw
-
-        // version (4)
-        guard bytes.count >= offset + 4 else { return false }
-        offset += 4
-
-        // input count — peer-supplied, bounded by remaining bytes so a
-        // fabricated VarInt can only fail the match, never trap.
-        guard let (inputCount, inputCountSize) = bytes.readBoundedCount(at: offset, minItemSize: 41) else { return false }
-        offset += inputCountSize
-
-        for _ in 0..<inputCount {
-            // prev txid (32) + vout (4)
-            guard bytes.count >= offset + 36 else { return false }
-            let outpoint = bytes.subdata(in: offset..<(offset + 36))
-            if filter.contains(outpoint) { return true }
-            offset += 36
-
-            // script length + script (sequence follows)
-            guard let (scriptLen, scriptStart) = bytes.readBoundedLength(at: offset, trailing: 4) else { return false }
-            offset = scriptStart + scriptLen
-
-            // sequence (4)
-            offset += 4
+    /// Decodes a transaction a peer sent. Returns nil unless the bytes are
+    /// exactly one transaction as Dogecoin serializes it: nothing missing,
+    /// nothing trailing, no witness data, and no larger than a block.
+    nonisolated static func decodeRelayedTransaction(_ raw: Data) -> RawTransaction? {
+        guard raw.count <= maximumTransactionSize,
+              let transaction = RawTransaction(data: raw),
+              // The txid is the hash of these bytes only if they are the
+              // plain serialization.
+              transaction.strippedData == raw else {
+            return nil
         }
+        return transaction
+    }
 
-        // output count
-        guard let (outputCount, outputCountSize) = bytes.readBoundedCount(at: offset, minItemSize: 9) else { return false }
-        offset += outputCountSize
+    /// Whether `raw` is a well-formed transaction that matches `filter`.
+    nonisolated static func transactionMatchesBloomFilter(_ raw: Data, filter: BloomFilter) -> Bool {
+        guard let transaction = decodeRelayedTransaction(raw) else { return false }
+        return self.transaction(transaction, withTxid: MerkleTree.doubleSHA256(raw), matches: filter)
+    }
 
-        for _ in 0..<outputCount {
-            // value (8)
-            guard bytes.count >= offset + 8 else { return false }
-            offset += 8
+    /// Whether `transaction` matches `filter`, tested as BIP 37 has a node
+    /// test it: the txid, every data push in every output script, every
+    /// outpoint spent, and every data push in every input script.
+    ///
+    /// Whole output scripts are tested as well. No node does that, but a
+    /// caller that put scripts in its filter expects them to match here.
+    /// - Parameter txid: The transaction id in internal byte order
+    nonisolated static func transaction(_ transaction: RawTransaction, withTxid txid: Data, matches filter: BloomFilter) -> Bool {
+        if filter.contains(txid) { return true }
 
-            // script length + script
-            guard let (scriptLen, scriptStart) = bytes.readBoundedLength(at: offset) else { return false }
-            offset = scriptStart
-            let scriptEnd = offset + scriptLen
-
-            let script = bytes.subdata(in: offset..<scriptEnd)
-            if filter.contains(script) { return true }
-            for push in scriptDataPushes(in: script) where filter.contains(push) {
+        for output in transaction.outputs {
+            if filter.contains(output.script) || anyDataPush(in: output.script, satisfies: filter.contains) {
                 return true
             }
+        }
 
-            offset = scriptEnd
+        for input in transaction.inputs {
+            var outpoint = input.previousTxid
+            withUnsafeBytes(of: input.previousIndex.littleEndian) { outpoint.append(contentsOf: $0) }
+            if filter.contains(outpoint) || anyDataPush(in: input.script, satisfies: filter.contains) {
+                return true
+            }
         }
 
         return false
     }
 
-    /// Extracts each data push from a Bitcoin script. Recognizes direct
-    /// pushes (opcodes 0x01..0x4b) and `OP_PUSHDATA1/2/4` (0x4c/0x4d/0x4e).
-    /// Other opcodes are skipped. Stops early on malformed script rather
-    /// than throwing — a malformed script simply yields no matches.
-    nonisolated private static func scriptDataPushes(in script: Data) -> [Data] {
-        var pushes: [Data] = []
-        var i = script.startIndex
-        while i < script.endIndex {
-            let op = script[i]
-            i += 1
-            let pushLen: Int
-            if op >= 0x01 && op <= 0x4b {
-                pushLen = Int(op)
-            } else if op == 0x4c {
-                guard i < script.endIndex else { return pushes }
-                pushLen = Int(script[i])
-                i += 1
-            } else if op == 0x4d {
-                guard script.endIndex - i >= 2 else { return pushes }
-                pushLen = Int(script[i]) | (Int(script[i + 1]) << 8)
-                i += 2
-            } else if op == 0x4e {
-                guard script.endIndex - i >= 4 else { return pushes }
-                pushLen = Int(script[i])
-                    | (Int(script[i + 1]) << 8)
-                    | (Int(script[i + 2]) << 16)
-                    | (Int(script[i + 3]) << 24)
-                i += 4
-            } else {
+    /// Whether any data push in `script` satisfies `predicate`. Recognizes
+    /// direct pushes (opcodes 0x01...0x4b) and `OP_PUSHDATA1/2/4`; other
+    /// opcodes are skipped, and a malformed push ends the walk.
+    nonisolated private static func anyDataPush(in script: Data, satisfies predicate: (Data) -> Bool) -> Bool {
+        var index = script.startIndex
+        while index < script.endIndex {
+            let opcode = script[index]
+            index += 1
+
+            let length: Int
+            switch opcode {
+            case 0x01...0x4b:
+                length = Int(opcode)
+            case 0x4c:
+                guard index < script.endIndex else { return false }
+                length = Int(script[index])
+                index += 1
+            case 0x4d:
+                guard script.endIndex - index >= 2 else { return false }
+                length = Int(script[index]) | (Int(script[index + 1]) << 8)
+                index += 2
+            case 0x4e:
+                guard script.endIndex - index >= 4 else { return false }
+                length = Int(script[index])
+                    | (Int(script[index + 1]) << 8)
+                    | (Int(script[index + 2]) << 16)
+                    | (Int(script[index + 3]) << 24)
+                index += 4
+            default:
                 continue
             }
-            guard pushLen >= 0, script.endIndex - i >= pushLen else { return pushes }
-            pushes.append(script.subdata(in: i..<(i + pushLen)))
-            i += pushLen
+
+            guard script.endIndex - index >= length else { return false }
+            if length > 0, predicate(script[index..<(index + length)]) {
+                return true
+            }
+            index += length
         }
-        return pushes
+        return false
     }
 
     private func handleBlock(_ block: BlockMessage, from peer: Peer) async {
@@ -1077,14 +1152,18 @@ extension SPVSyncManager: PeerManagerDelegate {
 
     private func refreshPendingMerkleBlocks() async {
         var events: [(TxMessage, SPVTransactionState)] = []
-        let blockHashes = Array(pendingMerkleBlocks.keys)
 
-        for blockHash in blockHashes {
+        for blockHash in Array(pendingMerkleBlocks.keys) {
+            let needsHeight = pendingMerkleBlocks[blockHash]?.height == nil
+            let isOnBestChain = await headerChain.isHeaderInBestChain(blockHash)
+            let height = needsHeight ? await headerChain.getHeader(hash: blockHash)?.height : nil
+
+            // Read only now: the entry may have changed during the lookups,
+            // and writing an older copy back would undo that.
             guard var pending = pendingMerkleBlocks[blockHash] else { continue }
-
-            pending.isOnBestChain = await headerChain.isHeaderInBestChain(blockHash)
+            pending.isOnBestChain = isOnBestChain
             if pending.height == nil {
-                pending.height = await headerChain.getHeader(hash: blockHash)?.height
+                pending.height = height
             }
 
             if pending.isOnBestChain, let height = pending.height {
@@ -1119,15 +1198,24 @@ extension SPVSyncManager: PeerManagerDelegate {
         }
     }
 
-    private func refreshVerifiedTransactionsForReorg() async {
+    /// The best chain above `forkHeight` was replaced.
+    ///
+    /// Transactions confirmed in the blocks that lost go back to waiting:
+    /// the block that replaced theirs usually holds them too, and they can
+    /// only be confirmed in it while their bytes are still at hand. The
+    /// scan returns to the fork, because peers announce just the new tip —
+    /// the blocks beneath it on the new branch would never be fetched.
+    private func handleReorganization(above forkHeight: Int32) async {
         var events: [(TxMessage, SPVTransactionState)] = []
-        let txids = Array(verifiedTransactions.keys)
 
-        for txid in txids {
-            guard let verified = verifiedTransactions[txid] else { continue }
-            guard await !headerChain.isHeaderInBestChain(verified.blockHash) else { continue }
+        for (txid, verified) in verifiedTransactions.filter({ $0.value.height > forkHeight }) {
+            guard await !headerChain.isHeaderInBestChain(verified.blockHash),
+                  verifiedTransactions[txid]?.blockHash == verified.blockHash else {
+                continue
+            }
 
             verifiedTransactions.removeValue(forKey: txid)
+            pendingTransactions[txid] = verified.transaction
             events.append((
                 verified.transaction,
                 .reorged(previousBlockHash: verified.blockHash, previousHeight: verified.height)
@@ -1137,6 +1225,16 @@ extension SPVSyncManager: PeerManagerDelegate {
         for event in events {
             delegateEvents.yield(.transaction(event.0, event.1))
         }
+
+        guard let nextHeight = nextFilteredHeight, nextHeight > forkHeight + 1 else { return }
+
+        logger.info("Chain reorganized above height \(forkHeight); rescanning from there")
+        filteredBlocksInFlight = filteredBlocksInFlight.filter { $0.value <= forkHeight }
+        if filteredBlocksInFlight.isEmpty {
+            filteredWindowPeer = nil
+            filteredBlockRequestTime = nil
+        }
+        nextFilteredHeight = forkHeight + 1
     }
 }
 

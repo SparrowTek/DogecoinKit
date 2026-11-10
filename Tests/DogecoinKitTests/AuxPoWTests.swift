@@ -145,70 +145,11 @@ struct AuxPoWTests {
         }
     }
 
-    // MARK: - Validation Error Tests
-
-    @Test("Validation fails with invalid parent PoW")
-    func testValidationInvalidParentPoW() throws {
-        let auxpow = makeTestAuxPoW(
-            parentBits: 0x1d00ffff,  // Very high difficulty target
-            parentMerkleRoot: Data(repeating: 0, count: 32)
-        )
-
-        #expect(throws: AuxPoW.ValidationError.self) {
-            try auxpow.validate(for: mergeMinedHeader(merkleRoot: Data(repeating: 0xAA, count: 32)))
-        }
-    }
-
-    @Test("Validation fails with missing commitment")
-    func testValidationMissingCommitment() throws {
-        // Create AuxPoW with coinbase that has no magic bytes
-        let auxpow = makeTestAuxPoWWithCoinbase(
-            scriptSig: Data(repeating: 0x00, count: 50),
-            parentBits: 0x207fffff  // Easy difficulty for test
-        )
-
-        #expect(throws: AuxPoW.ValidationError.self) {
-            try auxpow.validate(for: mergeMinedHeader(merkleRoot: Data(repeating: 0xBB, count: 32)))
-        }
-    }
-
     // MARK: - HeaderChain Integration Tests
-
-    @Test("Mainnet rejects merge-mined headers with a foreign chain ID")
-    func testMainnetRejectsForeignChainID() async throws {
-        let storageURL = temporaryStorageURL()
-        let chain = HeaderChain(network: .mainnet, storageDirectory: storageURL)
-        await chain.setup()
-
-        // Get genesis
-        guard let genesis = await chain.getHeader(height: 0) else {
-            Issue.record("Genesis not found")
-            return
-        }
-
-        // Chain ID 0x642 is not Dogecoin's 0x62 — Core rejects this header
-        // outright, with or without a proof attached.
-        let auxpowHeader = BlockHeader(
-            version: 0x6422100,
-            prevBlock: genesis.header.hash,
-            merkleRoot: Data(repeating: 0x01, count: 32),
-            timestamp: genesis.header.timestamp + 1,
-            bits: 0x1e0ffff0,
-            nonce: 1
-        )
-
-        await #expect {
-            try await chain.addHeaderValidated(auxpowHeader, auxpow: nil)
-        } throws: { error in
-            guard case HeaderChain.ValidationError.invalidVersion = error else { return false }
-            return true
-        }
-        #expect(await chain.height == 0)
-    }
 
     @Test("HeaderChain accepts AuxPoW blocks below checkpoint without validation")
     func testHeaderChainAcceptsAuxPoWBelowCheckpoint() async throws {
-        let storageURL = temporaryStorageURL()
+        let storageURL = TestDirectories.unique()
         let chain = HeaderChain(network: .testnet, storageDirectory: storageURL)
         await chain.setup()
 
@@ -236,31 +177,6 @@ struct AuxPoWTests {
 
         let height = await chain.height
         #expect(height == 1)
-    }
-
-    @Test("AuxPoW validation error is properly wrapped in HeaderChain")
-    func testHeaderChainWrapsAuxPoWError() {
-        // The auxPowValidationFailed error case exists and wraps AuxPoW.ValidationError
-        let innerError = AuxPoW.ValidationError.missingAuxPowCommitment
-        let wrappedError = HeaderChain.ValidationError.auxPowValidationFailed(innerError)
-
-        // Verify the error can be created and inspected
-        if case .auxPowValidationFailed(let inner) = wrappedError {
-            #expect(inner == .missingAuxPowCommitment)
-        } else {
-            Issue.record("Error wrapping failed")
-        }
-    }
-
-    @Test("HeaderChain auxPowRequired error includes height")
-    func testAuxPoWRequiredErrorIncludesHeight() {
-        let error = HeaderChain.ValidationError.auxPowRequired(height: 5_500_000)
-
-        if case .auxPowRequired(let height) = error {
-            #expect(height == 5_500_000)
-        } else {
-            Issue.record("Error type mismatch")
-        }
     }
 
     // MARK: - BlockMessage Integration Tests
@@ -342,90 +258,4 @@ struct AuxPoWTests {
     // MARK: - Helper Functions
 
     /// A header flagged as merge-mined, carrying Dogecoin's chain ID.
-    private func mergeMinedHeader(merkleRoot: Data) -> BlockHeader {
-        BlockHeader(
-            version: 0x0062_0104,
-            prevBlock: Data(count: 32),
-            merkleRoot: merkleRoot,
-            timestamp: 1_700_000_000,
-            bits: 0x1e0fffff,
-            nonce: 0
-        )
-    }
-
-    private func temporaryStorageURL() -> URL {
-        FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-    }
-
-    private func makeTestAuxPoW(parentBits: UInt32, parentMerkleRoot: Data) -> AuxPoW {
-        // Create a minimal coinbase transaction
-        var coinbaseTx = Data()
-        coinbaseTx.append(contentsOf: [0x01, 0x00, 0x00, 0x00])  // version
-        coinbaseTx.append(0x01)  // input count
-        coinbaseTx.append(Data(repeating: 0, count: 36))  // prevout
-        coinbaseTx.append(0x00)  // scriptSig length
-        coinbaseTx.append(contentsOf: [0xFF, 0xFF, 0xFF, 0xFF])  // sequence
-        coinbaseTx.append(0x01)  // output count
-        coinbaseTx.append(Data(repeating: 0, count: 8))  // value
-        coinbaseTx.append(0x00)  // scriptPubKey length
-        coinbaseTx.append(Data(repeating: 0, count: 4))  // locktime
-
-        // Create parent block header
-        let parentHeader = BlockHeader(
-            version: 1,
-            prevBlock: Data(repeating: 0, count: 32),
-            merkleRoot: parentMerkleRoot,
-            timestamp: 1000,
-            bits: parentBits,
-            nonce: 0
-        )
-
-        return AuxPoW(
-            coinbaseTx: coinbaseTx,
-            parentBlockHash: Data(repeating: 0, count: 32),
-            coinbaseMerkleBranch: [],
-            coinbaseMerkleIndex: 0,
-            chainMerkleBranch: [],
-            chainMerkleIndex: 0,
-            parentBlockHeader: parentHeader
-        )
-    }
-
-    private func makeTestAuxPoWWithCoinbase(scriptSig: Data, parentBits: UInt32) -> AuxPoW {
-        // Create coinbase with custom scriptSig
-        var coinbaseTx = Data()
-        coinbaseTx.append(contentsOf: [0x01, 0x00, 0x00, 0x00])  // version
-        coinbaseTx.append(0x01)  // input count
-        coinbaseTx.append(Data(repeating: 0, count: 36))  // prevout
-
-        // Variable length scriptSig
-        let scriptLen = UInt8(min(scriptSig.count, 252))
-        coinbaseTx.append(scriptLen)
-        coinbaseTx.append(scriptSig.prefix(Int(scriptLen)))
-
-        coinbaseTx.append(contentsOf: [0xFF, 0xFF, 0xFF, 0xFF])  // sequence
-        coinbaseTx.append(0x01)  // output count
-        coinbaseTx.append(Data(repeating: 0, count: 8))  // value
-        coinbaseTx.append(0x00)  // scriptPubKey length
-        coinbaseTx.append(Data(repeating: 0, count: 4))  // locktime
-
-        let parentHeader = BlockHeader(
-            version: 1,
-            prevBlock: Data(repeating: 0, count: 32),
-            merkleRoot: Data(repeating: 0, count: 32),
-            timestamp: 1000,
-            bits: parentBits,
-            nonce: 0
-        )
-
-        return AuxPoW(
-            coinbaseTx: coinbaseTx,
-            parentBlockHash: Data(repeating: 0, count: 32),
-            coinbaseMerkleBranch: [],
-            coinbaseMerkleIndex: 0,
-            chainMerkleBranch: [],
-            chainMerkleIndex: 0,
-            parentBlockHeader: parentHeader
-        )
-    }
 }

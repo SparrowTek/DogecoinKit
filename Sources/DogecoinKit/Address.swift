@@ -219,7 +219,8 @@ public struct DogecoinAddress: Sendable, Equatable, Hashable {
         }
     }
 
-    /// The pubkey hash of this address
+    /// The P2PKH output script (`76a914<hash160>88ac`) as hex; throws
+    /// `DogecoinError.invalidAddress` for a P2SH address
     public var pubkeyHash: String {
         get throws {
             try Address.toPubkeyHash(value)

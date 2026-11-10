@@ -26,14 +26,14 @@ public struct ElectrumServerList: Sendable {
     public static let mainnetServers: [ElectrumServer] = [
         ElectrumServer(host: "electrum1.cipig.net", port: 20060, useSSL: true, network: .mainnet),
         ElectrumServer(host: "electrum2.cipig.net", port: 20060, useSSL: true, network: .mainnet),
-        ElectrumServer(host: "electrum3.cipig.net", port: 20060, useSSL: true, network: .mainnet),
     ]
 
     // MARK: - Testnet Servers
 
-    public static let testnetServers: [ElectrumServer] = [
-        ElectrumServer(host: "electrum-testnet.cipig.net", port: 20063, useSSL: true, network: .testnet),
-    ]
+    /// Empty: no public Dogecoin testnet Electrum server is known to be
+    /// running. Pass your own to
+    /// ``ElectrumSyncManager/init(network:servers:)``.
+    public static let testnetServers: [ElectrumServer] = []
 
     // MARK: - Server Selection
 

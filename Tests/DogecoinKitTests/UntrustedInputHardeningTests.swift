@@ -270,6 +270,31 @@ struct UntrustedInputHardeningTests {
         }
     }
 
+    // MARK: - Headers message size
+
+    @Test("A headers message may hold 2,000 headers and not one more")
+    func headersMessageCount() {
+        func payload(count: Int) -> Data {
+            let header = BlockHeader(
+                version: 2,
+                prevBlock: Data(repeating: 0x11, count: 32),
+                merkleRoot: Data(repeating: 0x22, count: 32),
+                timestamp: 1,
+                bits: 0x1e0ffff0,
+                nonce: 0
+            )
+            let entry = header.serializeCore() + Data([0x00])
+            var payload = VarInt(UInt64(count)).serialize()
+            for _ in 0..<count {
+                payload.append(entry)
+            }
+            return payload
+        }
+
+        #expect(HeadersMessage.parse(from: payload(count: 2_000))?.entries.count == 2_000)
+        #expect(HeadersMessage.parse(from: payload(count: 2_001)) == nil)
+    }
+
     // MARK: - Electrum server policy
 
     @Test("Default Electrum server lists are SSL-only")
@@ -277,6 +302,5 @@ struct UntrustedInputHardeningTests {
         #expect(ElectrumServerList.mainnetServers.allSatisfy { $0.useSSL })
         #expect(ElectrumServerList.testnetServers.allSatisfy { $0.useSSL })
         #expect(!ElectrumServerList.mainnetServers.isEmpty)
-        #expect(!ElectrumServerList.testnetServers.isEmpty)
     }
 }

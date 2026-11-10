@@ -113,8 +113,24 @@ public actor PeerManager {
     }
     private var addrBudgetByPeer: [UUID: AddrBudget] = [:]
 
-    /// Pending transactions waiting to be requested by peers
-    private var pendingTransactions: [Data: TxMessage] = [:]
+    /// A transaction on offer to peers
+    private struct Announcement {
+        let transaction: TxMessage
+        /// Counts the times the transaction was announced, so the end of an
+        /// earlier announcement's window leaves a later one alone
+        var generation = 0
+        var wasFetched = false
+        var waiters: [UUID: CheckedContinuation<Void, any Error>] = [:]
+    }
+
+    /// Transactions announced to peers, by txid in internal byte order
+    private var announcements: [Data: Announcement] = [:]
+
+    /// How long a broadcast waits for a peer to ask for the transaction
+    private let broadcastTimeout: Duration
+
+    /// How long an announced transaction stays on offer
+    private let announcementLifetime: Duration = .seconds(60)
 
     private let makeStream: ByteStreamFactory
     private let dnsSeeds: [String]
@@ -159,13 +175,15 @@ public actor PeerManager {
         streamFactory: @escaping ByteStreamFactory,
         dnsSeeds: [String],
         fallbackNodes: [(host: String, port: UInt16)],
-        banStore: UserDefaults? = .standard
+        banStore: UserDefaults? = .standard,
+        broadcastTimeout: Duration = .seconds(15)
     ) {
         self.network = network
         self.makeStream = streamFactory
         self.dnsSeeds = dnsSeeds
         self.fallbackNodes = fallbackNodes
         self.banStore = banStore
+        self.broadcastTimeout = broadcastTimeout
 
         // Inline banned peer loading (can't call actor-isolated methods from init)
         if let data = banStore?.data(forKey: Self.bannedPeersKey),
@@ -350,7 +368,21 @@ public actor PeerManager {
         return try await broadcastTransaction(txMessage)
     }
 
-    /// Broadcast a transaction to the network
+    /// Announces a transaction to every connected peer and waits until one
+    /// of them has asked for it.
+    ///
+    /// An announcement only tells peers the transaction exists; it has left
+    /// this device once a peer fetches it. Returning before that reported
+    /// transactions as sent that no peer ever received. A peer that fetches
+    /// a transaction may still decline to relay it.
+    ///
+    /// Cancelling the calling task does not withdraw the announcement: the
+    /// call still ends, one way or the other, once a peer asks or the wait
+    /// runs out.
+    /// - Returns: The transaction id, in display byte order
+    /// - Throws: `DogecoinError.noPeersAvailable` with no peer connected,
+    ///   or `DogecoinError.broadcastFailed` when no peer asks for the
+    ///   transaction in time — it is then no longer on offer
     public func broadcastTransaction(_ txMessage: TxMessage) async throws -> String {
         let readyPeers = connectedPeers
         guard !readyPeers.isEmpty else {
@@ -360,7 +392,11 @@ public actor PeerManager {
         let txid = txMessage.txidInternal
         let txidHex = txMessage.txidHex
 
-        pendingTransactions[txid] = txMessage
+        // Announcing a transaction again gives it a whole window of its own.
+        var announcement = announcements[txid] ?? Announcement(transaction: txMessage)
+        announcement.generation += 1
+        let generation = announcement.generation
+        announcements[txid] = announcement
 
         logger.info("Broadcasting transaction: \(txidHex)")
 
@@ -370,32 +406,80 @@ public actor PeerManager {
             await peer.sendInv(inventory: [inv])
         }
 
-        // Schedule cleanup of pending transaction after 60 seconds
-        Task { [weak self] in
-            try? await Task.sleep(for: .seconds(60))
-            guard !Task.isCancelled else { return }
-            await self?.removePendingTransaction(txid)
+        Task { [weak self, announcementLifetime] in
+            try? await Task.sleep(for: announcementLifetime)
+            await self?.endAnnouncement(of: txid, generation: generation)
         }
 
+        try await waitUntilFetched(txid)
         return txidHex
     }
 
-    private func removePendingTransaction(_ txid: Data) {
-        pendingTransactions.removeValue(forKey: txid)
+    /// Returns once a peer has fetched the announced transaction.
+    private func waitUntilFetched(_ txid: Data) async throws {
+        guard let announcement = announcements[txid] else {
+            throw DogecoinError.broadcastFailed("No peer asked for the transaction")
+        }
+        // A peer may have asked while the others were still being told.
+        guard !announcement.wasFetched else { return }
+
+        let waiter = UUID()
+        let timeout = Task { [weak self, broadcastTimeout] in
+            try? await Task.sleep(for: broadcastTimeout)
+            guard !Task.isCancelled else { return }
+            await self?.stopWaiting(waiter, for: txid)
+        }
+        defer { timeout.cancel() }
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            announcements[txid]?.waiters[waiter] = continuation
+        }
+    }
+
+    /// The wait for a peer ran out. With nobody else waiting either, the
+    /// transaction is taken off offer: one reported as failed must not go
+    /// out afterwards.
+    private func stopWaiting(_ waiter: UUID, for txid: Data) {
+        guard var announcement = announcements[txid],
+              let continuation = announcement.waiters.removeValue(forKey: waiter) else {
+            return
+        }
+        announcements[txid] = announcement.waiters.isEmpty ? nil : announcement
+
+        logger.error("No peer asked for transaction \(announcement.transaction.txidHex)")
+        continuation.resume(throwing: DogecoinError.broadcastFailed("No peer asked for the transaction"))
+    }
+
+    private func endAnnouncement(of txid: Data, generation: Int) {
+        guard let announcement = announcements[txid],
+              announcement.generation == generation,
+              announcement.waiters.isEmpty else {
+            return
+        }
+        announcements[txid] = nil
     }
 
     /// Handle a getdata request from a peer
     internal func handleGetData(_ inventory: [InventoryVector], from peer: Peer) async {
-        for item in inventory {
-            switch item.type {
-            case .transaction:
-                if let tx = pendingTransactions[item.hash] {
-                    logger.info("Sending transaction \(tx.txidHex) to peer \(peer.host)")
-                    await peer.sendTransaction(tx)
-                }
-            default:
-                break
-            }
+        for item in inventory where item.type == .transaction {
+            guard let transaction = announcements[item.hash]?.transaction else { continue }
+
+            logger.info("Sending transaction \(transaction.txidHex) to peer \(peer.host)")
+            guard await peer.sendTransaction(transaction) else { continue }
+            markFetched(item.hash)
+        }
+    }
+
+    private func markFetched(_ txid: Data) {
+        guard var announcement = announcements[txid] else { return }
+
+        let waiters = Array(announcement.waiters.values)
+        announcement.wasFetched = true
+        announcement.waiters = [:]
+        announcements[txid] = announcement
+
+        for waiter in waiters {
+            waiter.resume()
         }
     }
 
@@ -526,24 +610,6 @@ public actor PeerManager {
                 connectToDiscoveredPeers()
             }
         }
-    }
-
-    private func handleGetAddr(from peer: Peer) async {
-        let candidates = Array(discoveredAddresses.prefix(100))
-
-        guard !candidates.isEmpty else { return }
-
-        let now = UInt32(Date().timeIntervalSince1970)
-        let entries: [AddrMessage.Entry] = candidates.compactMap { host, port in
-            guard let address = NetworkAddress.from(host: host, port: port) else { return nil }
-            guard address.isRoutable else { return nil }
-            return AddrMessage.Entry(timestamp: now, address: address)
-        }
-
-        let addrMessage = AddrMessage(entries: entries)
-        let payload = addrMessage.serialize()
-        let message = ProtocolMessage(network: network, command: ProtocolMessage.Command.addr, payload: payload)
-        await peer.send(message)
     }
 
     private func connectToDiscoveredPeers() {
@@ -688,10 +754,6 @@ extension PeerManager: PeerDelegate {
                 return
             }
             handleAddrMessage(addrMessage, from: peer)
-        }
-
-        if message.command == ProtocolMessage.Command.getaddr {
-            await handleGetAddr(from: peer)
         }
 
         // Forward to delegate for other handling — inline, so messages keep

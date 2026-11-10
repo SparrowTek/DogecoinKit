@@ -140,12 +140,15 @@ public final class HDWallet: Sendable {
 
     /// Derive an address at a custom derivation path
     /// - Parameters:
-    ///   - path: The derivation path (e.g., "m/44'/3'/0'/0/0")
+    ///   - path: The derivation path (e.g., "m/44'/3'/0'/0/0"): `m` followed
+    ///     by one or more `/index` components, each below 2³¹ and optionally
+    ///     marked hardened with `'`, `h`, `H`, or `p`
     /// - Returns: The derived P2PKH address
-    /// - Throws: `DogecoinError.derivationFailed` if derivation fails
+    /// - Throws: `DogecoinError.derivationFailed` if the path is malformed or
+    ///   derivation fails
     public func deriveAddress(path: String) async throws -> String {
         try await Dogecoin.ensureInitialized()
-        try Self.validateLength(of: path)
+        try Self.validate(path: path)
         ECC.armCurrentThread()
 
         var masterKeyBuffer = Self.paddedCString(masterKey, length: Int(HDKEYLEN))
@@ -212,12 +215,14 @@ public final class HDWallet: Sendable {
 
     /// Derive a private key in WIF format at a custom derivation path
     /// - Parameters:
-    ///   - path: The derivation path (e.g., "m/44'/3'/0'/0/0")
+    ///   - path: The derivation path (e.g., "m/44'/3'/0'/0/0"), in the form
+    ///     ``deriveAddress(path:)`` accepts
     /// - Returns: The derived private key in WIF format
-    /// - Throws: `DogecoinError.derivationFailed` if derivation fails
+    /// - Throws: `DogecoinError.derivationFailed` if the path is malformed or
+    ///   derivation fails
     public func derivePrivateKey(path: String) async throws -> String {
         try await Dogecoin.ensureInitialized()
-        try Self.validateLength(of: path)
+        try Self.validate(path: path)
         ECC.armCurrentThread()
 
         var masterKeyBuffer = Self.paddedCString(masterKey, length: Int(HDKEYLEN))
@@ -297,7 +302,9 @@ public func generateMnemonic(strength: MnemonicStrength = .words12) async throws
     while strengthBuffer.count < 4 { strengthBuffer.append(0) }
     defer { zeroize(&mnemonic) }
 
-    let result = generateRandomEnglishMnemonic(&strengthBuffer, &mnemonic)
+    let result = mnemonicGenerationLock.withLock {
+        generateRandomEnglishMnemonic(&strengthBuffer, &mnemonic)
+    }
 
     guard result == 0 else {
         throw DogecoinError.keyGenerationFailed
@@ -313,13 +320,47 @@ public func generateMnemonic(strength: MnemonicStrength = .words12) async throws
     return phrase
 }
 
+/// libdogecoin assembles a new mnemonic's checksum in a function-static
+/// buffer, so two phrases must never be generated at the same time: the
+/// loser would come out with the wrong last word and fail verification.
+private let mnemonicGenerationLock = NSLock()
+
 private extension HDWallet {
-    /// libdogecoin documents paths as at most `KEYPATHMAXLEN - 1` characters
-    /// and asserts — aborting the process — on very long ones.
-    static func validateLength(of path: String) throws {
-        guard path.utf8.count < Int(KEYPATHMAXLEN) else {
+    /// Checks a derivation path before libdogecoin sees it.
+    ///
+    /// libdogecoin does not report a path it cannot parse. Its key
+    /// derivation hands back whatever it had derived up to that point — the
+    /// *parent's* private key for `m/44'/3'/0'/0/x`, an all-zero key for a
+    /// path without the leading `m/` — and an index of 2³¹ or more silently
+    /// becomes a different, hardened child. It also asserts, aborting the
+    /// process, on very long paths. So only `m` followed by one or more
+    /// `/index` components gets through, each a number below 2³¹ with an
+    /// optional hardening mark.
+    static func validate(path: String) throws {
+        var components = path.split(separator: "/", omittingEmptySubsequences: false)
+
+        guard path.utf8.count < Int(KEYPATHMAXLEN),
+              components.count > 1,
+              components.removeFirst() == "m",
+              components.allSatisfy(isValidPathComponent) else {
             throw DogecoinError.derivationFailed
         }
+    }
+
+    /// A child index below 2³¹ in decimal digits, optionally followed by one
+    /// of the hardening marks libdogecoin understands.
+    static func isValidPathComponent(_ component: Substring) -> Bool {
+        var digits = component
+        if let mark = digits.last, "'hHp".contains(mark) {
+            digits.removeLast()
+        }
+
+        guard !digits.isEmpty,
+              digits.utf8.allSatisfy({ (UInt8(ascii: "0")...UInt8(ascii: "9")).contains($0) }),
+              let index = UInt32(digits) else {
+            return false
+        }
+        return index < 0x8000_0000
     }
 
     static func stringFromCStringBuffer(_ buffer: [CChar]) -> String {

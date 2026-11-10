@@ -4,7 +4,6 @@ Generate new wallets and restore existing ones using mnemonic phrases.
 
 @Metadata {
     @PageKind(article)
-    @PageImage(purpose: card, source: "wallet-card", alt: "Creating a Dogecoin wallet")
 }
 
 ## Overview
@@ -33,7 +32,6 @@ func createWallet() async throws {
     // Access the recovery phrase
     if let mnemonic = wallet.mnemonic {
         print("Recovery phrase: \(mnemonic)")
-        // Example: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
     }
 }
 ```
@@ -135,7 +133,18 @@ The validation checks:
 - Words are from the BIP39 English word list
 - Checksum is valid
 
-> Note: ``HDWallet/init(mnemonic:passphrase:network:)`` runs the same validation itself and throws ``DogecoinError/invalidMnemonic`` for an unknown word or a bad checksum. BIP39 can turn any string into a seed, so without this check a single mistyped word would silently restore a different, empty wallet. Trim pasted input first, because surrounding whitespace also fails validation. To tell the user which word is wrong, use ``validateMnemonicDetailed(_:)``.
+> Note: ``HDWallet/init(mnemonic:passphrase:network:)`` runs the same validation itself and throws ``DogecoinError/invalidMnemonic`` for an unknown word or a bad checksum. BIP39 can turn any string into a seed, so without this check a single mistyped word would silently restore a different, empty wallet.
+
+Validation is exact: words must be lowercase and separated by single spaces, with nothing before or after, so normalize typed or pasted input first:
+
+```swift
+let phrase = userInput
+    .lowercased()
+    .split(whereSeparator: \.isWhitespace)
+    .joined(separator: " ")
+```
+
+To tell the user which word is wrong, pass the normalized phrase to ``validateMnemonicDetailed(_:)``.
 
 ## Generating Mnemonics Directly
 
@@ -222,52 +231,33 @@ Each account has its own set of receiving and change addresses, derived independ
 
 ### Storing the Mnemonic
 
-Never store mnemonics in plain text. On Apple platforms, use the Keychain (on Android, the Android Keystore):
+Never store mnemonics in plain text. On Apple platforms, use ``SecureKeyStorage``, which keeps them in the Keychain (on Android, use the Android Keystore):
 
 ```swift
-import Security
+let storage = SecureKeyStorage(serviceName: "com.yourapp.wallet")
 
-func storeMnemonic(_ mnemonic: String, identifier: String) throws {
-    let data = Data(mnemonic.utf8)
+// Create a wallet and store its recovery phrase in one step
+let (wallet, keychainID) = try await storage.createAndStoreWallet(
+    strength: .words12,
+    network: .mainnet
+)
 
-    let query: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrAccount as String: identifier,
-        kSecAttrService as String: "com.yourapp.wallet",
-        kSecValueData as String: data,
-        kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-    ]
+// Or validate and store a phrase the user typed in
+let (imported, importedID) = try await storage.importAndStoreWallet(
+    mnemonic: userInput,
+    network: .mainnet
+)
 
-    // Delete any existing item
-    SecItemDelete(query as CFDictionary)
+// Persist `keychainID` (never the phrase) in your app's database.
+// Later, rebuild the wallet from the Keychain:
+let restored = try await storage.restoreWallet(keychainID: keychainID)
 
-    // Add the new item
-    let status = SecItemAdd(query as CFDictionary, nil)
-    guard status == errSecSuccess else {
-        throw KeychainError.unableToStore
-    }
-}
+// Read the phrase back to show it on a backup screen
+let credentials = try await storage.retrieveWalletCredentials(id: keychainID)
+let words = credentials.mnemonic.split(separator: " ")
 
-func retrieveMnemonic(identifier: String) throws -> String {
-    let query: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrAccount as String: identifier,
-        kSecAttrService as String: "com.yourapp.wallet",
-        kSecReturnData as String: true,
-        kSecMatchLimit as String: kSecMatchLimitOne
-    ]
-
-    var result: AnyObject?
-    let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-    guard status == errSecSuccess,
-          let data = result as? Data,
-          let mnemonic = String(data: data, encoding: .utf8) else {
-        throw KeychainError.unableToRetrieve
-    }
-
-    return mnemonic
-}
+// Remove the wallet
+try await storage.deleteWalletCredentials(id: keychainID)
 ```
 
 ### Security Recommendations
@@ -276,7 +266,7 @@ func retrieveMnemonic(identifier: String) throws -> String {
 2. **Use secure displays** — Prevent screenshots when showing mnemonics
 3. **Encourage backups** — Prompt users to write down their recovery phrase
 4. **Verify backups** — Ask users to confirm words from their backup
-5. **Device-only storage** — Use `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`
+5. **Device-only storage** — ``SecureKeyStorage`` already stores items as `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`
 
 ## Error Handling
 

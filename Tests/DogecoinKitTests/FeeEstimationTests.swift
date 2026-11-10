@@ -148,39 +148,38 @@ struct FeeEstimationTests {
     // MARK: - All Priorities Tests
 
     @Test("Estimate all priorities")
-    func testEstimateAllPriorities() {
+    func testEstimateAllPriorities() throws {
         let fees = FeeEstimation.estimateAllPriorities(inputCount: 1, outputCount: 2)
 
         #expect(fees.count == 3)
-        #expect(fees[.low] != nil)
-        #expect(fees[.standard] != nil)
-        #expect(fees[.high] != nil)
+        let low = try #require(fees[.low])
+        let standard = try #require(fees[.standard])
+        let high = try #require(fees[.high])
 
         // Verify ordering: low < standard < high
-        #expect(fees[.low]!.koinu < fees[.standard]!.koinu)
-        #expect(fees[.standard]!.koinu < fees[.high]!.koinu)
+        #expect(low.koinu < standard.koinu)
+        #expect(standard.koinu < high.koinu)
     }
 
     // MARK: - UTXO Selection Tests
 
     @Test("Select UTXOs with fee - sufficient funds")
-    func testSelectUTXOsWithFeeSufficient() {
+    func testSelectUTXOsWithFeeSufficient() throws {
         let utxos = [
             UTXO(txid: "tx1", vout: 0, address: "D1", amount: DogecoinAmount(doge: 100), confirmations: 10),
             UTXO(txid: "tx2", vout: 0, address: "D1", amount: DogecoinAmount(doge: 50), confirmations: 10)
         ]
 
         let targetAmount = DogecoinAmount(doge: 30)
-        let result = FeeEstimation.selectUTXOsWithFee(targetAmount: targetAmount, utxos: utxos)
+        let result = try #require(FeeEstimation.selectUTXOsWithFee(targetAmount: targetAmount, utxos: utxos))
 
-        #expect(result != nil)
-        #expect(result!.utxos.count == 1) // Should only need the 100 DOGE UTXO
-        #expect(result!.utxos.first?.txid == "tx1") // Largest first
-        #expect(result!.fee.koinu > 0) // Fee should be calculated
+        #expect(result.utxos.count == 1) // Should only need the 100 DOGE UTXO
+        #expect(result.utxos.first?.txid == "tx1") // Largest first
+        #expect(result.fee.koinu > 0) // Fee should be calculated
     }
 
     @Test("Select UTXOs with fee - needs multiple")
-    func testSelectUTXOsWithFeeMultiple() {
+    func testSelectUTXOsWithFeeMultiple() throws {
         let utxos = [
             UTXO(txid: "tx1", vout: 0, address: "D1", amount: DogecoinAmount(doge: 30), confirmations: 10),
             UTXO(txid: "tx2", vout: 0, address: "D1", amount: DogecoinAmount(doge: 40), confirmations: 10),
@@ -188,11 +187,10 @@ struct FeeEstimationTests {
         ]
 
         let targetAmount = DogecoinAmount(doge: 60)
-        let result = FeeEstimation.selectUTXOsWithFee(targetAmount: targetAmount, utxos: utxos)
+        let result = try #require(FeeEstimation.selectUTXOsWithFee(targetAmount: targetAmount, utxos: utxos))
 
-        #expect(result != nil)
         // Need at least 2 UTXOs to cover 60 DOGE + fee
-        #expect(result!.utxos.count >= 2)
+        #expect(result.utxos.count >= 2)
     }
 
     @Test("Select UTXOs with fee - insufficient funds")

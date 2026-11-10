@@ -8,8 +8,9 @@ public enum NetworkConstants {
     /// Magic bytes for mainnet
     public static let mainnetMagic: UInt32 = 0xC0C0C0C0
 
-    /// Magic bytes for testnet
-    public static let testnetMagic: UInt32 = 0xFCC1B7DC
+    /// Magic bytes for testnet: `fc c1 b7 dc` on the wire. Messages carry
+    /// the magic little-endian, so the bytes read in reverse here.
+    public static let testnetMagic: UInt32 = 0xDCB7C1FC
 
     /// Default mainnet port
     public static let mainnetPort: UInt16 = 22556
@@ -20,8 +21,9 @@ public enum NetworkConstants {
     /// User agent string
     public static let userAgent = "/DogecoinKit:0.1.0/"
 
-    /// Services supported (NODE_NETWORK)
-    public static let services: UInt64 = 1
+    /// Services advertised to peers: none. An SPV client serves neither
+    /// blocks nor headers, so it does not claim `NODE_NETWORK`.
+    public static let services: UInt64 = 0
 
     /// Maximum message payload size (32 MB)
     public static let maxPayloadSize: UInt32 = 32 * 1024 * 1024

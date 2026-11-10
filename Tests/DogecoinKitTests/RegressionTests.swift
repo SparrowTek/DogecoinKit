@@ -168,10 +168,8 @@ struct FeeEstimationBoundsTests {
 @Suite("Live Peer Discovery")
 struct LivePeerDiscoveryTests {
 
-    @Test("DNS seeds resolve and peers complete the handshake")
+    @Test("DNS seeds resolve and peers complete the handshake", .enabled(if: TestEnvironment.runsLiveP2PTests))
     func discoversPeers() async throws {
-        guard ProcessInfo.processInfo.environment["DOGECOINKIT_LIVE_P2P"] == "1" else { return }
-
         let manager = PeerManager(network: .mainnet)
         await manager.start()
 
@@ -286,7 +284,7 @@ struct BlockVersionRuleTests {
 
     @Test("HeaderChain rejects a merge-mined header before merged mining began")
     func earlyAuxPoWRejected() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("EarlyAuxPoW-\(UUID().uuidString)")
+        let directory = TestDirectories.unique()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let chain = HeaderChain(network: .mainnet, storageDirectory: directory)
         await chain.setup()

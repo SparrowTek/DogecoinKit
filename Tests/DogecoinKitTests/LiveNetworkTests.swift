@@ -34,10 +34,6 @@ private final class LivePeerObserver: PeerDelegate, @unchecked Sendable {
 @Suite("Live P2P Network")
 struct LiveNetworkTests {
 
-    private var enabled: Bool {
-        ProcessInfo.processInfo.environment["DOGECOINKIT_LIVE_P2P"] == "1"
-    }
-
     private func waitFor(_ timeout: Duration, _ condition: () -> Bool) async -> Bool {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
@@ -48,11 +44,12 @@ struct LiveNetworkTests {
         return condition()
     }
 
-    @Test("Headers from a live node pass full validation, AuxPoW and DigiShield included")
+    @Test(
+        "Headers from a live node pass full validation, AuxPoW and DigiShield included",
+        .enabled(if: TestEnvironment.runsLiveP2PTests)
+    )
     func liveHeadersValidate() async throws {
-        guard enabled else { return }
-
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("LiveP2P-\(UUID().uuidString)")
+        let directory = TestDirectories.unique()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let database = try HeaderDatabase(path: directory.appendingPathComponent("headers.sqlite").path)
         try database.insertHeaders(RealChainFixtures.storedAncestors().map { HeaderRecord(storedHeader: $0, isInBestChain: true) })

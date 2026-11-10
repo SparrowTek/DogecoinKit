@@ -1,10 +1,9 @@
 # ``DogecoinKit``
 
-Build Dogecoin wallets for iOS, macOS, and Android with a pure Swift SDK.
+Build Dogecoin wallets for iOS, macOS, and Android with a Swift-native SDK.
 
 @Metadata {
     @DisplayName("DogecoinKit")
-    @PageImage(purpose: icon, source: "dogecoin-icon", alt: "The DogecoinKit framework icon")
 }
 
 ## Overview
@@ -16,7 +15,7 @@ Whether you're building a simple wallet app or integrating Dogecoin payments int
 - Generate HD wallets with BIP39 mnemonic phrases
 - Derive addresses following BIP44 standards
 - Build and sign transactions
-- Sync with the Dogecoin network using SPV
+- Sync with the Dogecoin network through Electrum servers or with SPV
 
 ### Quick Example
 
@@ -48,6 +47,7 @@ func quickStart() async throws {
 - ``Dogecoin``
 - ``DogecoinNetwork``
 - ``DogecoinError``
+- ``WalletMode``
 
 ### Wallet Management
 
@@ -57,11 +57,30 @@ func quickStart() async throws {
 - ``MnemonicStrength``
 - ``generateMnemonic(strength:)``
 - ``validateMnemonic(_:)``
+- ``validateMnemonicDetailed(_:)``
+- ``verifyMnemonic(_:language:)``
+- ``MnemonicValidationResult``
+- ``MnemonicValidationError``
+
+### BIP39 Word List
+
+- ``bip39WordCount``
+- ``getBIP39Wordlist()``
+- ``isValidBIP39Word(_:)``
+- ``bip39WordsMatching(prefix:limit:)``
+- ``bip39WordIndex(_:)``
+- ``bip39Word(at:)``
+
+### Secure Storage
+
+- ``SecureKeyStorage``
+- ``StoredWalletCredentials``
 
 ### Addresses
 
 - <doc:WorkingWithAddresses>
 - ``Address``
+- ``AddressKind``
 - ``DogecoinAddress``
 
 ### Amounts & Currency
@@ -77,15 +96,47 @@ func quickStart() async throws {
 - ``TransactionBuilder``
 - ``UTXO``
 - ``SignedTransaction``
+- ``FeeEstimation``
 - ``createTransaction(inputs:outputs:privateKey:changeAddress:fee:)``
 - ``createTransaction(inputs:outputs:signingKeysByAddress:changeAddress:fee:)``
 
-### Network & Synchronization
+### Electrum Synchronization
+
+- ``ElectrumSyncManager``
+- ``ElectrumSyncState``
+- ``BlockchainSyncManager``
+- ``BlockchainSyncDelegate``
+- ``SyncState``
+- ``ElectrumClient``
+- ``ElectrumServer``
+- ``ElectrumServerList``
+- ``ElectrumError``
+- ``ElectrumBalance``
+- ``ElectrumUTXO``
+- ``ElectrumHistoryItem``
+- ``ElectrumHeader``
+- ``ElectrumTransaction``
+- ``ElectrumScriptHash``
+- ``ElectrumSubscription``
+- ``ElectrumServerInfo``
+
+### Electrum JSON-RPC
+
+- ``ElectrumMethod``
+- ``ElectrumRequest``
+- ``ElectrumParam``
+- ``ElectrumResponse``
+- ``ElectrumRPCError``
+- ``ElectrumNull``
+
+### SPV Synchronization
 
 - <doc:SPVSynchronization>
 - ``SPVSyncManager``
 - ``SPVSyncDelegate``
 - ``SPVSyncState``
+- ``SPVTransactionState``
+- ``BloomFilter``
 - ``PeerManager``
 - ``PeerManagerDelegate``
 - ``Peer``
@@ -96,6 +147,14 @@ func quickStart() async throws {
 - ``HeaderChain``
 - ``BlockHeader``
 - ``StoredHeader``
+- ``AuxPoW``
+- ``HeaderDatabase``
+- ``HeaderRecord``
+- ``HeaderDatabaseError``
+
+### Bundled Header Caches
+
+- ``HeaderCacheMetadata``
 
 ### Protocol Messages
 
@@ -108,12 +167,23 @@ func quickStart() async throws {
 - ``VerackMessage``
 - ``InvMessage``
 - ``GetDataMessage``
+- ``NotFoundMessage``
 - ``InventoryVector``
 - ``InventoryType``
 - ``HeadersMessage``
 - ``GetHeadersMessage``
 - ``GetBlocksMessage``
+- ``TxMessage``
+- ``BlockMessage``
+- ``MerkleBlockMessage``
+- ``MerkleBlockMatches``
+- ``MerkleBlockError``
+- ``AddrMessage``
+- ``FilterLoadMessage``
+- ``FilterAddMessage``
+- ``FilterClearMessage``
 
-### Constants
+### Constants & Utilities
 
 - ``NetworkConstants``
+- ``LRUCache``

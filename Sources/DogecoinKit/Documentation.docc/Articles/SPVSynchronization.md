@@ -4,12 +4,11 @@ Sync with the Dogecoin network using Simplified Payment Verification.
 
 @Metadata {
     @PageKind(article)
-    @PageImage(purpose: card, source: "spv-card", alt: "SPV Synchronization")
 }
 
 ## Overview
 
-SPV (Simplified Payment Verification) allows mobile wallets to verify transactions without downloading the entire blockchain. Instead of storing all block data (~100 GB), an SPV client downloads only block headers (80 bytes each, roughly 500 MB for Dogecoin's 6 million+ blocks).
+SPV (Simplified Payment Verification) allows mobile wallets to verify transactions without downloading the entire blockchain. Instead of storing all block data (~100 GB), an SPV client downloads only block headers. A header is 80 bytes, but DogecoinKit keeps headers in an indexed SQLite database that takes roughly 1.5–2 GB for Dogecoin's 6.3 million+ blocks: about 1.5 GB when the current version creates it, and about 2 GB if it was created before two unused indexes were dropped, because the file isn't shrunk in place.
 
 DogecoinKit provides a complete SPV implementation using native Swift networking.
 
@@ -86,6 +85,37 @@ extension WalletSyncManager: SPVSyncDelegate {
 
 ``SPVSyncManager`` is an actor. Read its properties and call its methods with `await`, and set the delegate with `setDelegate(_:)`, because actor properties can't be assigned from outside. The manager holds its delegate weakly. Delegates must be `Sendable`, which is why `WalletSyncManager` is a `final` class with only immutable, `Sendable` stored properties. Callbacks are `async` and arrive strictly in order. For example, a transaction's `.confirmed` update never overtakes its `.unconfirmed` one. `spvSyncDidComplete` fires each time the chain catches up with its peers: once after the initial sync, and again after every new block.
 
+### Watching Your Addresses
+
+Headers alone don't tell you about your transactions. Give the manager a bloom filter (BIP 37) with ``SPVSyncManager/configureBloomFilter(elements:falsePositiveRate:tweak:flags:startHeight:)`` and it scans filtered blocks from `startHeight`, verifies each merkle proof, and reports matches through `spvSync(_:didUpdateTransaction:state:)`. Without a filter, that callback and `spvSync(_:didProcessFilteredBlock:targetHeight:)` never fire.
+
+```swift
+// A node tests the data each script pushes, never a whole script, so the
+// element to insert for a P2PKH address is its 20-byte public key hash
+func publicKeyHash(of address: String) -> Data? {
+    guard Address.kind(address) == .p2pkh,
+          let script = Address.scriptPubKey(for: address) else {
+        return nil
+    }
+    return Data(script[3..<23])  // OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+}
+
+// flags: 1 is BIP 37's BLOOM_UPDATE_ALL: the node adds every output it matches
+// to the filter, so it also matches the transaction that later spends it
+await syncManager.configureBloomFilter(
+    elements: addresses.compactMap(publicKeyHash(of:)),
+    flags: 1,
+    startHeight: birthdayHeight
+)
+
+// Later, when the wallet derives a new address
+if let element = publicKeyHash(of: newAddress) {
+    await syncManager.addBloomFilterElement(element)
+}
+```
+
+A transaction arrives as `.unconfirmed` if a peer relays it before it is mined, then as `.confirmed(blockHash:height:)`. After a chain reorganization, each affected transaction is reported as `.reorged`, and as `.confirmed` again once the block that replaced its old one holds it.
+
 ### SwiftUI Integration
 
 ```swift
@@ -135,7 +165,11 @@ extension SyncViewModel: SPVSyncDelegate {
     }
 
     func spvSync(_ manager: SPVSyncManager, didEncounterError error: Error) async {
-        state = .error(error)
+        // Most reports concern data from one peer, which has already been
+        // dropped while the sync carries on. Only a failed start stops it.
+        if case .error = await manager.state {
+            state = .error(error)
+        }
     }
 }
 
@@ -203,6 +237,8 @@ print("Current height: \(currentHeight)")
 print("Target height: \(targetHeight)")
 print("Progress: \(progress * 100)%")
 ```
+
+> Note: The header database is opened by ``SPVSyncManager/start()``, or by creating the manager with ``SPVSyncManager/create(network:storageDirectory:bundledCacheDirectory:)``. Until then `currentHeight` is `-1`, `getHeader(height:)` returns `nil`, and `getBlockLocator()` is empty.
 
 ### PeerManager
 
@@ -272,6 +308,8 @@ DogecoinKit automatically discovers peers via DNS seeds:
 | Mainnet | seed.multidoge.org, seed2.multidoge.org, seed.dogecoin.com, seed.dogechain.info |
 | Testnet | testnetseed.jrn.me.uk |
 
+If no seed yields a peer, mainnet falls back to the hard-coded nodes in ``NetworkConstants/mainnetFallbackNodes``.
+
 The discovery process:
 
 1. Query DNS seeds for peer IP addresses
@@ -322,7 +360,7 @@ let locator = await headerChain.getBlockLocator()
 
 ## Custom Storage Location
 
-Specify where to store headers:
+By default headers are stored in `Caches/DogecoinKit/headers/<network>/headers.sqlite`. Specify where to store headers:
 
 ```swift
 let storageURL = URL.documentsDirectory.appending(path: "DogecoinWallet")
@@ -335,7 +373,7 @@ let syncManager = SPVSyncManager(
 
 ## Background Sync
 
-For iOS apps, register for background fetch:
+For iOS apps, schedule a background processing task:
 
 ```swift
 @preconcurrency import BackgroundTasks
@@ -395,22 +433,21 @@ Don't forget to add the background mode capability and task identifier to your I
 Headers are processed in batches of up to 2000:
 
 ```swift
-extension WalletSyncManager: SPVSyncDelegate {
-    func spvSync(_ manager: SPVSyncManager, didReceiveHeader header: BlockHeader, height: Int32) async {
-        // Don't process every header individually
-        // Instead, wait for batch completion
-    }
+// In your SPVSyncDelegate:
+func spvSync(_ manager: SPVSyncManager, didReceiveHeader header: BlockHeader, height: Int32) async {
+    // Called for every header, up to 2,000 per batch: keep this cheap
+}
 
-    func spvSync(_ manager: SPVSyncManager, progressUpdated progress: Double, height: Int32) async {
-        // Update UI after each batch
-        // Avoid heavy UI updates for every single header
-    }
+func spvSync(_ manager: SPVSyncManager, progressUpdated progress: Double, height: Int32) async {
+    // Called once per batch: update the UI here
 }
 ```
 
 ### Throttling UI Updates
 
 ```swift
+import Observation
+
 @MainActor
 @Observable
 final class ThrottledSyncViewModel {
@@ -434,21 +471,19 @@ final class ThrottledSyncViewModel {
 
 ## Error Recovery
 
-Handle sync errors gracefully. The manager recovers from network trouble on its own. It drops peers that time out or disconnect, backs off before retrying them, bans peers that send invalid headers, and keeps syncing from the peers that remain. If every peer is lost, syncing resumes as soon as a new one connects. The delegate hears about problems with the data your wallet depends on, such as a block or merkle proof that fails verification. By the time the delegate is called, the peer that sent it has already been banned.
+Handle sync errors gracefully. The manager recovers from network trouble on its own. It drops peers that time out or disconnect, backs off before retrying them, bans peers that send invalid headers, and keeps syncing from the peers that remain. If every peer is lost, syncing resumes as soon as a new one connects. The delegate hears about problems with the data your wallet depends on, such as a block or merkle proof that fails verification. By the time the delegate is called, the peer that sent it has already been banned. The delegate also hears when `start()` can't open the header database. Nothing is syncing then, and `state` stays `.error` until you call `start()` again.
 
 ```swift
-extension WalletSyncManager: SPVSyncDelegate {
-    func spvSync(_ manager: SPVSyncManager, didEncounterError error: Error) async {
-        switch error {
-        case DogecoinError.syncFailed, is MerkleBlockError:
-            // A peer sent a block or merkle proof that failed verification.
-            // It has already been banned; sync continues with other peers.
-            print("Discarded invalid data: \(error.localizedDescription)")
-
-        default:
-            // Other error - notify user
-            showError("Sync failed: \(error.localizedDescription)")
-        }
+// In your SPVSyncDelegate:
+func spvSync(_ manager: SPVSyncManager, didEncounterError error: Error) async {
+    if case .error = await manager.state {
+        // start() couldn't open the header database, so nothing is syncing.
+        // Fix the storage problem, then call start() again.
+        showError("Sync could not start: \(error.localizedDescription)")
+    } else {
+        // A peer sent a block or merkle proof that failed verification.
+        // It has already been banned; sync continues with other peers.
+        print("Discarded invalid data: \(error.localizedDescription)")
     }
 }
 ```

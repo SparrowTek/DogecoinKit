@@ -26,14 +26,23 @@ public struct DogecoinAmount: Sendable, Equatable, Hashable, Comparable {
 
     /// Create an amount from Dogecoin
     /// - Parameter doge: The amount in Dogecoin
+    ///
+    /// Rounds to the nearest koinu. Negative and non-finite amounts become
+    /// zero; amounts too large to represent saturate at `UInt64.max`. A
+    /// `Double` holds an amount exactly to the koinu only up to about
+    /// 90 million DOGE — use ``init(dogeString:)`` or ``init(koinu:)`` where
+    /// every koinu matters.
     public init(doge: Double) {
-        guard doge.isFinite else {
+        guard doge.isFinite, doge > 0 else {
             self.koinu = 0
             return
         }
 
-        let decimal = Decimal(doge)
-        self.koinu = Self.koinuFromDecimal(decimal) ?? (doge < 0 ? 0 : UInt64.max)
+        // Scaling in binary and rounding once is as exact as a Double
+        // allows. (Converting through `Decimal(Double)` was already off by a
+        // few koinu from about a million DOGE up.)
+        let scaled = (doge * Double(Self.koinuPerDoge)).rounded()
+        self.koinu = scaled < 0x1p64 ? UInt64(scaled) : .max
     }
 
     /// Create an amount from a Dogecoin string
@@ -70,11 +79,26 @@ public struct DogecoinAmount: Sendable, Equatable, Hashable, Comparable {
     }
 
     /// Format the amount with a specific number of decimal places
+    ///
+    /// Rounds half up, in integer arithmetic, so every koinu value formats
+    /// exactly — a `Double` cannot hold amounts above about 90 million DOGE
+    /// to the koinu.
     /// - Parameter decimals: Number of decimal places (0-8)
     /// - Returns: Formatted string
     public func formatted(decimals: Int = 8) -> String {
-        let clampedDecimals = max(0, min(8, decimals))
-        return String(format: "%.\(clampedDecimals)f", doge)
+        let places = max(0, min(8, decimals))
+        let unit = Self.powerOfTen(8 - places)
+
+        // Rounded this way the sum cannot overflow, even at `UInt64.max`.
+        let quotient = koinu / unit
+        let rounded = (koinu % unit) * 2 >= unit ? quotient + 1 : quotient
+
+        let scale = Self.powerOfTen(places)
+        let whole = rounded / scale
+        guard places > 0 else { return "\(whole)" }
+
+        let fraction = String(rounded % scale)
+        return "\(whole)." + String(repeating: "0", count: places - fraction.count) + fraction
     }
 
     // MARK: - Comparable
@@ -170,10 +194,16 @@ extension DogecoinAmount {
 
 private extension DogecoinAmount {
     static let maxKoinuDecimal = Decimal(UInt64.max)
+    /// ASCII digits only: `\d` also matches other scripts' digits, which
+    /// `Decimal(string:)` then stops at, silently truncating the amount.
     static let validAmountPattern = try? NSRegularExpression(
-        pattern: #"^(?:\d+)(?:\.\d{1,8})?$"#,
+        pattern: #"^(?:[0-9]+)(?:\.[0-9]{1,8})?$"#,
         options: []
     )
+
+    static func powerOfTen(_ exponent: Int) -> UInt64 {
+        (0..<exponent).reduce(1) { power, _ in power * 10 }
+    }
 
     static func koinuFromDecimal(_ value: Decimal) -> UInt64? {
         guard value >= 0 else { return nil }

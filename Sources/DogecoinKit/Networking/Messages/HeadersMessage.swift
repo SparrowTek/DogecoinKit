@@ -202,11 +202,18 @@ public struct HeadersMessage: Sendable {
         return data
     }
 
+    /// The most headers a node puts in one message — Dogecoin Core's
+    /// `MAX_HEADERS_RESULTS`. A message this full means the sender has more;
+    /// one that holds more than this is not from an honest node.
+    static let maximumEntries = 2_000
+
     /// Parse from Data
     public static func parse(from data: Data) -> HeadersMessage? {
         // Bound the peer-supplied header count by the remaining bytes
-        // (each entry is at least an 80-byte header).
-        guard let (count, varIntSize) = data.readBoundedCount(at: 0, minItemSize: BlockHeader.size) else { return nil }
+        // (each entry is at least an 80-byte header) and by what a node
+        // may send at all.
+        guard let (count, varIntSize) = data.readBoundedCount(at: 0, minItemSize: BlockHeader.size),
+              count <= maximumEntries else { return nil }
 
         var offset = varIntSize
         var entries: [Entry] = []

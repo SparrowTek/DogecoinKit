@@ -93,7 +93,7 @@ public enum FeeEstimation {
         return overflow ? .max : size
     }
 
-    /// Estimate virtual size for a typical send transaction (1 recipient + 1 change)
+    /// Estimate size for a typical send transaction (1 recipient + 1 change)
     /// - Parameter inputCount: Number of inputs needed
     /// - Returns: Estimated size in bytes
     public static func estimateSendSize(inputCount: Int) -> Int {
@@ -184,7 +184,7 @@ public enum FeeEstimation {
     /// Estimate the number of inputs needed to cover an amount plus fee
     /// - Parameters:
     ///   - targetAmount: The amount to send
-    ///   - utxos: Available UTXOs sorted by amount (largest first)
+    ///   - utxos: Available UTXOs, in any order (they are sorted here, largest first)
     ///   - priority: Fee priority level
     /// - Returns: Tuple of (selected UTXOs, total fee) or nil if insufficient funds
     public static func selectUTXOsWithFee(

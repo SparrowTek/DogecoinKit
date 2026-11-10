@@ -9,10 +9,6 @@ struct ElectrumClientTests {
         await Dogecoin.initialize()
     }
 
-    private func requireIntegrationTests() -> Bool {
-        ProcessInfo.processInfo.environment["ELECTRUM_INTEGRATION_TESTS"] == "1"
-    }
-
     /// Connects to the first mainnet server that answers; any one of them
     /// may be down at a given moment.
     private func connectToAnyServer() async throws -> ElectrumClient {
@@ -28,9 +24,8 @@ struct ElectrumClientTests {
         throw ElectrumError.noServersAvailable
     }
 
-    @Test("Connect to mainnet server")
+    @Test("Connect to mainnet server", .enabled(if: TestEnvironment.runsLiveElectrumTests))
     func testConnect() async throws {
-        guard requireIntegrationTests() else { return }
         let client = try await connectToAnyServer()
 
         // Should be connected now
@@ -39,9 +34,8 @@ struct ElectrumClientTests {
         await client.disconnect()
     }
 
-    @Test("Get balance for known address")
+    @Test("Get balance for known address", .enabled(if: TestEnvironment.runsLiveElectrumTests))
     func testGetBalance() async throws {
-        guard requireIntegrationTests() else { return }
         let client = try await connectToAnyServer()
 
         // Use a known Dogecoin address
@@ -58,9 +52,8 @@ struct ElectrumClientTests {
         await client.disconnect()
     }
 
-    @Test("Subscribe to headers")
+    @Test("Subscribe to headers", .enabled(if: TestEnvironment.runsLiveElectrumTests))
     func testHeaderSubscription() async throws {
-        guard requireIntegrationTests() else { return }
         let client = try await connectToAnyServer()
 
         let header = try await client.subscribeHeaders()
@@ -82,25 +75,17 @@ struct ElectrumClientTests {
         #expect(scriptHash.scriptHash == "774575bb5a9f803fde8be6804d24bc17ade79c45c9f28ee5a9835edf17b8ada0")
     }
 
-    @Test("Testnet Electrum server list is populated")
-    func testTestnetServersAvailable() {
-        let servers = ElectrumServerList.servers(for: .testnet)
-        #expect(!servers.isEmpty)
-        #expect(servers.allSatisfy { $0.network == .testnet })
+    @Test("Each network's server list holds only that network's servers", arguments: [DogecoinNetwork.mainnet, .testnet])
+    func serverListsMatchTheirNetwork(network: DogecoinNetwork) {
+        #expect(ElectrumServerList.servers(for: network).allSatisfy { $0.network == network })
     }
 }
 
 @Suite("Electrum Sync Manager Tests")
 struct ElectrumSyncManagerTests {
 
-    private func requireIntegrationTests() -> Bool {
-        ProcessInfo.processInfo.environment["ELECTRUM_INTEGRATION_TESTS"] == "1"
-    }
-
-    @Test("Start and stop sync")
+    @Test("Start and stop sync", .enabled(if: TestEnvironment.runsLiveElectrumTests))
     func testStartStop() async throws {
-        guard requireIntegrationTests() else { return }
-
         let manager = ElectrumSyncManager(network: .mainnet)
 
         try await manager.start()
@@ -114,9 +99,8 @@ struct ElectrumSyncManagerTests {
         #expect(!stoppedState.isConnected)
     }
 
-    @Test("Live UTXOs verify against their funding transactions")
+    @Test("Live UTXOs verify against their funding transactions", .enabled(if: TestEnvironment.runsLiveElectrumTests))
     func testLiveUTXOVerification() async throws {
-        guard requireIntegrationTests() else { return }
         await Dogecoin.initialize()
 
         let manager = ElectrumSyncManager(network: .mainnet)

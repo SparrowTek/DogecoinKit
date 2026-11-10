@@ -119,6 +119,7 @@ private let standardResponder: Responder = { method, id, _ in
 private final class StreamRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var opened: [ScriptedStream] = []
+    private var openedHosts: [String] = []
     private let responderForStream: @Sendable (Int) -> Responder
     private let openDelay: @Sendable (Int) -> Duration
 
@@ -134,11 +135,12 @@ private final class StreamRecorder: @unchecked Sendable {
     }
 
     var factory: ByteStreamFactory {
-        { [self] _, _, _ in
+        { [self] host, _, _ in
             lock.withLock {
                 let index = opened.count
                 let stream = ScriptedStream(responder: responderForStream(index), openDelay: openDelay(index))
                 opened.append(stream)
+                openedHosts.append(host)
                 return stream
             }
         }
@@ -147,9 +149,15 @@ private final class StreamRecorder: @unchecked Sendable {
     var streams: [ScriptedStream] {
         lock.withLock { opened }
     }
+
+    /// The host of each connection, in the order they were opened.
+    var hosts: [String] {
+        lock.withLock { openedHosts }
+    }
 }
 
 private let testServer = ElectrumServer(host: "electrum.test", port: 50002, useSSL: true, network: .mainnet)
+private let secondTestServer = ElectrumServer(host: "electrum2.test", port: 50002, useSSL: true, network: .mainnet)
 
 private func waitUntil(timeout: Duration = .seconds(5), _ condition: @Sendable () async -> Bool) async -> Bool {
     let clock = ContinuousClock()
@@ -199,6 +207,37 @@ struct ElectrumBehaviorTests {
         try await client.connect()
         let balance = try await client.getBalance(scriptHash: String(repeating: "ab", count: 32))
         #expect(balance.confirmed == 7)
+    }
+
+    @Test("Lines are found wherever the reads happen to split them")
+    func lineFramingAtAwkwardBoundaries() async throws {
+        let notification = #"{"jsonrpc":"2.0","method":"blockchain.scripthash.subscribe","params":["feed","beef"]}"#
+        let responder: Responder = { method, id, _ in
+            guard method == "blockchain.scripthash.get_balance" else {
+                return standardResponder(method, id, [])
+            }
+            // A line ending mid-read with the next line already begun, then
+            // a line whose newline arrives in a read of its own.
+            let balance = #"{"jsonrpc":"2.0","id":\#(id),"result":{"confirmed":7,"unconfirmed":0}}"#
+            return [
+                String(notification.prefix(30)),
+                String(notification.dropFirst(30)) + "\n" + String(balance.prefix(25)),
+                String(balance.dropFirst(25)),
+                "\n",
+            ]
+        }
+        let client = ElectrumClient(server: testServer, streamFactory: StreamRecorder(responder: responder).factory)
+        try await client.connect()
+
+        let received = StatusBox()
+        _ = try await client.subscribeScriptHash("feed") { received.set($0) }
+
+        let balance = try await client.getBalance(scriptHash: String(repeating: "ab", count: 32))
+        #expect(balance.confirmed == 7)
+        #expect(await waitUntil { received.value == "beef" })
+
+        // Nothing is left over to corrupt the next reply.
+        try await client.serverPing()
     }
 
     @Test("Servers that echo the request id as a string are understood")
@@ -358,6 +397,69 @@ struct ElectrumBehaviorTests {
         #expect(await !client.isConnected)
         #expect(await waitUntil { dropped.value == "dropped" })
     }
+
+    @Test("An idle connection is pinged, so the server does not drop it")
+    func idleConnectionIsPinged() async throws {
+        let recorder = StreamRecorder()
+        let client = ElectrumClient(server: testServer, streamFactory: recorder.factory, keepaliveInterval: .milliseconds(50))
+        try await client.connect()
+
+        #expect(await waitUntil { recorder.streams.first?.methods.contains("server.ping") == true })
+        #expect(await client.isConnected)
+
+        // And goes on being pinged for as long as it stays idle.
+        #expect(await waitUntil { (recorder.streams.first?.methods.filter { $0 == "server.ping" }.count ?? 0) >= 3 })
+        await client.disconnect()
+    }
+
+    @Test("A connection in use is not pinged")
+    func busyConnectionIsNotPinged() async throws {
+        let recorder = StreamRecorder()
+        let client = ElectrumClient(server: testServer, streamFactory: recorder.factory, keepaliveInterval: .milliseconds(400))
+        try await client.connect()
+
+        // Requests arrive more often than the keepalive interval, for
+        // longer than the interval.
+        for _ in 0..<12 {
+            _ = try await client.getBalance(scriptHash: String(repeating: "ab", count: 32))
+            try await Task.sleep(for: .milliseconds(50))
+        }
+
+        #expect(recorder.streams.first?.methods.contains("server.ping") == false)
+        await client.disconnect()
+    }
+
+    @Test("An unanswered keepalive drops the connection so its owner reconnects")
+    func unansweredKeepaliveDropsConnection() async throws {
+        let responder: Responder = { method, id, _ in
+            method == "server.ping" ? [] : standardResponder(method, id, [])
+        }
+        let client = ElectrumClient(
+            server: testServer,
+            streamFactory: StreamRecorder(responder: responder).factory,
+            requestTimeout: .milliseconds(200),
+            keepaliveInterval: .milliseconds(50)
+        )
+        try await client.connect()
+
+        let dropped = StatusBox()
+        await client.setDisconnectHandler { dropped.set("dropped") }
+
+        #expect(await waitUntil { dropped.value == "dropped" })
+        #expect(await !client.isConnected)
+    }
+
+    @Test("A disconnected client stops pinging")
+    func disconnectStopsKeepalive() async throws {
+        let recorder = StreamRecorder()
+        let client = ElectrumClient(server: testServer, streamFactory: recorder.factory, keepaliveInterval: .milliseconds(50))
+        try await client.connect()
+        await client.disconnect()
+
+        let pings = recorder.streams.first?.methods.filter { $0 == "server.ping" }.count
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(recorder.streams.first?.methods.filter { $0 == "server.ping" }.count == pings)
+    }
 }
 
 private final class StatusBox: @unchecked Sendable {
@@ -445,6 +547,64 @@ struct ElectrumSyncManagerBehaviorTests {
             _ = try await manager.refreshBalance(for: ["DD8sGWjLS7KodzdhWFA63G2Ryn1Ku1qjQ5"])
         }
     }
+
+    @Test("Starting with no servers fails right away")
+    func noServers() async throws {
+        let manager = ElectrumSyncManager(network: .testnet, serverList: [], streamFactory: StreamRecorder().factory)
+
+        let error = await #expect(throws: ElectrumError.self) {
+            try await manager.start()
+        }
+        guard case .noServersAvailable = error else {
+            Issue.record("Expected noServersAvailable, got \(String(describing: error))")
+            return
+        }
+        #expect(await !manager.state.isConnected)
+    }
+
+    @Test("A server that drops the connection is not the first one tried again")
+    func droppedServerIsTriedLast() async throws {
+        let recorder = StreamRecorder()
+        let manager = ElectrumSyncManager(network: .mainnet, serverList: [testServer, secondTestServer], streamFactory: recorder.factory)
+        try await manager.start()
+        #expect(recorder.hosts == [testServer.host])
+
+        await recorder.streams.last?.inbox.close()
+        #expect(await waitUntil { recorder.hosts.count == 2 })
+        #expect(await waitUntil { await manager.state.isConnected })
+        #expect(recorder.hosts == [testServer.host, secondTestServer.host])
+        #expect(await manager.connectedServer == secondTestServer)
+
+        // The list wraps around.
+        await recorder.streams.last?.inbox.close()
+        #expect(await waitUntil { recorder.hosts.count == 3 })
+        #expect(await waitUntil { await manager.state.isConnected })
+        #expect(recorder.hosts == [testServer.host, secondTestServer.host, testServer.host])
+        await manager.stop()
+    }
+
+    @Test("A request the server never answers is retried on the next server")
+    func unansweredRequestMovesToNextServer() async throws {
+        let recorder = StreamRecorder { index in
+            { method, id, _ in
+                // The first connection accepts everything but never answers
+                // a balance query.
+                index == 0 && method == "blockchain.scripthash.get_balance" ? [] : standardResponder(method, id, [])
+            }
+        }
+        let manager = ElectrumSyncManager(
+            network: .mainnet,
+            serverList: [testServer, secondTestServer],
+            streamFactory: recorder.factory,
+            requestTimeout: .milliseconds(200)
+        )
+        try await manager.start()
+
+        let balance = try await manager.refreshBalance(for: ["DD8sGWjLS7KodzdhWFA63G2Ryn1Ku1qjQ5"])
+        #expect(balance == 60)
+        #expect(recorder.hosts == [testServer.host, secondTestServer.host])
+        await manager.stop()
+    }
 }
 
 // MARK: - Sync manager resilience
@@ -461,6 +621,49 @@ private func fundingTransaction(paying address: String, value: UInt64) throws ->
     data.append(script)
     data.append(contentsOf: [0, 0, 0, 0])                 // lock time
     return (data.hexString, Data(MerkleTree.doubleSHA256(data).reversed()).hexString)
+}
+
+/// A server holding `transactions`, all of them unspent at output 0.
+/// - Parameter failingRequest: The `blockchain.transaction.get` request,
+///   counted from 1, to answer with an error
+private func walletResponder(
+    transactions: [(hex: String, txid: String)],
+    values: [UInt64],
+    failingRequest: Int? = nil
+) -> Responder {
+    let hexByTxid = Dictionary(uniqueKeysWithValues: transactions.map { ($0.txid, $0.hex) })
+    let unspent = zip(transactions, values)
+        .map { #"{"tx_hash":"\#($0.txid)","tx_pos":0,"height":100,"value":\#($1)}"# }
+        .joined(separator: ",")
+    let requests = Counter()
+
+    return { method, id, params in
+        switch method {
+        case "blockchain.scripthash.listunspent":
+            return [reply(id, "[\(unspent)]")]
+        case "blockchain.transaction.get":
+            guard requests.increment() != failingRequest,
+                  let txid = params.first as? String, let hex = hexByTxid[txid] else {
+                return [#"{"jsonrpc":"2.0","id":\#(id),"error":{"code":-32600,"message":"busy"}}"# + "\n"]
+            }
+            return [reply(id, #""\#(hex)""#)]
+        default:
+            return standardResponder(method, id, [])
+        }
+    }
+}
+
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    /// - Returns: The count after incrementing
+    func increment() -> Int {
+        lock.withLock {
+            count += 1
+            return count
+        }
+    }
 }
 
 /// A server whose UTXO list and transactions can disagree.
@@ -583,6 +786,76 @@ struct ElectrumSyncManagerResilienceTests {
         await #expect(throws: ElectrumError.self) {
             _ = try await manager.fetchUTXOs(for: [address])
         }
+        await manager.stop()
+    }
+
+    @Test("After a failed fetch, verification carries on instead of starting over")
+    func verificationResumes() async throws {
+        // One more transaction than is fetched at a time, so the request
+        // that fails is only sent once another has been verified.
+        let values = (1...9).map { UInt64($0) * 100_000_000 }
+        let transactions = try values.map { try fundingTransaction(paying: address, value: $0) }
+        let recorder = StreamRecorder(responder: walletResponder(transactions: transactions, values: values, failingRequest: 9))
+        let manager = ElectrumSyncManager(network: .mainnet, serverList: [testServer], streamFactory: recorder.factory)
+        try await manager.start()
+
+        await #expect(throws: ElectrumError.self) {
+            _ = try await manager.fetchUTXOs(for: [address])
+        }
+
+        let utxos = try await manager.fetchUTXOs(for: [address])
+        #expect(Set(utxos.map(\.utxo.value)) == Set(values.map { Int64($0) }))
+
+        // Starting over would fetch all nine again: eighteen requests.
+        let fetches = recorder.streams.first?.methods.filter { $0 == "blockchain.transaction.get" }.count ?? 0
+        #expect(fetches < 18)
+        await manager.stop()
+    }
+
+    @Test("A wallet with more outputs than are remembered still verifies")
+    func moreOutputsThanTheCacheHolds() async throws {
+        let values = (1...8_200).map { UInt64($0) + 100_000_000 }
+        let transactions = try values.map { try fundingTransaction(paying: address, value: $0) }
+        let recorder = StreamRecorder(responder: walletResponder(transactions: transactions, values: values))
+        let manager = ElectrumSyncManager(network: .mainnet, serverList: [testServer], streamFactory: recorder.factory)
+        try await manager.start()
+
+        let utxos = try await manager.fetchUTXOs(for: [address])
+        #expect(utxos.count == values.count)
+        await manager.stop()
+    }
+
+    @Test("Broadcasting returns the transaction's own id, whatever the server calls it")
+    func broadcastReturnsComputedTxid() async throws {
+        let funding = try fundingTransaction(paying: address, value: 100_000_000)
+        let responder: Responder = { method, id, _ in
+            method == "blockchain.transaction.broadcast"
+                ? [reply(id, #""\#(String(repeating: "ff", count: 32))""#)]
+                : standardResponder(method, id, [])
+        }
+        let manager = ElectrumSyncManager(network: .mainnet, serverList: [testServer], streamFactory: StreamRecorder(responder: responder).factory)
+        try await manager.start()
+
+        #expect(try await manager.broadcastTransaction(funding.hex) == funding.txid)
+        await manager.stop()
+    }
+
+    @Test("A rejected broadcast is reported, not retried")
+    func rejectedBroadcast() async throws {
+        let funding = try fundingTransaction(paying: address, value: 100_000_000)
+        let responder: Responder = { method, id, _ in
+            method == "blockchain.transaction.broadcast"
+                ? [#"{"jsonrpc":"2.0","id":\#(id),"error":{"code":1,"message":"min relay fee not met"}}"# + "\n"]
+                : standardResponder(method, id, [])
+        }
+        let recorder = StreamRecorder(responder: responder)
+        let manager = ElectrumSyncManager(network: .mainnet, serverList: [testServer], streamFactory: recorder.factory)
+        try await manager.start()
+
+        await #expect(throws: ElectrumError.self) {
+            _ = try await manager.broadcastTransaction(funding.hex)
+        }
+        #expect(recorder.streams.first?.methods.filter { $0 == "blockchain.transaction.broadcast" }.count == 1)
         await manager.stop()
     }
 }

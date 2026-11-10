@@ -80,6 +80,7 @@ public actor Peer {
     private var handshakeTimeoutTask: Task<Void, Never>?
     private var pingTimeoutTask: Task<Void, Never>?
     private var pendingPingNonce: UInt64?
+    private var didReceiveVerack = false
     private var didRequestAddresses = false
     private var receiveBuffer = Data()
 
@@ -152,6 +153,7 @@ public actor Peer {
         receiveBuffer = Data()
         pendingPingNonce = nil
         peerVersion = nil
+        didReceiveVerack = false
 
         logger.info("Connecting to \(self.host):\(self.port)")
         await updateState(.connecting)
@@ -190,15 +192,18 @@ public actor Peer {
     }
 
     /// Send a protocol message
-    public func send(_ message: ProtocolMessage) {
+    /// - Returns: Whether the message was handed to a live connection
+    @discardableResult
+    public func send(_ message: ProtocolMessage) -> Bool {
         guard let writer, state == .ready || state == .handshaking else {
             logger.warning("Cannot send message: not connected")
-            return
+            return false
         }
 
         let data = message.serialize()
         logger.debug("Sending \(message.command) message (\(data.count) bytes)")
         writer.write(data)
+        return true
     }
 
     /// Send a ping message
@@ -335,9 +340,11 @@ public actor Peer {
     }
 
     /// Send a transaction message
-    public func sendTransaction(_ txMessage: TxMessage) {
+    /// - Returns: Whether the transaction was handed to a live connection
+    @discardableResult
+    public func sendTransaction(_ txMessage: TxMessage) -> Bool {
         let message = ProtocolMessage(network: network, command: ProtocolMessage.Command.tx, payload: txMessage.serialize())
-        send(message)
+        return send(message)
     }
 
     /// Send an inv message announcing a transaction
@@ -491,10 +498,20 @@ public actor Peer {
         logger.info("Peer version: \(version.userAgent), height: \(version.startHeight)")
 
         sendVerack()
+        await completeHandshakeIfDone()
     }
 
     private func handleVerackMessage() async {
         guard state == .handshaking else { return }
+        didReceiveVerack = true
+        await completeHandshakeIfDone()
+    }
+
+    /// The handshake is over once the peer has both introduced itself and
+    /// acknowledged us, in whichever order. Becoming ready on `verack`
+    /// alone left a peer in use with no known version or height.
+    private func completeHandshakeIfDone() async {
+        guard state == .handshaking, didReceiveVerack, peerVersion != nil else { return }
 
         handshakeTimeoutTask?.cancel()
         handshakeTimeoutTask = nil

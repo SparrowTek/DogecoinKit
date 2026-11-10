@@ -22,7 +22,9 @@ public struct BlockMessage: Sendable {
         return data
     }
 
-    public static func parse(from data: Data) -> BlockMessage? {
+    public static func parse(from payload: Data) -> BlockMessage? {
+        // The transaction walk below indexes from zero.
+        let data = payload.rebased
         guard data.count >= BlockHeader.size else { return nil }
         guard let header = BlockHeader.parse(from: Data(data.prefix(BlockHeader.size))) else { return nil }
 

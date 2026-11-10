@@ -34,19 +34,24 @@ enum RealChainFixtures {
         "04016200f98a0ad0514e9fb948109f62b46ab2624e2ba66c23b8b87c66b18fcc7d1cd6c5047ac176f0abb732f85ec20e18ec7ed501e5003bc99a2201cd395af814af90f167a4886ae80f70190000000001000000010000000000000000000000000000000000000000000000000000000000000000ffffffff5203514730194d696e656420627920416e74506f6f6cb900e601c07cb61101fabe6d6d7ca21219cebdab77c60139c6ef7f0be3e556c85e4b854de08587acf3e72ed26b20000000000000000000873e59020000ffffffff03e5c46d25000000001976a914bc14b37375146785074671bbaf5804133e5827e588ac0000000000000000266a24aa21a9ed79a84e6c1fd34bd5fce5d6885c22af4410437ea58b90a17afa76c6e7d0ef01ed0000000000000000146a12455853415401000d130f0e0e0b041f12001300000000ead2d3999e2e8ae3d3f3e054948911f8dabeb39ec1f7fbae5d000000000000000ada92965b1853fcdc3c232cda21e23d315c9ac87b90a1ed8a2ccdca62807e0ce4a97f71f2980163921bd05356509dfb8daf80eba1cf2b2a4ef29a04f72ebbb5e528c3918bea10aaef0dc5f8c2199a0d0c8edcdb4e36eba396fc372a1da2ba0800fda9ca0f9971629ab0216ea2dfa8e2085b15c4c7a810cdf3313eebc886e32d2c3e182342f705eee258273393cdbc5fe7e2e603c48fa776c371b722cf5fca85c6c1cbfffb68e4f25980952128a652b0fad0270fc07230b111d73739f6e1093601c18fe3bd7a150707db01851ef61d63cd45e4cc548350794e42e8752ddb2cb039b40e57f2c74c7ec2b8b7b8269e802cfc3e195a8f4d1f713d7769479dce483f5d9b3fdc0c974d7d5f66e7edf5bd7247826786ed2b83c2f55907069760c8c1de92a3043682a01c3843f9df1b4b7b35ed4d8682910f3a09ca7bba6c262cc44cbe67000000000519000000000000000000000000000000000000000000000000000000000000009673f696e5825601a920ad8c0059c7c80893bcb6d0234f8011426f7bc33ab6e729dc6f732473e373bb8a2f93ca08e112bb1e30f398c2c67ee6208ce643524afd1e79e9bf04831ad117ba5662be81a65005879db1e6e7bf13f290603d09e443e19baa98f083da27a1f5cb0dfd1744f1c194c607376aa2c0fc3de813431e8e0ec918000000000000206564a7a69fc44a3dda9e08d97ca6ba359fe5353d1957680ec60ab8b458a91714607b1d8e27a313c10ce16c0dec746738f48c96c71fc04a7d4339780c9b190435d0a4886a0e9d3119699892e1",
     ]
 
-    /// The three merge-mined entries parsed as a `headers` message would be.
-    static func parsedEntries() -> [HeadersMessage.Entry] {
+    /// The three merge-mined entries as the payload of a `headers` message.
+    static func headersPayload() -> Data {
         var payload = VarInt(UInt64(mergeMinedEntries.count)).serialize()
         for entry in mergeMinedEntries {
             payload.append(Data(hexString: entry) ?? Data())
             payload.append(0)
         }
-        return HeadersMessage.parse(from: payload)?.entries ?? []
+        return payload
+    }
+
+    /// The three merge-mined entries parsed as a `headers` message would be.
+    static func parsedEntries() -> [HeadersMessage.Entry] {
+        HeadersMessage.parse(from: headersPayload())?.entries ?? []
     }
 
     /// A mainnet header chain whose database holds exactly the ancestors.
     static func headerChainAtTip() async throws -> HeaderChain {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("RealChain-\(UUID().uuidString)")
+        let directory = TestDirectories.unique()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
         let database = try HeaderDatabase(path: directory.appendingPathComponent("headers.sqlite").path)
@@ -64,5 +69,58 @@ enum RealChainFixtures {
                   let work = Data(hexString: ancestor.chainWorkHex) else { return nil }
             return StoredHeader(header: header, height: ancestor.height, chainWork: work)
         }
+    }
+}
+
+/// Two competing branches on top of the testnet genesis block, mined for
+/// these tests at the minimum difficulty, so they pass real proof-of-work
+/// validation:
+///
+///     genesis ── a1
+///        └────── b1 ── b2
+///
+/// `a1` and `b1` each hold `transaction` as their only transaction; `b2`
+/// holds something else. The `b` branch has more work once `b2` arrives.
+enum ReorgFixtures {
+    /// Pays 1 DOGE to the public key hash `42…42`.
+    static let transaction = hex("010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff0100e1f505000000001976a914424242424242424242424242424242424242424288ac00000000")
+
+    /// The public key hash `transaction` pays to
+    static let paidPubkeyHash = Data(repeating: 0x42, count: 20)
+
+    static let a1 = header("010000009e555073d0c4f36456db8951f449704d544d2826d9aa60636b40374626780abb8568d2dcae16aefa97bca36d32011c512890edbaaafb26ef46fe981fdc7a32b61da8f052f0ff0f1ef5430500")
+    static let b1 = header("010000009e555073d0c4f36456db8951f449704d544d2826d9aa60636b40374626780abb8568d2dcae16aefa97bca36d32011c512890edbaaafb26ef46fe981fdc7a32b6c3a7f052f0ff0f1e18a71700")
+    static let b2 = header("010000003ac6efa654eaa70cc0ab01d401f70fe7ab516ec1a0de6c1c92fc1c82f142ee390707070707070707070707070707070707070707070707070707070707070707c4a7f052f0ff0f1e834e1700")
+
+    /// The payload of a `headers` message carrying `headers`.
+    static func headersPayload(_ headers: [BlockHeader]) -> Data {
+        var payload = VarInt(UInt64(headers.count)).serialize()
+        for header in headers {
+            payload.append(header.serializeCore())
+            payload.append(0)
+        }
+        return payload
+    }
+
+    /// The merkle block a node sends for a block whose only transaction is
+    /// the one its header commits to.
+    /// - Parameter matched: Whether that transaction matched the filter
+    static func merkleBlock(for header: BlockHeader, matched: Bool) -> Data {
+        MerkleBlockMessage(
+            header: header,
+            totalTransactions: 1,
+            hashes: [header.merkleRoot],
+            flags: Data([matched ? 0x01 : 0x00])
+        ).serialize()
+    }
+
+    private static func hex(_ string: String) -> Data {
+        Data(hexString: string) ?? Data()
+    }
+
+    private static func header(_ string: String) -> BlockHeader {
+        BlockHeader.parse(from: hex(string)) ?? BlockHeader(
+            version: 0, prevBlock: Data(count: 32), merkleRoot: Data(count: 32), timestamp: 0, bits: 0, nonce: 0
+        )
     }
 }

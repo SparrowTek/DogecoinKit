@@ -37,9 +37,22 @@ private actor WireInbox {
     }
 }
 
+/// A message as a node puts it on the wire.
+private struct WireMessage: Sendable {
+    let command: String
+    let payload: Data
+}
+
 /// How the scripted node behaves.
 private struct NodeScript: Sendable {
+    enum Handshake: Sendable {
+        case versionThenVerack
+        case verackThenVersion
+        case verackOnly
+    }
+
     var answersVersion = true
+    var handshake = Handshake.versionThenVerack
     var echoesOurNonce = false
     var sendsGarbageVersion = false
     var answersPing = true
@@ -47,6 +60,10 @@ private struct NodeScript: Sendable {
     var startHeight: Int32 = 6_400_000
     /// Sent back for every `getheaders`; nil leaves them unanswered
     var headersReply: Data?
+    /// Whether the node fetches the transactions announced to it
+    var fetchesAnnouncedTransactions = false
+    /// What the node sends when asked for a filtered block, by block hash
+    var filteredBlocks: [Data: [WireMessage]] = [:]
 }
 
 /// A `ByteStream` that plays a Dogecoin node.
@@ -104,14 +121,34 @@ private final class ScriptedNode: ByteStream, @unchecked Sendable {
             let ours = VersionMessage.parse(from: message.payload)
             let nonce = script.echoesOurNonce ? (ours?.nonce ?? 0) : 42
             let version = VersionMessage(nonce: nonce, userAgent: "/ScriptedNode:1.0/", startHeight: script.startHeight)
-            await send("version", version.serialize())
-            await send("verack")
+            switch script.handshake {
+            case .versionThenVerack:
+                await send("version", version.serialize())
+                await send("verack")
+            case .verackThenVersion:
+                await send("verack")
+                await send("version", version.serialize())
+            case .verackOnly:
+                await send("verack")
+            }
         case ProtocolMessage.Command.ping:
             guard script.answersPing, let ping = PingMessage.parse(from: message.payload) else { return }
             await send("pong", PongMessage(nonce: ping.nonce).serialize())
         case ProtocolMessage.Command.getheaders:
             guard let headersReply = script.headersReply else { return }
             await send("headers", headersReply)
+        case ProtocolMessage.Command.inv:
+            guard script.fetchesAnnouncedTransactions,
+                  let transactions = InvMessage.parse(from: message.payload)?.inventory.filter({ $0.type == .transaction }),
+                  !transactions.isEmpty else { return }
+            await send("getdata", GetDataMessage(inventory: transactions).serialize())
+        case ProtocolMessage.Command.getdata:
+            let requested = GetDataMessage.parse(from: message.payload)?.inventory ?? []
+            for item in requested where item.type == .filteredBlock {
+                for reply in script.filteredBlocks[item.hash] ?? [] {
+                    await send(reply.command, reply.payload)
+                }
+            }
         default:
             break
         }
@@ -122,14 +159,19 @@ private final class NodeRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var nodes: [ScriptedNode] = []
     private let script: NodeScript
+    private let scripts: [String: NodeScript]
 
-    init(script: NodeScript = NodeScript()) {
+    /// - Parameters:
+    ///   - script: How every node behaves, unless `scripts` says otherwise
+    ///   - scripts: How particular nodes behave, by host
+    init(script: NodeScript = NodeScript(), scripts: [String: NodeScript] = [:]) {
         self.script = script
+        self.scripts = scripts
     }
 
     var factory: ByteStreamFactory {
         { [self] host, _, _ in
-            let node = ScriptedNode(script: script, host: host)
+            let node = ScriptedNode(script: scripts[host] ?? script, host: host)
             lock.withLock { nodes.append(node) }
             return node
         }
@@ -207,6 +249,49 @@ struct PeerBehaviorTests {
 
         let node = try #require(recorder.all.first)
         #expect(await eventually { node.commandsReceived == ["version", "verack", "getaddr"] })
+    }
+
+    @Test("The version sent claims no services and asks for no transaction relay")
+    func versionSent() async throws {
+        let recorder = NodeRecorder()
+        let peer = await makePeer(recorder, log: PeerEventLog())
+
+        await peer.connect()
+        #expect(await eventually { await peer.state == .ready })
+
+        let payload = try #require(recorder.all.first?.payloads(of: "version").first)
+        let version = try #require(VersionMessage.parse(from: payload))
+        #expect(version.services == 0)
+        #expect(!version.relay)
+    }
+
+    @Test("A verack that arrives before the version still completes the handshake")
+    func verackBeforeVersion() async throws {
+        var script = NodeScript()
+        script.handshake = .verackThenVersion
+        let recorder = NodeRecorder(script: script)
+        let log = PeerEventLog()
+        let peer = await makePeer(recorder, log: log)
+
+        await peer.connect()
+        #expect(await eventually { await peer.state == .ready })
+        #expect(await peer.peerVersion?.startHeight == 6_400_000)
+        #expect(log.stateHistory == [.connecting, .connected, .handshaking, .ready])
+    }
+
+    @Test("A peer that acknowledges us without sending its version never becomes ready")
+    func verackWithoutVersion() async throws {
+        var script = NodeScript()
+        script.handshake = .verackOnly
+        let recorder = NodeRecorder(script: script)
+        let log = PeerEventLog()
+        let peer = await makePeer(recorder, log: log)
+        await peer.configureTimeouts(handshake: 0.3)
+
+        await peer.connect()
+        #expect(await eventually { await peer.state == .disconnected })
+        #expect(!log.stateHistory.contains(.ready))
+        #expect(log.errorDescriptions.contains { $0.contains("handshake") })
     }
 
     @Test("Messages reach the delegate in exactly wire order")
@@ -287,13 +372,16 @@ struct PeerBehaviorTests {
         await peer.connect()
         #expect(await eventually { await peer.state == .ready })
 
-        // Re-pinging must not keep restarting the timeout.
-        for _ in 0..<5 {
+        // Re-pinging must not keep restarting the timeout: pinged several
+        // times per timeout, for several timeouts, the peer is still dropped.
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(2))
+        while clock.now < deadline, await peer.state != .disconnected {
             await peer.sendPing()
-            try await Task.sleep(for: .milliseconds(100))
+            try await Task.sleep(for: .milliseconds(50))
         }
 
-        #expect(await eventually { await peer.state == .disconnected })
+        #expect(await peer.state == .disconnected)
         #expect(log.errorDescriptions.contains { $0.contains("ping") })
     }
 
@@ -374,13 +462,18 @@ private final class ManagerEventLog: PeerManagerDelegate, @unchecked Sendable {
 }
 
 /// A peer manager that dials only scripted nodes and keeps its bans to itself.
-private func makePeerManager(_ recorder: NodeRecorder) -> PeerManager {
+private func makePeerManager(
+    _ recorder: NodeRecorder,
+    network: DogecoinNetwork = .mainnet,
+    broadcastTimeout: Duration = .seconds(15)
+) -> PeerManager {
     PeerManager(
-        network: .mainnet,
+        network: network,
         streamFactory: recorder.factory,
         dnsSeeds: [],
         fallbackNodes: [],
-        banStore: nil
+        banStore: nil,
+        broadcastTimeout: broadcastTimeout
     )
 }
 
@@ -440,9 +533,176 @@ struct PeerManagerBehaviorTests {
         try await Task.sleep(for: .milliseconds(50))
         #expect(events.disconnectCount == 1)
     }
+
+    @Test("A peer asking for addresses gets no answer")
+    func addressRequestsAreNotAnswered() async throws {
+        let recorder = NodeRecorder()
+        let manager = makePeerManager(recorder)
+        await manager.addPeer(host: "a.test")
+        #expect(await eventually { await manager.connectedPeerCount == 1 })
+        let node = try #require(recorder.node(for: "a.test"))
+
+        // Something the manager could pass on, were it to answer.
+        let entry = AddrMessage.Entry(timestamp: UInt32(Date().timeIntervalSince1970), address: .ipv4("8.8.8.8", port: 22556, services: 1))
+        await node.send("addr", AddrMessage(entries: [entry]).serialize())
+        await node.send("getaddr")
+
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(!node.commandsReceived.contains("addr"))
+        #expect(await manager.connectedPeerCount == 1)
+    }
+
+    // MARK: Broadcasting
+
+    private let transaction = TxMessage(rawData: ReorgFixtures.transaction)
+
+    @Test("A broadcast returns once a peer has fetched the transaction")
+    func broadcastWaitsForFetch() async throws {
+        var script = NodeScript()
+        script.fetchesAnnouncedTransactions = true
+        let recorder = NodeRecorder(script: script)
+        let manager = makePeerManager(recorder)
+        await manager.addPeer(host: "a.test")
+        #expect(await eventually { await manager.connectedPeerCount == 1 })
+
+        let txid = try await manager.broadcastTransaction(transaction)
+
+        #expect(txid == transaction.txidHex)
+        let node = try #require(recorder.node(for: "a.test"))
+        #expect(await eventually { node.payloads(of: "tx") == [transaction.rawData] })
+    }
+
+    @Test("One peer fetching the transaction is enough")
+    func broadcastNeedsOnlyOneFetch() async throws {
+        var fetching = NodeScript()
+        fetching.fetchesAnnouncedTransactions = true
+        let recorder = NodeRecorder(scripts: ["b.test": fetching])
+        let manager = makePeerManager(recorder)
+        await manager.addPeer(host: "a.test")
+        await manager.addPeer(host: "b.test")
+        #expect(await eventually { await manager.connectedPeerCount == 2 })
+
+        _ = try await manager.broadcastTransaction(transaction)
+
+        #expect(recorder.node(for: "a.test")?.commandsReceived.contains("inv") == true)
+        #expect(recorder.node(for: "a.test")?.payloads(of: "tx").isEmpty == true)
+    }
+
+    @Test("A broadcast no peer asks for fails, and the transaction is withdrawn")
+    func broadcastFailsWhenNobodyFetches() async throws {
+        let recorder = NodeRecorder()
+        let manager = makePeerManager(recorder, broadcastTimeout: .milliseconds(200))
+        await manager.addPeer(host: "a.test")
+        #expect(await eventually { await manager.connectedPeerCount == 1 })
+
+        let error = await #expect(throws: DogecoinError.self) {
+            try await manager.broadcastTransaction(transaction)
+        }
+        #expect(error == .broadcastFailed("No peer asked for the transaction"))
+
+        // It was announced; asking for it now is too late.
+        let node = try #require(recorder.node(for: "a.test"))
+        #expect(node.commandsReceived.contains("inv"))
+        let request = GetDataMessage(inventory: [InventoryVector(type: .transaction, hash: transaction.txidInternal)])
+        await node.send("getdata", request.serialize())
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(node.payloads(of: "tx").isEmpty)
+    }
+
+    @Test("A broadcast that failed can be tried again")
+    func broadcastRetry() async throws {
+        let recorder = NodeRecorder()
+        let manager = makePeerManager(recorder, broadcastTimeout: .milliseconds(300))
+        await manager.addPeer(host: "a.test")
+        #expect(await eventually { await manager.connectedPeerCount == 1 })
+        let node = try #require(recorder.node(for: "a.test"))
+
+        await #expect(throws: DogecoinError.self) {
+            try await manager.broadcastTransaction(transaction)
+        }
+
+        // The second time, the peer asks.
+        let request = GetDataMessage(inventory: [InventoryVector(type: .transaction, hash: transaction.txidInternal)])
+        async let txid = manager.broadcastTransaction(transaction)
+        #expect(await eventually { node.payloads(of: "inv").count == 2 })
+        await node.send("getdata", request.serialize())
+
+        #expect(try await txid == transaction.txidHex)
+        #expect(await eventually { node.payloads(of: "tx") == [transaction.rawData] })
+    }
+
+    @Test("Broadcasting with no peer connected fails at once")
+    func broadcastWithoutPeers() async {
+        let manager = makePeerManager(NodeRecorder())
+
+        await #expect(throws: DogecoinError.noPeersAvailable) {
+            try await manager.broadcastTransaction(transaction)
+        }
+    }
+}
+
+// MARK: - Wire format
+
+@Suite("Network Magic")
+struct NetworkMagicTests {
+
+    @Test("Messages start with their network's magic bytes", arguments: [
+        (DogecoinNetwork.mainnet, [UInt8](arrayLiteral: 0xc0, 0xc0, 0xc0, 0xc0)),
+        (DogecoinNetwork.testnet, [UInt8](arrayLiteral: 0xfc, 0xc1, 0xb7, 0xdc)),
+    ])
+    func magicBytes(network: DogecoinNetwork, expected: [UInt8]) {
+        let message = ProtocolMessage(network: network, command: "verack", payload: Data())
+        #expect([UInt8](message.serialize().prefix(4)) == expected)
+    }
+
+    @Test("A message survives the trip through its own network's framing", arguments: [DogecoinNetwork.mainnet, .testnet])
+    func roundTrip(network: DogecoinNetwork) throws {
+        let message = ProtocolMessage(network: network, command: "ping", payload: Data([1, 2, 3, 4, 5, 6, 7, 8]))
+        let parsed = try #require(ProtocolMessage.parse(from: message.serialize()))
+        #expect(parsed.message == message)
+        #expect(parsed.message.magic == NetworkConstants.magic(for: network))
+    }
 }
 
 // MARK: - SPV sync
+
+/// Records what an SPV sync reports.
+private final class SyncEventLog: SPVSyncDelegate, @unchecked Sendable {
+    enum TransactionEvent: Equatable {
+        case unconfirmed
+        case confirmed(blockHash: Data, height: Int32)
+        case reorged(previousBlockHash: Data, previousHeight: Int32)
+    }
+
+    private let lock = NSLock()
+    private var completions = 0
+    private var transactions: [TransactionEvent] = []
+
+    var completionCount: Int { lock.withLock { completions } }
+    var transactionEvents: [TransactionEvent] { lock.withLock { transactions } }
+
+    func spvSync(_ manager: SPVSyncManager, progressUpdated progress: Double, height: Int32) async {}
+
+    func spvSyncDidComplete(_ manager: SPVSyncManager) async {
+        lock.withLock { completions += 1 }
+    }
+
+    func spvSync(_ manager: SPVSyncManager, didReceiveHeader header: BlockHeader, height: Int32) async {}
+
+    func spvSync(_ manager: SPVSyncManager, didEncounterError error: Error) async {}
+
+    func spvSync(_ manager: SPVSyncManager, didUpdateTransaction transaction: TxMessage, state: SPVTransactionState) async {
+        let event: TransactionEvent = switch state {
+        case .unconfirmed:
+            .unconfirmed
+        case .confirmed(let blockHash, let height):
+            .confirmed(blockHash: blockHash, height: height)
+        case .reorged(let previousBlockHash, let previousHeight):
+            .reorged(previousBlockHash: previousBlockHash, previousHeight: previousHeight)
+        }
+        lock.withLock { transactions.append(event) }
+    }
+}
 
 @Suite("SPV Sync Peer Handling")
 struct SPVSyncPeerHandlingTests {
@@ -454,12 +714,22 @@ struct SPVSyncPeerHandlingTests {
     /// An empty `headers` message: "nothing after your tip".
     private static let noHeaders = Data([0x00])
 
-    private func makeSync(_ recorder: NodeRecorder) async throws -> (SPVSyncManager, PeerManager) {
+    /// The height of the fixture chain's tip, and of the last of the three
+    /// real headers that follow it.
+    private static let tipHeight: Int32 = 6_341_590
+    private static let extendedHeight: Int32 = 6_341_593
+
+    private func makeSync(_ recorder: NodeRecorder, delegate: SyncEventLog? = nil) async throws -> (SPVSyncManager, PeerManager) {
         let peerManager = makePeerManager(recorder)
         let chain = try await RealChainFixtures.headerChainAtTip()
         let sync = SPVSyncManager(network: .mainnet, peerManager: peerManager, headerChain: chain)
+        await sync.setDelegate(delegate)
         await sync.start()
         return (sync, peerManager)
+    }
+
+    private func blockAnnouncement(_ hash: Data) -> Data {
+        InvMessage(inventory: [InventoryVector(type: .block, hash: hash)]).serialize()
     }
 
     @Test("Losing the sync peer moves header requests to another peer")
@@ -537,6 +807,239 @@ struct SPVSyncPeerHandlingTests {
                 .map(\.hash) ?? []
             return Set(requested) == Set(expected)
         })
+        await sync.stop()
+    }
+
+    // MARK: Following the best chain
+
+    @Test("A peer that connects with a longer chain is asked for it, even when the sync looked complete")
+    func longerChainFromLaterPeer() async throws {
+        let recorder = NodeRecorder(scripts: [
+            "a.test": NodeScript(startHeight: Self.tipHeight, headersReply: Self.noHeaders),
+            "b.test": NodeScript(startHeight: Self.extendedHeight, headersReply: RealChainFixtures.headersPayload()),
+        ])
+        let (sync, peerManager) = try await makeSync(recorder)
+
+        // The first peer has nothing new, and the sync settles behind it.
+        await peerManager.addPeer(host: "a.test")
+        #expect(await eventually { await sync.state == .synchronized })
+        #expect(await sync.currentHeight == Self.tipHeight)
+
+        await peerManager.addPeer(host: "b.test")
+        #expect(await eventually { await sync.currentHeight == Self.extendedHeight })
+        #expect(await eventually { await sync.state == .synchronized })
+        await sync.stop()
+    }
+
+    @Test("A block announced by a peer other than the one being followed is fetched, once")
+    func announcementFromAnotherPeer() async throws {
+        let recorder = NodeRecorder(scripts: [
+            "a.test": NodeScript(startHeight: Self.tipHeight, headersReply: Self.noHeaders),
+            "b.test": NodeScript(startHeight: Self.tipHeight, headersReply: RealChainFixtures.headersPayload()),
+        ])
+        let events = SyncEventLog()
+        let (sync, peerManager) = try await makeSync(recorder, delegate: events)
+
+        await peerManager.addPeer(host: "a.test")
+        #expect(await eventually { await sync.state == .synchronized })
+        await peerManager.addPeer(host: "b.test")
+        #expect(await eventually { await peerManager.connectedPeerCount == 2 })
+        let nodeA = try #require(recorder.node(for: "a.test"))
+        let nodeB = try #require(recorder.node(for: "b.test"))
+        #expect(!nodeB.commandsReceived.contains("getheaders"))
+        #expect(await eventually { events.completionCount == 1 })
+
+        // The peer being followed stays silent; the other announces a block.
+        let newBlock = try #require(RealChainFixtures.parsedEntries().first).header.hash
+        await nodeB.send("inv", blockAnnouncement(newBlock))
+        #expect(await eventually { await sync.currentHeight == Self.extendedHeight })
+        #expect(await eventually { events.completionCount == 2 })
+
+        // Announced again by a slower peer, the block is already known.
+        let requestsToA = nodeA.payloads(of: "getheaders").count
+        await nodeA.send("inv", blockAnnouncement(newBlock))
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(nodeA.payloads(of: "getheaders").count == requestsToA)
+        await sync.stop()
+    }
+
+    @Test("A peer confirming there is nothing new does not report completion again")
+    func completionIsReportedOncePerHeight() async throws {
+        let recorder = NodeRecorder(script: NodeScript(startHeight: Self.tipHeight, headersReply: Self.noHeaders))
+        let events = SyncEventLog()
+        let (sync, peerManager) = try await makeSync(recorder, delegate: events)
+
+        await peerManager.addPeer(host: "a.test")
+        #expect(await eventually { events.completionCount == 1 })
+        let node = try #require(recorder.node(for: "a.test"))
+
+        // Announcing a block the chain lacks makes the sync ask again; the
+        // peer then has nothing to show for it.
+        await node.send("inv", blockAnnouncement(Data(repeating: 0xAB, count: 32)))
+        #expect(await eventually { node.payloads(of: "getheaders").count == 2 })
+        try await Task.sleep(for: .milliseconds(150))
+
+        #expect(events.completionCount == 1)
+        #expect(await sync.state == .synchronized)
+        await sync.stop()
+    }
+
+    @Test("Headers that fail for a reason that may be local are not re-requested from peer after peer at once")
+    func unacceptedHeadersDoNotBounce() async throws {
+        // One header whose parent is unknown. It proves nothing against its
+        // sender, so nobody is banned for it.
+        let orphan = BlockHeader(
+            version: 0x0062_0004,
+            prevBlock: Data(repeating: 0xEE, count: 32),
+            merkleRoot: Data(repeating: 0x01, count: 32),
+            timestamp: 1,
+            bits: 0x1a00ffff,
+            nonce: 0
+        )
+        let script = NodeScript(startHeight: 6_341_600, headersReply: ReorgFixtures.headersPayload([orphan]))
+        let recorder = NodeRecorder(script: script)
+        let (sync, peerManager) = try await makeSync(recorder)
+
+        await peerManager.addPeer(host: "a.test")
+        await peerManager.addPeer(host: "b.test")
+        #expect(await eventually { await peerManager.connectedPeerCount == 2 })
+        try await Task.sleep(for: .milliseconds(400))
+
+        // Each peer is asked when it connects. Bouncing between them would
+        // have sent hundreds of requests by now.
+        let requests = recorder.all.reduce(0) { $0 + $1.payloads(of: "getheaders").count }
+        #expect(requests <= 2)
+        #expect(await peerManager.connectedPeerCount == 2)
+        await sync.stop()
+    }
+
+    // MARK: Transactions
+
+    @Test("A transaction a peer sends unasked is reported only if it matches the filter")
+    func unsolicitedTransactions() async throws {
+        let recorder = NodeRecorder(script: NodeScript(startHeight: Self.tipHeight, headersReply: Self.noHeaders))
+        let events = SyncEventLog()
+        let (sync, peerManager) = try await makeSync(recorder, delegate: events)
+        await peerManager.addPeer(host: "a.test")
+        #expect(await eventually { await sync.state == .synchronized })
+        let node = try #require(recorder.node(for: "a.test"))
+
+        // A filter for other keys — with a fixed tweak, and large enough
+        // that it does not match by accident, as a one-element filter does
+        // about one time in three.
+        let otherKeys = (1...50).map { Data(repeating: UInt8($0), count: 20) }
+        await sync.configureBloomFilter(elements: otherKeys, falsePositiveRate: 0.0001, tweak: 0, startHeight: Self.tipHeight)
+        await node.send("tx", ReorgFixtures.transaction)
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(events.transactionEvents.isEmpty)
+
+        await sync.configureBloomFilter(elements: otherKeys + [ReorgFixtures.paidPubkeyHash], tweak: 0, startHeight: Self.tipHeight)
+        await node.send("tx", ReorgFixtures.transaction)
+        #expect(await eventually { events.transactionEvents == [.unconfirmed] })
+        #expect(await peerManager.connectedPeerCount == 1)
+        await sync.stop()
+    }
+
+    @Test("A peer that sends a malformed transaction is banned, and nothing is reported")
+    func malformedTransactionBansPeer() async throws {
+        let recorder = NodeRecorder(script: NodeScript(startHeight: Self.tipHeight, headersReply: Self.noHeaders))
+        let events = SyncEventLog()
+        let (sync, peerManager) = try await makeSync(recorder, delegate: events)
+        await peerManager.addPeer(host: "a.test")
+        #expect(await eventually { await sync.state == .synchronized })
+        await sync.configureBloomFilter(elements: [ReorgFixtures.paidPubkeyHash], startHeight: Self.tipHeight)
+
+        // A transaction that pays the wallet, with a byte tacked on: every
+        // such variation would count as a different payment.
+        let node = try #require(recorder.node(for: "a.test"))
+        await node.send("tx", ReorgFixtures.transaction + Data([0x00]))
+
+        #expect(await eventually { await peerManager.isHostBanned("a.test") })
+        #expect(events.transactionEvents.isEmpty)
+        await sync.stop()
+    }
+
+    @Test("A transaction whose block is reorganized away is confirmed again in the block that replaced it")
+    func reorganizedTransactionIsReconfirmed() async throws {
+        let a1 = ReorgFixtures.a1
+        let b1 = ReorgFixtures.b1
+        let b2 = ReorgFixtures.b2
+        let transaction = WireMessage(command: "tx", payload: ReorgFixtures.transaction)
+
+        var script = NodeScript()
+        script.magic = NetworkConstants.testnetMagic
+        script.startHeight = 1
+        script.headersReply = ReorgFixtures.headersPayload([a1])
+        script.filteredBlocks = [
+            a1.hash: [WireMessage(command: "merkleblock", payload: ReorgFixtures.merkleBlock(for: a1, matched: true)), transaction],
+            // The node has sent the transaction once and does not repeat it.
+            b1.hash: [WireMessage(command: "merkleblock", payload: ReorgFixtures.merkleBlock(for: b1, matched: true))],
+            b2.hash: [WireMessage(command: "merkleblock", payload: ReorgFixtures.merkleBlock(for: b2, matched: false))],
+        ]
+        let recorder = NodeRecorder(script: script)
+        let peerManager = makePeerManager(recorder, network: .testnet)
+        let chain = HeaderChain(network: .testnet, storageDirectory: TestDirectories.unique())
+        let sync = SPVSyncManager(network: .testnet, peerManager: peerManager, headerChain: chain)
+        let events = SyncEventLog()
+        await sync.setDelegate(events)
+        await sync.start()
+
+        // The wallet's transaction confirms in a1.
+        await peerManager.addPeer(host: "a.test")
+        #expect(await eventually { await sync.currentHeight == 1 })
+        await sync.configureBloomFilter(elements: [ReorgFixtures.paidPubkeyHash], startHeight: 1)
+        #expect(await eventually { events.transactionEvents == [.confirmed(blockHash: a1.hash, height: 1)] })
+
+        // Then a longer branch replaces a1 with b1, which holds it too.
+        let node = try #require(recorder.node(for: "a.test"))
+        await node.send("headers", ReorgFixtures.headersPayload([b1, b2]))
+
+        #expect(await eventually { await sync.currentHeight == 2 })
+        #expect(await eventually {
+            events.transactionEvents == [
+                .confirmed(blockHash: a1.hash, height: 1),
+                .reorged(previousBlockHash: a1.hash, previousHeight: 1),
+                .confirmed(blockHash: b1.hash, height: 1),
+            ]
+        })
+        #expect(await peerManager.connectedPeerCount == 1)
+        await sync.stop()
+    }
+
+    @Test("The same merkle block arriving again confirms nothing twice and leaves nothing waiting")
+    func duplicateMerkleBlock() async throws {
+        let a1 = ReorgFixtures.a1
+        let merkleBlock = WireMessage(command: "merkleblock", payload: ReorgFixtures.merkleBlock(for: a1, matched: true))
+        let transaction = WireMessage(command: "tx", payload: ReorgFixtures.transaction)
+
+        var script = NodeScript()
+        script.magic = NetworkConstants.testnetMagic
+        script.startHeight = 1
+        script.headersReply = ReorgFixtures.headersPayload([a1])
+        script.filteredBlocks = [a1.hash: [merkleBlock, transaction]]
+        let recorder = NodeRecorder(script: script)
+        let peerManager = makePeerManager(recorder, network: .testnet)
+        let chain = HeaderChain(network: .testnet, storageDirectory: TestDirectories.unique())
+        let sync = SPVSyncManager(network: .testnet, peerManager: peerManager, headerChain: chain)
+        let events = SyncEventLog()
+        await sync.setDelegate(events)
+        await sync.start()
+
+        await peerManager.addPeer(host: "a.test")
+        #expect(await eventually { await sync.currentHeight == 1 })
+        await sync.configureBloomFilter(elements: [ReorgFixtures.paidPubkeyHash], startHeight: 1)
+        let confirmed = [SyncEventLog.TransactionEvent.confirmed(blockHash: a1.hash, height: 1)]
+        #expect(await eventually { events.transactionEvents == confirmed })
+
+        // As when a second peer announces the block and sends it as well.
+        let node = try #require(recorder.node(for: "a.test"))
+        await node.send(merkleBlock.command, merkleBlock.payload)
+        await node.send(transaction.command, transaction.payload)
+        try await Task.sleep(for: .milliseconds(150))
+
+        #expect(events.transactionEvents == confirmed)
+        #expect(await sync.pendingMerkleBlockCount == 0)
+        #expect(await peerManager.connectedPeerCount == 1)
         await sync.stop()
     }
 }

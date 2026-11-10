@@ -11,15 +11,15 @@ import Testing
 @Suite("Mainnet Replay")
 struct MainnetReplayTests {
 
-    private var databasePath: String? {
-        ProcessInfo.processInfo.environment["DOGECOINKIT_MAINNET_HEADERS"]
-    }
-
-    @Test("Every mainnet header satisfies difficulty, version, and work rules")
+    @Test(
+        "Every mainnet header satisfies difficulty, version, and work rules",
+        .enabled(if: TestEnvironment.mainnetHeadersPath != nil)
+    )
     func replayMainnet() throws {
-        guard let databasePath else { return }
+        let databasePath = try #require(TestEnvironment.mainnetHeadersPath)
 
-        let database = try HeaderDatabase(path: databasePath)
+        // Read-only: replaying a sync database must not rewrite or migrate it.
+        let database = try HeaderDatabase(readOnlyPath: databasePath)
         let tipHeight = try #require(try database.getTip()).height
         let rules = ProofOfWorkRules.mainnet
 

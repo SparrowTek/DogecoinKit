@@ -21,7 +21,8 @@ public struct BloomFilter: Sendable {
     }
 
     public init(data: Data, hashFunctions: UInt32, tweak: UInt32, flags: UInt8) {
-        self.data = data
+        // Bits are addressed from zero.
+        self.data = data.rebased
         self.hashFunctions = hashFunctions
         self.tweak = tweak
         self.flags = flags

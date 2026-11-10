@@ -19,13 +19,9 @@ DogecoinKit uses a portable replacement:
 | `os.Logger` | logcat |
 | The system's SQLite | SQLite you build and ship with the app |
 
-Two features remain Apple-only:
-
-- ``SecureKeyStorage``, which stores secrets in the Keychain. On Android,
-  protect the mnemonic with the Android Keystore instead.
-- Installing legacy `headers.bin.lzfse` header caches, which needs Apple's
-  Compression framework. Bundle header caches as `headers.sqlite`; those
-  install on every platform.
+One feature remains Apple-only: ``SecureKeyStorage``, which stores secrets in
+the Keychain. On Android, protect the mnemonic with the Android Keystore
+instead.
 
 DogecoinKit doesn't include a Kotlin or Java interface. An Android app calls
 it through a JNI bridge, such as one generated with swift-java.

@@ -3,9 +3,23 @@ import Testing
 import Foundation
 @testable import DogecoinKit
 
+private let keychainServiceName = "com.dogecoinkit.tests"
+
+/// Keychain items need an entitled host (an app, on a device or simulator).
+/// A plain `swift test` process has none, so the Keychain tests are skipped
+/// there — and reported as skipped — rather than passing without running.
+private let needsKeychain: ConditionTrait = .enabled("The Keychain is not reachable from this test process") {
+    let storage = SecureKeyStorage(serviceName: keychainServiceName)
+    do {
+        let id = try await storage.storeMasterKey("availability-probe", network: .testnet)
+        try await storage.deleteMasterKey(id: id)
+        return true
+    } catch {
+        return false
+    }
+}
+
 /// Tests for SecureKeyStorage
-/// Note: Keychain tests require a host app context (simulator or device)
-/// These tests may fail in pure CLI test runners without Keychain access
 @Suite("Secure Key Storage Tests")
 struct SecureKeyStorageTests {
 
@@ -13,24 +27,13 @@ struct SecureKeyStorageTests {
 
     init() async {
         await Dogecoin.initialize()
-        storage = SecureKeyStorage(serviceName: "com.dogecoinkit.tests")
-    }
-
-    private func requireKeychain() async -> Bool {
-        do {
-            let id = try await storage.storeMasterKey("availability-probe", network: .testnet)
-            try await storage.deleteMasterKey(id: id)
-            return true
-        } catch {
-            return false
-        }
+        storage = SecureKeyStorage(serviceName: keychainServiceName)
     }
 
     // MARK: - Wallet Credentials Tests
 
-    @Test("Store and retrieve wallet credentials")
+    @Test("Store and retrieve wallet credentials", needsKeychain)
     func testStoreAndRetrieveCredentials() async throws {
-        guard await requireKeychain() else { return }
         let mnemonic = try await generateMnemonic(strength: .words12)
         let passphrase = "testpassphrase"
         let network = DogecoinNetwork.testnet
@@ -55,9 +58,8 @@ struct SecureKeyStorageTests {
         try await storage.deleteWalletCredentials(id: id)
     }
 
-    @Test("Wallet credentials with empty passphrase")
+    @Test("Wallet credentials with empty passphrase", needsKeychain)
     func testCredentialsEmptyPassphrase() async throws {
-        guard await requireKeychain() else { return }
         let mnemonic = try await generateMnemonic(strength: .words12)
 
         let id = try await storage.storeWalletCredentials(
@@ -73,9 +75,8 @@ struct SecureKeyStorageTests {
         try await storage.deleteWalletCredentials(id: id)
     }
 
-    @Test("Delete wallet credentials")
+    @Test("Delete wallet credentials", needsKeychain)
     func testDeleteCredentials() async throws {
-        guard await requireKeychain() else { return }
         let mnemonic = try await generateMnemonic(strength: .words12)
 
         let id = try await storage.storeWalletCredentials(
@@ -95,9 +96,8 @@ struct SecureKeyStorageTests {
         #expect(!gone)
     }
 
-    @Test("Retrieve non-existent credentials throws error")
+    @Test("Retrieve non-existent credentials throws error", needsKeychain)
     func testRetrieveNonExistent() async throws {
-        guard await requireKeychain() else { return }
         let fakeID = UUID().uuidString
 
         await #expect(throws: DogecoinError.self) {
@@ -107,9 +107,8 @@ struct SecureKeyStorageTests {
 
     // MARK: - Master Key Tests
 
-    @Test("Store and retrieve master key")
+    @Test("Store and retrieve master key", needsKeychain)
     func testMasterKeyStorage() async throws {
-        guard await requireKeychain() else { return }
         let wallet = try await HDWallet.create(strength: .words12, network: .testnet)
 
         let id = try await storage.storeMasterKey(wallet.masterKey, network: .testnet)
@@ -124,9 +123,8 @@ struct SecureKeyStorageTests {
 
     // MARK: - Private Key Tests
 
-    @Test("Store and retrieve private key")
+    @Test("Store and retrieve private key", needsKeychain)
     func testPrivateKeyStorage() async throws {
-        guard await requireKeychain() else { return }
         let keyPair = try await KeyPair.generate(network: .testnet)
 
         let id = try await storage.storePrivateKey(keyPair.privateKeyWIF, address: keyPair.address)
@@ -141,9 +139,8 @@ struct SecureKeyStorageTests {
 
     // MARK: - Convenience Method Tests
 
-    @Test("Create and store wallet")
+    @Test("Create and store wallet", needsKeychain)
     func testCreateAndStoreWallet() async throws {
-        guard await requireKeychain() else { return }
         let (wallet, keychainID) = try await storage.createAndStoreWallet(
             strength: .words12,
             network: .testnet
@@ -162,9 +159,8 @@ struct SecureKeyStorageTests {
         try await storage.deleteWalletCredentials(id: keychainID)
     }
 
-    @Test("Import and store wallet")
+    @Test("Import and store wallet", needsKeychain)
     func testImportAndStoreWallet() async throws {
-        guard await requireKeychain() else { return }
         let mnemonic = try await generateMnemonic(strength: .words12)
 
         let (wallet, keychainID) = try await storage.importAndStoreWallet(
@@ -185,9 +181,8 @@ struct SecureKeyStorageTests {
         try await storage.deleteWalletCredentials(id: keychainID)
     }
 
-    @Test("Restore wallet from stored credentials")
+    @Test("Restore wallet from stored credentials", needsKeychain)
     func testRestoreWallet() async throws {
-        guard await requireKeychain() else { return }
         // First create and store
         let originalMnemonic = try await generateMnemonic(strength: .words12)
         let keychainID = try await storage.storeWalletCredentials(
@@ -212,9 +207,8 @@ struct SecureKeyStorageTests {
 
     // MARK: - Multiple Storage Tests
 
-    @Test("Store multiple wallets with unique IDs")
+    @Test("Store multiple wallets with unique IDs", needsKeychain)
     func testMultipleWallets() async throws {
-        guard await requireKeychain() else { return }
         let mnemonic1 = try await generateMnemonic(strength: .words12)
         let mnemonic2 = try await generateMnemonic(strength: .words12)
 

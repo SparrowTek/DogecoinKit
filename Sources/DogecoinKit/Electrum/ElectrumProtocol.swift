@@ -273,7 +273,6 @@ public enum ElectrumMethod: String, Sendable {
     case blockchainScripthashGetMempool = "blockchain.scripthash.get_mempool"
     case blockchainScripthashListUnspent = "blockchain.scripthash.listunspent"
     case blockchainScripthashSubscribe = "blockchain.scripthash.subscribe"
-    case blockchainScripthashUnsubscribe = "blockchain.scripthash.unsubscribe"
 
     // Transaction methods
     case blockchainTransactionGet = "blockchain.transaction.get"

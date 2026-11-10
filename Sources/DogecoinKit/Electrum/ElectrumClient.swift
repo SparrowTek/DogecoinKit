@@ -29,6 +29,16 @@ public actor ElectrumClient {
 
     private let connectionTimeout: Duration = .seconds(30)
     private let requestTimeout: Duration
+    static let defaultRequestTimeout: Duration = .seconds(60)
+
+    /// How long the connection may go without a request before it is
+    /// pinged. ElectrumX closes a session that has sent nothing for about
+    /// ten minutes — however many notifications it has been pushing — so an
+    /// idle wallet waiting for a payment would otherwise be cut off, and
+    /// reconnect, over and over.
+    private let keepaliveInterval: Duration
+    private var keepaliveTask: Task<Void, Never>?
+    private var lastRequestTime = ContinuousClock.now
 
     /// Upper bound for a single newline-delimited JSON-RPC line. A server (or
     /// MITM on the wire) that streams data without ever sending a newline
@@ -44,10 +54,24 @@ public actor ElectrumClient {
         self.init(server: server, streamFactory: defaultByteStreamFactory)
     }
 
-    init(server: ElectrumServer, streamFactory: @escaping ByteStreamFactory, requestTimeout: Duration = .seconds(60)) {
+    init(
+        server: ElectrumServer,
+        streamFactory: @escaping ByteStreamFactory,
+        requestTimeout: Duration = ElectrumClient.defaultRequestTimeout,
+        keepaliveInterval: Duration = .seconds(240)
+    ) {
         self.server = server
         self.makeStream = streamFactory
         self.requestTimeout = requestTimeout
+        self.keepaliveInterval = keepaliveInterval
+    }
+
+    deinit {
+        // A client dropped without `disconnect()` must not leave its socket
+        // and reader behind.
+        keepaliveTask?.cancel()
+        connectTask?.cancel()
+        stream?.close()
     }
 
     // MARK: - Connection Management
@@ -145,6 +169,7 @@ public actor ElectrumClient {
             }
             logger.info("Connected to \(self.server.host, privacy: .public) — server version \(version.joined(separator: " "), privacy: .public)")
             isConnected = true
+            startKeepalive(on: stream)
         } catch {
             logger.error("Version handshake with \(self.server.host, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
             if self.stream === stream {
@@ -156,6 +181,8 @@ public actor ElectrumClient {
 
     /// Closes the current stream and fails everything waiting on it.
     private func teardown(failingWith error: Error) {
+        keepaliveTask?.cancel()
+        keepaliveTask = nil
         stream?.close()
         stream = nil
         writer = nil
@@ -184,6 +211,7 @@ public actor ElectrumClient {
 
         requestId += 1
         let id = requestId
+        lastRequestTime = .now
 
         // Newline-delimited JSON-RPC
         let payload = try JSONEncoder().encode(ElectrumRequest(id: id, method: method.rawValue, params: params)) + Data([0x0a])
@@ -248,6 +276,33 @@ public actor ElectrumClient {
         }
     }
 
+    private func startKeepalive(on stream: any ByteStream) {
+        keepaliveTask?.cancel()
+        keepaliveTask = Task { [weak self, keepaliveInterval] in
+            var deadline = ContinuousClock.now + keepaliveInterval
+            while !Task.isCancelled {
+                try? await Task.sleep(until: deadline)
+                guard !Task.isCancelled, let next = await self?.keepAlive(on: stream) else { return }
+                deadline = next
+            }
+        }
+    }
+
+    /// Pings if nothing was sent for a whole interval. An unanswered ping
+    /// times out like any request, which drops the connection so its owner
+    /// reconnects.
+    /// - Returns: When the connection will next have been idle that long,
+    ///   or nil once `source` is no longer the live connection
+    private func keepAlive(on source: any ByteStream) async -> ContinuousClock.Instant? {
+        guard source === stream, isConnected else { return nil }
+
+        if ContinuousClock.now - lastRequestTime >= keepaliveInterval {
+            try? await serverPing()
+            guard source === stream else { return nil }
+        }
+        return lastRequestTime + keepaliveInterval
+    }
+
     private func startReceiving(on stream: any ByteStream) {
         Task { [weak self] in
             do {
@@ -265,17 +320,26 @@ public actor ElectrumClient {
     private func handle(_ chunk: Data, from source: any ByteStream) {
         guard source === stream else { return }
 
+        // What is already buffered holds no newline — every complete line
+        // was taken out when it arrived — so only the new bytes are
+        // searched, and nothing is copied until a line completes. Scanning
+        // and copying the whole buffer for every chunk made the cost of a
+        // long line grow with the square of its length.
+        var searchStart = lineBuffer.endIndex
         lineBuffer.append(chunk)
         var consumed = lineBuffer.startIndex
-        while let newline = lineBuffer[consumed...].firstIndex(of: 0x0a) {
+        while let newline = lineBuffer[searchStart...].firstIndex(of: 0x0a) {
             let line = Data(lineBuffer[consumed..<newline])
             consumed = lineBuffer.index(after: newline)
+            searchStart = consumed
             handleMessage(line)
             // A handler may have torn the connection down.
             guard source === stream else { return }
         }
         // Copy the unconsumed tail so consumed bytes are actually released.
-        lineBuffer = Data(lineBuffer[consumed...])
+        if consumed != lineBuffer.startIndex {
+            lineBuffer = Data(lineBuffer[consumed...])
+        }
 
         // A line that exceeds the cap without a newline is a protocol
         // violation (or an attack) — drop the connection instead of
@@ -376,18 +440,13 @@ public actor ElectrumClient {
         }
     }
 
-    public func unsubscribeScriptHash(_ scriptHash: String) async throws -> Bool {
-        subscriptionHandlers.removeValue(forKey: scriptHash)
-        return try await sendRequest(.blockchainScripthashUnsubscribe, params: [.string(scriptHash)])
-    }
-
     // MARK: - Transaction Methods
 
-    /// Returns raw transaction hex by default (verbose=false)
-    public func getTransaction(txHash: String, verbose: Bool = false) async throws -> String {
+    /// Returns the raw transaction as hex
+    public func getTransaction(txHash: String) async throws -> String {
         try await sendRequest(.blockchainTransactionGet, params: [
             .string(txHash),
-            .bool(verbose)
+            .bool(false)
         ])
     }
 

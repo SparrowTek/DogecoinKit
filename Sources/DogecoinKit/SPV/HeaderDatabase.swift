@@ -10,6 +10,25 @@ public enum HeaderDatabaseError: Error, Sendable {
     case migrationFailed(Error)
     case queryFailed(Error)
     case insertFailed(Error)
+    /// A pre-built header cache failed verification and was not installed
+    case invalidCache(String)
+}
+
+extension HeaderDatabaseError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .databaseNotOpen:
+            return "The header database is not open"
+        case .migrationFailed(let error):
+            return "Header database migration failed: \(error.localizedDescription)"
+        case .queryFailed(let error):
+            return "Header database query failed: \(error.localizedDescription)"
+        case .insertFailed(let error):
+            return "Header database insert failed: \(error.localizedDescription)"
+        case .invalidCache(let reason):
+            return "The header cache is not usable: \(reason)"
+        }
+    }
 }
 
 /// SQLite database for block header storage
@@ -24,8 +43,11 @@ public final class HeaderDatabase: Sendable {
     /// - Parameter path: Path to the SQLite database file
     public init(path: String) throws {
         var config = Configuration()
+        // Another connection to the same file (a second sync manager, a
+        // cache check) makes a write wait briefly instead of failing.
+        config.busyMode = .timeout(5)
         config.prepareDatabase { db in
-            // Enable WAL mode for better concurrent read performance
+            // WAL keeps commits cheap: one append instead of a journal
             try db.execute(sql: "PRAGMA journal_mode = WAL")
             // Optimize for our read-heavy workload
             try db.execute(sql: "PRAGMA synchronous = NORMAL")
@@ -36,6 +58,29 @@ public final class HeaderDatabase: Sendable {
         self.dbQueue = try DatabaseQueue(path: path, configuration: config)
         try migrate()
         logger.info("Opened header database at \(path)")
+    }
+
+    /// Whether `error` says the file itself is damaged, or is not a
+    /// database at all — as opposed to a failure that may not repeat.
+    static func indicatesUnreadableFile(_ error: Error) -> Bool {
+        guard let error = error as? DatabaseError else { return false }
+        return error.resultCode == .SQLITE_NOTADB || error.resultCode == .SQLITE_CORRUPT
+    }
+
+    /// Opens an existing database for reading only.
+    ///
+    /// Nothing is written: no journal mode change, no migration. Use it to
+    /// inspect or verify a header database without altering it — opening
+    /// one with ``init(path:)`` rewrites its header and can migrate it.
+    ///
+    /// SQLite can only read a database left in write-ahead-log mode this
+    /// way while its `-wal` and `-shm` files are still beside it, as they
+    /// are after ``init(path:)`` has opened it on Apple platforms.
+    /// - Parameter path: Path to the SQLite database file
+    public init(readOnlyPath path: String) throws {
+        var config = Configuration()
+        config.readonly = true
+        self.dbQueue = try DatabaseQueue(path: path, configuration: config)
     }
 
     /// Initialize with an in-memory database (for testing)
@@ -76,6 +121,17 @@ public final class HeaderDatabase: Sendable {
                 on: "headers",
                 columns: ["merkleRoot"]
             )
+        }
+
+        // No query ever filtered on the previous-block hash or the merkle
+        // root, yet their indexes were a quarter of the database — about
+        // 525 MB of a full mainnet chain — and more than doubled the pages
+        // every insert touches. Dropping them frees those pages for reuse;
+        // the file itself only shrinks when the database is next exported
+        // or vacuumed.
+        migrator.registerMigration("v2_drop_unused_indexes") { db in
+            try db.execute(sql: "DROP INDEX IF EXISTS headers_on_prevBlockHash")
+            try db.execute(sql: "DROP INDEX IF EXISTS idx_headers_merkle_root")
         }
 
         try migrator.migrate(dbQueue)
@@ -133,16 +189,6 @@ public final class HeaderDatabase: Sendable {
     public func headerExists(hash: Data) throws -> Bool {
         try dbQueue.read { db in
             try HeaderRecord.exists(db, key: hash)
-        }
-    }
-
-    /// Find header by merkle root (for merkle proof verification)
-    public func getHeader(merkleRoot: Data) throws -> HeaderRecord? {
-        try dbQueue.read { db in
-            try HeaderRecord
-                .filter(HeaderRecord.Columns.merkleRoot == merkleRoot)
-                .filter(HeaderRecord.Columns.isInBestChain == true)
-                .fetchOne(db)
         }
     }
 
@@ -297,6 +343,13 @@ public final class HeaderDatabase: Sendable {
     }
 
     // MARK: - Utility
+
+    /// Names of the indexes on the headers table
+    func indexNames() throws -> Set<String> {
+        try dbQueue.read { db in
+            try Set(String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'headers'"))
+        }
+    }
 
     /// Access database for raw queries (use sparingly)
     public func read<T>(_ block: (Database) throws -> T) throws -> T {

@@ -14,6 +14,19 @@ public enum ElectrumError: Error, Sendable {
     case invalidAddress(String)
 }
 
+extension ElectrumError {
+    /// Whether this error means the connection it happened on is gone: it
+    /// closed, or it was dropped because the server stopped answering.
+    var endedConnection: Bool {
+        switch self {
+        case .serverDisconnected, .connectionTimeout:
+            true
+        default:
+            false
+        }
+    }
+}
+
 extension ElectrumError: LocalizedError {
     public var errorDescription: String? {
         switch self {

@@ -4,7 +4,6 @@ Work with Dogecoin amounts safely and accurately.
 
 @Metadata {
     @PageKind(article)
-    @PageImage(purpose: card, source: "amounts-card", alt: "Handling Dogecoin amounts")
 }
 
 ## Overview
@@ -164,7 +163,7 @@ print(each.doge)  // 25.0
 
 ## Comparisons
 
-``DogecoinAmount`` conforms to ``Comparable``:
+``DogecoinAmount`` conforms to `Comparable`:
 
 ```swift
 let small = DogecoinAmount(doge: 10)
@@ -203,7 +202,7 @@ func calculateFee(inputCount: Int, outputCount: Int) -> DogecoinAmount {
 }
 
 let fee = calculateFee(inputCount: 2, outputCount: 2)
-print("Estimated fee: \(fee)")  // "0.37400000 DOGE"
+print("Estimated fee: \(fee)")  // "Estimated fee: 0.37400000 DOGE"
 ```
 
 ``FeeEstimation`` provides this calculation, with priority levels and the 0.01 DOGE minimum fee applied.
@@ -258,7 +257,7 @@ let utxos = [
 ]
 
 let total = totalBalance(utxos: utxos)
-print("Total: \(total)")  // "100.00000000 DOGE"
+print("Total: \(total)")  // "Total: 100.00000000 DOGE"
 ```
 
 ## Displaying Amounts
@@ -312,7 +311,7 @@ print(amount.localizedString())  // "1,234,567.89" (US) or "1.234.567,89" (DE)
 
 ## Serialization
 
-``DogecoinAmount`` conforms to ``Codable``:
+``DogecoinAmount`` conforms to `Codable`:
 
 ```swift
 struct Transaction: Codable {

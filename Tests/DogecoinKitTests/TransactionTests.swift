@@ -50,10 +50,11 @@ struct TransactionTests {
             confirmations: 6
         )
 
-        await #expect(throws: DogecoinError.self) {
+        // A valid recipient, so nothing but the missing key can fail.
+        await #expect(throws: DogecoinError.transactionValidationFailed("Missing signing key for address \(address)")) {
             _ = try await createTransaction(
                 inputs: [utxo],
-                outputs: [(address: "DFbJ8uS9Q2c8E7yVX7p2XfX9wRkN8qVZ3m", amount: DogecoinAmount(doge: 1))],
+                outputs: [(address: "DD8sGWjLS7KodzdhWFA63G2Ryn1Ku1qjQ5", amount: DogecoinAmount(doge: 1))],
                 signingKeysByAddress: [:],
                 changeAddress: address,
                 fee: DogecoinAmount(doge: 0.1)

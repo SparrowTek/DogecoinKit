@@ -129,11 +129,6 @@ public enum DogecoinNetwork: Sendable {
         self == .testnet ? 1 : 0
     }
 
-    /// Boolean flag for C API compatibility (bool version)
-    internal var isTestnetBool: Bool {
-        self == .testnet
-    }
-
     /// Address prefix for P2PKH addresses
     public var addressPrefix: String {
         switch self {
@@ -170,10 +165,19 @@ public enum DogecoinNetwork: Sendable {
 
 /// Encoded as `0` (mainnet) or `1` (testnet).
 extension DogecoinNetwork: Codable {
+    /// - Throws: `DecodingError.dataCorrupted` for any other value. Reading
+    ///   an unknown value as mainnet would turn a corrupted or
+    ///   newer-format record into a real-money wallet.
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
-        let value = try container.decode(Int.self)
-        self = value == 1 ? .testnet : .mainnet
+        switch try container.decode(Int.self) {
+        case 0:
+            self = .mainnet
+        case 1:
+            self = .testnet
+        case let value:
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Unknown Dogecoin network \(value)")
+        }
     }
 
     public func encode(to encoder: Encoder) throws {

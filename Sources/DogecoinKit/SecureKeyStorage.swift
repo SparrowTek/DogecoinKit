@@ -48,8 +48,9 @@ private struct KeychainStore {
     }
 
     /// Reads the raw data for this keychain item. Callers pass the raw buffer
-    /// directly into a decoder to avoid round-tripping sensitive material
-    /// through a `String`, which is not zeroizable.
+    /// directly into a decoder, so the stored bytes never pass through an
+    /// intermediate `String`. (The decoded credentials are still Swift
+    /// strings, which the language cannot zeroize.)
     func readData() throws -> Data {
         var query = baseQuery
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -65,15 +66,13 @@ private struct KeychainStore {
         return data
     }
 
-    /// Writes a raw `Data` buffer. Use this path for sensitive credentials so
-    /// we do not materialize intermediate Swift `String` copies that the
-    /// language cannot zeroize on drop.
+    /// Writes a raw `Data` buffer.
     ///
     /// The item is written non-synchronizable (never leaves this device,
     /// never reaches iCloud Keychain) and with
-    /// `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` so it is inaccessible
-    /// until the user has unlocked the device at least once and is never
-    /// migrated to a new device via encrypted backups.
+    /// `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, so it can be read
+    /// only while the device is unlocked and is never migrated to a new
+    /// device via encrypted backups.
     func saveData(_ data: Data) throws {
         var newItem = baseQuery
         newItem[kSecValueData as String] = data
@@ -129,11 +128,23 @@ public struct StoredWalletCredentials: Codable, Sendable {
     }
 }
 
+/// Describes the credentials without the secrets, so logging or
+/// interpolating a value can never print a recovery phrase.
+extension StoredWalletCredentials: CustomStringConvertible, CustomDebugStringConvertible {
+    public var description: String {
+        "StoredWalletCredentials(network: \(network), storedAt: \(storedAt))"
+    }
+
+    public var debugDescription: String {
+        description
+    }
+}
+
 // MARK: - Secure Key Storage
 
-/// Manages secure storage of wallet credentials in the iOS Keychain
+/// Manages secure storage of wallet credentials in the Keychain (iOS and macOS)
 ///
-/// This class provides a thread-safe interface for storing, retrieving, and deleting
+/// This actor provides a thread-safe interface for storing, retrieving, and deleting
 /// sensitive wallet data such as mnemonic phrases and master keys.
 ///
 /// ## Usage
@@ -142,17 +153,17 @@ public struct StoredWalletCredentials: Codable, Sendable {
 /// let storage = SecureKeyStorage(serviceName: "com.myapp.wallet")
 ///
 /// // Store credentials
-/// let id = try storage.storeWalletCredentials(
+/// let id = try await storage.storeWalletCredentials(
 ///     mnemonic: "abandon abandon...",
 ///     passphrase: "",
 ///     network: .mainnet
 /// )
 ///
 /// // Retrieve credentials
-/// let credentials = try storage.retrieveWalletCredentials(id: id)
+/// let credentials = try await storage.retrieveWalletCredentials(id: id)
 ///
 /// // Delete when done
-/// try storage.deleteWalletCredentials(id: id)
+/// try await storage.deleteWalletCredentials(id: id)
 /// ```
 public actor SecureKeyStorage {
 
@@ -210,9 +221,6 @@ public actor SecureKeyStorage {
             try store.saveData(jsonData)
             keychainLogger.info("Stored wallet credentials id=\(id, privacy: .public) network=\(String(describing: network), privacy: .public)")
             return id
-        } catch let error as DogecoinError {
-            keychainLogger.error("Store wallet credentials failed id=\(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
-            throw error
         } catch let error as KeychainStoreError {
             keychainLogger.error("Store wallet credentials failed id=\(id, privacy: .public): \(String(describing: error), privacy: .public)")
             throw DogecoinError.keychainStorageFailed("\(error)")
@@ -235,8 +243,6 @@ public actor SecureKeyStorage {
             let credentials = try JSONDecoder().decode(StoredWalletCredentials.self, from: jsonData)
             keychainLogger.debug("Retrieved wallet credentials id=\(id, privacy: .public)")
             return credentials
-        } catch let error as DogecoinError {
-            throw error
         } catch KeychainStoreError.notFound {
             keychainLogger.error("Wallet credentials not found id=\(id, privacy: .public)")
             throw DogecoinError.keyNotFound(id)
@@ -260,8 +266,10 @@ public actor SecureKeyStorage {
             try store.delete()
             keychainLogger.info("Deleted wallet credentials id=\(id, privacy: .public)")
         } catch {
-            keychainLogger.error("Delete wallet credentials failed id=\(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
-            throw DogecoinError.keychainDeletionFailed(error.localizedDescription)
+            // `"\(error)"`, not `localizedDescription`: only the former
+            // carries the Keychain status code.
+            keychainLogger.error("Delete wallet credentials failed id=\(id, privacy: .public): \(String(describing: error), privacy: .public)")
+            throw DogecoinError.keychainDeletionFailed("\(error)")
         }
     }
 
@@ -298,8 +306,6 @@ public actor SecureKeyStorage {
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
             try store.saveData(jsonData)
             return id
-        } catch let error as DogecoinError {
-            throw error
         } catch let error as KeychainStoreError {
             throw DogecoinError.keychainStorageFailed("\(error)")
         } catch {
@@ -310,7 +316,7 @@ public actor SecureKeyStorage {
     /// Retrieve a master key from the Keychain
     /// - Parameter id: The identifier returned from `storeMasterKey`
     /// - Returns: A tuple containing the master key and network
-    /// - Throws: `DogecoinError.keyNotFound` if not found
+    /// - Throws: `DogecoinError.keyNotFound` if not found, or `DogecoinError.keychainRetrievalFailed` on error
     public func retrieveMasterKey(id: String) throws -> (masterKey: String, network: DogecoinNetwork) {
         let accountName = Self.masterKeyPrefix + id
 
@@ -319,14 +325,13 @@ public actor SecureKeyStorage {
             let jsonData = try store.readData()
             let payload = try JSONDecoder().decode(MasterKeyPayload.self, from: jsonData)
             return (payload.masterKey, payload.network)
-        } catch let error as DogecoinError {
-            throw error
         } catch KeychainStoreError.notFound {
             throw DogecoinError.keyNotFound(id)
         } catch let error as KeychainStoreError {
             throw DogecoinError.keychainRetrievalFailed("\(error)")
         } catch {
-            throw DogecoinError.keyNotFound(id)
+            // The item exists but does not decode
+            throw DogecoinError.keychainRetrievalFailed(error.localizedDescription)
         }
     }
 
@@ -340,7 +345,7 @@ public actor SecureKeyStorage {
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
             try store.delete()
         } catch {
-            throw DogecoinError.keychainDeletionFailed(error.localizedDescription)
+            throw DogecoinError.keychainDeletionFailed("\(error)")
         }
     }
 
@@ -364,8 +369,6 @@ public actor SecureKeyStorage {
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
             try store.saveData(jsonData)
             return id
-        } catch let error as DogecoinError {
-            throw error
         } catch let error as KeychainStoreError {
             throw DogecoinError.keychainStorageFailed("\(error)")
         } catch {
@@ -376,7 +379,7 @@ public actor SecureKeyStorage {
     /// Retrieve an individual private key from the Keychain
     /// - Parameter id: The identifier returned from `storePrivateKey`
     /// - Returns: A tuple containing the private key WIF and associated address
-    /// - Throws: `DogecoinError.keyNotFound` if not found
+    /// - Throws: `DogecoinError.keyNotFound` if not found, or `DogecoinError.keychainRetrievalFailed` on error
     public func retrievePrivateKey(id: String) throws -> (privateKeyWIF: String, address: String) {
         let accountName = Self.privateKeyPrefix + id
 
@@ -385,14 +388,13 @@ public actor SecureKeyStorage {
             let jsonData = try store.readData()
             let payload = try JSONDecoder().decode(PrivateKeyPayload.self, from: jsonData)
             return (payload.privateKeyWIF, payload.address)
-        } catch let error as DogecoinError {
-            throw error
         } catch KeychainStoreError.notFound {
             throw DogecoinError.keyNotFound(id)
         } catch let error as KeychainStoreError {
             throw DogecoinError.keychainRetrievalFailed("\(error)")
         } catch {
-            throw DogecoinError.keyNotFound(id)
+            // The item exists but does not decode
+            throw DogecoinError.keychainRetrievalFailed(error.localizedDescription)
         }
     }
 
@@ -406,7 +408,7 @@ public actor SecureKeyStorage {
             let store = KeychainStore(service: serviceName, account: accountName, accessGroup: accessGroup)
             try store.delete()
         } catch {
-            throw DogecoinError.keychainDeletionFailed(error.localizedDescription)
+            throw DogecoinError.keychainDeletionFailed("\(error)")
         }
     }
 }

@@ -42,10 +42,16 @@ public actor ElectrumSyncManager {
     /// clear its successor.
     private var reconnectLoopGeneration = 0
 
-    /// Funding-transaction outputs already checked against their txids.
+    /// Outputs already checked against their funding transaction's txid.
     /// Transactions never change, so these stay valid; the capacity covers
     /// wallets with thousands of UTXOs, whose first check servers throttle.
-    private let verifiedOutputs = LRUCache<String, [RawTransaction.Output]>(capacity: 8192)
+    private let verifiedOutputs = LRUCache<Outpoint, RawTransaction.Output>(capacity: 8192)
+
+    /// Where the next connection attempt starts in `serverList`. It moves
+    /// past a server whose connection was lost or that would not take the
+    /// subscriptions back, so one that accepts connections but does not
+    /// work is not retried forever while the others go unused.
+    private var nextServerIndex = 0
 
     private enum DelegateEvent: Sendable {
         case progress(Double, height: Int32)
@@ -72,6 +78,7 @@ public actor ElectrumSyncManager {
 
     private let serverList: [ElectrumServer]
     private let streamFactory: ByteStreamFactory
+    private let requestTimeout: Duration
 
     /// Per-server connection timeout
     private let connectionTimeout: Duration = .seconds(10)
@@ -90,10 +97,22 @@ public actor ElectrumSyncManager {
         self.init(network: network, serverList: ElectrumServerList.servers(for: network).shuffled())
     }
 
-    init(network: DogecoinNetwork, serverList: [ElectrumServer], streamFactory: @escaping ByteStreamFactory = defaultByteStreamFactory) {
+    /// Creates a sync manager that uses your own servers instead of the
+    /// built-in list. They are tried in the order given.
+    public init(network: DogecoinNetwork, servers: [ElectrumServer]) {
+        self.init(network: network, serverList: servers)
+    }
+
+    init(
+        network: DogecoinNetwork,
+        serverList: [ElectrumServer],
+        streamFactory: @escaping ByteStreamFactory = defaultByteStreamFactory,
+        requestTimeout: Duration = ElectrumClient.defaultRequestTimeout
+    ) {
         self.network = network
         self.serverList = serverList
         self.streamFactory = streamFactory
+        self.requestTimeout = requestTimeout
     }
 
     // MARK: - Public Methods
@@ -293,9 +312,27 @@ public actor ElectrumSyncManager {
     /// Broadcasts once and never retries: if the connection drops before the
     /// reply, the transaction may or may not have reached the server, and the
     /// caller is better placed to decide what to do about that.
+    ///
+    /// Cancelling the calling task does not abandon a broadcast under way.
+    /// By then the transaction is with the server, and giving up could only
+    /// hide whether it was accepted.
+    /// - Returns: The transaction's id, computed from the transaction
+    ///   itself. A server decides whether to accept a transaction, not
+    ///   what it is called.
     public func broadcastTransaction(_ rawHex: String) async throws -> String {
         let client = try await connectedClient()
-        return try await client.broadcastTransaction(rawHex: rawHex)
+        let reported = try await Task {
+            try await client.broadcastTransaction(rawHex: rawHex)
+        }.value
+
+        guard let raw = Data(hexString: rawHex) else {
+            return reported
+        }
+        let txid = Data(MerkleTree.doubleSHA256(raw).reversed()).hexString
+        if reported.lowercased() != txid {
+            logger.error("Server reported txid \(reported, privacy: .public) for transaction \(txid, privacy: .public)")
+        }
+        return txid
     }
 
     public func subscribeToAddresses(_ addresses: [String]) async throws {
@@ -319,14 +356,17 @@ public actor ElectrumSyncManager {
     // MARK: - Connection
 
     /// Runs `operation` against the live client. If the connection drops
-    /// underneath it, reconnects once and runs it again — every operation
-    /// routed through here is a read or an idempotent subscription.
+    /// underneath it — or the server stops answering, which drops it too —
+    /// reconnects once and runs it again. Every operation routed through
+    /// here is a read or an idempotent subscription.
     private func withClient<T: Sendable>(_ operation: @Sendable (ElectrumClient) async throws -> T) async throws -> T {
         let client = try await connectedClient()
         do {
             return try await operation(client)
-        } catch ElectrumError.serverDisconnected where isRunning {
-            logger.info("Connection dropped mid-request; reconnecting and retrying once")
+        } catch let error as ElectrumError where isRunning && error.endedConnection {
+            logger.info("Connection lost mid-request; reconnecting and retrying once")
+            // The client's own notice of the drop may not have arrived yet.
+            clientDidDisconnect(client)
             return try await operation(try await connectedClient())
         }
     }
@@ -396,6 +436,7 @@ public actor ElectrumSyncManager {
                     self.client = nil
                     connectedServer = nil
                     state = .connecting
+                    tryNextServerFirst()
                 }
                 await client.disconnect()
                 throw error
@@ -418,7 +459,15 @@ public actor ElectrumSyncManager {
         client = nil
         connectedServer = nil
         state = .connecting
+        tryNextServerFirst()
         startReconnectLoop()
+    }
+
+    /// Makes the next attempt begin with the server after the one that was
+    /// just in use.
+    private func tryNextServerFirst() {
+        guard !serverList.isEmpty else { return }
+        nextServerIndex = (nextServerIndex + 1) % serverList.count
     }
 
     private func startReconnectLoop() {
@@ -483,13 +532,17 @@ public actor ElectrumSyncManager {
 
         state = .connecting
 
-        // Try servers until one connects
+        // Try servers until one connects, starting where the last attempt
+        // left off
         var lastError: Error?
-        for (index, server) in serverList.enumerated() {
+        let firstIndex = nextServerIndex
+        for offset in serverList.indices {
             try Task.checkCancellation()
-            logger.debug("Trying server \(index + 1, privacy: .public)/\(self.serverList.count, privacy: .public): \(server.host, privacy: .public):\(server.port, privacy: .public)")
+            let index = (firstIndex + offset) % serverList.count
+            let server = serverList[index]
+            logger.debug("Trying server \(offset + 1, privacy: .public)/\(self.serverList.count, privacy: .public): \(server.host, privacy: .public):\(server.port, privacy: .public)")
 
-            let candidate = ElectrumClient(server: server, streamFactory: streamFactory)
+            let candidate = ElectrumClient(server: server, streamFactory: streamFactory, requestTimeout: requestTimeout)
             do {
                 try await connectWithTimeout(candidate)
 
@@ -516,6 +569,7 @@ public actor ElectrumSyncManager {
 
                 client = candidate
                 connectedServer = server
+                nextServerIndex = index
                 currentHeight = Int32(clamping: header.height)
                 progress = 1.0
                 state = .connected
@@ -561,6 +615,22 @@ public actor ElectrumSyncManager {
 
     // MARK: - UTXO Verification
 
+    /// Where an output sits on the chain
+    private struct Outpoint: Hashable, Sendable {
+        /// Lowercase display-order hex
+        let txid: String
+        let index: Int
+
+        init(txid: String, index: Int) {
+            self.txid = txid
+            self.index = index
+        }
+
+        init(_ utxo: ElectrumUTXO) {
+            self.init(txid: utxo.txHash.lowercased(), index: utxo.txPos)
+        }
+    }
+
     /// Checks every UTXO against the transaction that created it: that
     /// transaction must hash to the claimed txid, and the output must exist,
     /// pay the address, and carry exactly the reported value.
@@ -571,54 +641,104 @@ public actor ElectrumSyncManager {
     /// - Throws: `ElectrumError.invalidResponse` for the first UTXO the
     ///   server misreported
     private func verifyAgainstFundingTransactions(_ utxos: [(address: String, utxo: ElectrumUTXO)]) async throws {
-        let outputsByTxid = try await fundingOutputs(of: Set(utxos.map { $0.utxo.txHash.lowercased() }))
+        // Collected here as well as cached: a wallet with more outputs than
+        // the cache holds must still verify.
+        var outputs: [Outpoint: RawTransaction.Output] = [:]
+        var missing: [String: Set<Int>] = [:]
+        for (_, utxo) in utxos {
+            let outpoint = Outpoint(utxo)
+            if let output = verifiedOutputs.get(outpoint) {
+                outputs[outpoint] = output
+            } else {
+                missing[outpoint.txid, default: []].insert(outpoint.index)
+            }
+        }
+
+        if !missing.isEmpty {
+            outputs.merge(try await fetchVerifiedOutputs(missing)) { _, fetched in fetched }
+        }
 
         for (address, utxo) in utxos {
-            guard let outputs = outputsByTxid[utxo.txHash.lowercased()],
-                  outputs.indices.contains(utxo.txPos),
-                  outputs[utxo.txPos].script == Address.scriptPubKey(for: address),
-                  outputs[utxo.txPos].value == UInt64(exactly: utxo.value) else {
+            guard let output = outputs[Outpoint(utxo)],
+                  output.script == Address.scriptPubKey(for: address),
+                  output.value == UInt64(exactly: utxo.value) else {
                 logger.error("Server misreported UTXO \(utxo.outpoint, privacy: .public)")
                 throw ElectrumError.invalidResponse("Server misreported output \(utxo.outpoint)")
             }
         }
     }
 
-    /// The outputs of each transaction, from the cache or fetched a few at a
-    /// time — a wallet with hundreds of small outputs must not flood the
-    /// server — and checked against the txid.
-    private func fundingOutputs(of txids: Set<String>) async throws -> [String: [RawTransaction.Output]] {
-        var outputsByTxid: [String: [RawTransaction.Output]] = [:]
-        for txid in txids {
-            outputsByTxid[txid] = verifiedOutputs.get(txid)
-        }
-        let missing = txids.filter { outputsByTxid[$0] == nil }
-        guard !missing.isEmpty else { return outputsByTxid }
+    /// Fetches transactions a few at a time — a wallet with hundreds of
+    /// small outputs must not flood the server — checks each against its
+    /// txid, and returns the outputs asked for.
+    ///
+    /// Each transaction's outputs are cached as soon as it verifies. When
+    /// one fetch among thousands fails, the retry — or the next refresh —
+    /// carries on from there instead of starting over.
+    /// - Parameter indexesByTxid: The output indexes needed, by txid
+    private func fetchVerifiedOutputs(_ indexesByTxid: [String: Set<Int>]) async throws -> [Outpoint: RawTransaction.Output] {
+        try await withClient { client in
+            // This runs again after a reconnect, and then picks up whatever
+            // the first run got through.
+            let cached = await self.cachedOutputs(of: indexesByTxid)
+            var outputs = cached.outputs
 
-        let fetched = try await withClient { client in
             try await withThrowingTaskGroup(of: (txid: String, outputs: [RawTransaction.Output]).self) { group in
-                var remaining = missing.makeIterator()
+                var remaining = cached.missingTxids.makeIterator()
                 for _ in 0..<Self.maximumConcurrentTransactionFetches {
                     guard let txid = remaining.next() else { break }
                     group.addTask { (txid, try await Self.verifiedOutputs(of: txid, from: client)) }
                 }
 
-                var results: [(txid: String, outputs: [RawTransaction.Output])] = []
-                while let result = try await group.next() {
-                    results.append(result)
+                while let (txid, fetched) = try await group.next() {
+                    let kept = await self.remember(fetched, of: txid, at: indexesByTxid[txid] ?? [])
+                    outputs.merge(kept) { _, new in new }
                     if let txid = remaining.next() {
                         group.addTask { (txid, try await Self.verifiedOutputs(of: txid, from: client)) }
                     }
                 }
-                return results
+            }
+            return outputs
+        }
+    }
+
+    /// The outputs among `indexesByTxid` that are already cached, and the
+    /// transactions to fetch for the rest.
+    private func cachedOutputs(
+        of indexesByTxid: [String: Set<Int>]
+    ) -> (outputs: [Outpoint: RawTransaction.Output], missingTxids: [String]) {
+        var outputs: [Outpoint: RawTransaction.Output] = [:]
+        var missingTxids: [String] = []
+        for (txid, indexes) in indexesByTxid {
+            var isMissingAny = false
+            for index in indexes {
+                let outpoint = Outpoint(txid: txid, index: index)
+                if let output = verifiedOutputs.get(outpoint) {
+                    outputs[outpoint] = output
+                } else {
+                    isMissingAny = true
+                }
+            }
+            if isMissingAny {
+                missingTxids.append(txid)
             }
         }
+        return (outputs, missingTxids)
+    }
 
-        for (txid, outputs) in fetched {
-            verifiedOutputs.set(txid, outputs)
-            outputsByTxid[txid] = outputs
+    /// Caches the outputs of `txid` at `indexes` and returns them by outpoint.
+    private func remember(
+        _ outputs: [RawTransaction.Output],
+        of txid: String,
+        at indexes: Set<Int>
+    ) -> [Outpoint: RawTransaction.Output] {
+        var kept: [Outpoint: RawTransaction.Output] = [:]
+        for index in indexes where outputs.indices.contains(index) {
+            let outpoint = Outpoint(txid: txid, index: index)
+            verifiedOutputs.set(outpoint, outputs[index])
+            kept[outpoint] = outputs[index]
         }
-        return outputsByTxid
+        return kept
     }
 
     /// Fetches a transaction and returns its outputs, once it hashes to `txid`.

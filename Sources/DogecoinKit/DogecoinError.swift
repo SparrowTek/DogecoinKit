@@ -2,7 +2,8 @@ import Foundation
 
 /// Errors that can occur when using the Dogecoin library
 public enum DogecoinError: Error, LocalizedError, Sendable, Equatable {
-    /// The library failed to initialize the ECC context
+    /// The library is not initialized: `Dogecoin.initialize()` has not
+    /// finished, or `Dogecoin.cleanup()` has run since
     case initializationFailed
 
     /// Key generation failed

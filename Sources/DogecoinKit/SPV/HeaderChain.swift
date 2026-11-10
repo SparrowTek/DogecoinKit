@@ -49,31 +49,6 @@ extension BlockHeader: Codable {
     }
 }
 
-// MARK: - Binary Serialization (kept for migration compatibility)
-
-extension StoredHeader {
-    /// Serialize to binary format: 80 bytes header + 4 bytes height + 32 bytes chainWork = 116 bytes
-    func serializeBinary() -> Data {
-        var data = Data()
-        data.reserveCapacity(116)
-        data.append(header.serializeCore())
-        withUnsafeBytes(of: height.littleEndian) { data.append(contentsOf: $0) }
-        let paddedChainWork = chainWork.count == 32 ? chainWork : chainWork.prefix(32) + Data(repeating: 0, count: max(0, 32 - chainWork.count))
-        data.append(paddedChainWork.prefix(32))
-        return data
-    }
-
-    /// Deserialize from binary format
-    static func deserializeBinary(from data: Data) -> StoredHeader? {
-        guard let headerBytes = data.bytes(at: 0, count: 80),
-              let header = BlockHeader.parse(from: headerBytes),
-              let heightRaw: Int32 = data.readInteger(at: 80),
-              let chainWork = data.bytes(at: 84, count: 32) else { return nil }
-
-        return StoredHeader(header: header, height: Int32(littleEndian: heightRaw), chainWork: chainWork)
-    }
-}
-
 /// Manages the chain of block headers for SPV verification
 ///
 /// Every header is checked the way Dogecoin Core checks it before it can
@@ -91,6 +66,8 @@ extension StoredHeader {
 ///   (DigiShield) demands, so nobody can claim easy targets or invent work.
 /// - **Time** — later than the median of the previous 11 blocks, and no more
 ///   than two hours in the future.
+///
+/// On testnet only the checkpoint, proof-of-work, and time rules apply.
 public actor HeaderChain {
     /// The network
     public nonisolated let network: DogecoinNetwork
@@ -116,8 +93,8 @@ public actor HeaderChain {
     /// Cached warning state for auxpow handling
     private var didLogAuxpowWarning = false
 
-    /// Binary record size for migration: 80 (header) + 4 (height) + 32 (chainWork) = 116 bytes
-    private static let binaryRecordSize = 116
+    private static let databaseFileName = "headers.sqlite"
+    private static let metadataFileName = "metadata.json"
 
     // MARK: - Checkpoints
 
@@ -210,7 +187,8 @@ public actor HeaderChain {
     /// - Parameters:
     ///   - network: The Dogecoin network (mainnet or testnet)
     ///   - storageDirectory: Optional custom storage directory for header cache
-    ///   - bundledCacheDirectory: Optional directory containing pre-bundled headers.sqlite
+    ///   - bundledCacheDirectory: Optional directory containing a pre-built
+    ///     `headers.sqlite` and its `metadata.json`
     public init(network: DogecoinNetwork = .mainnet, storageDirectory: URL? = nil, bundledCacheDirectory: URL? = nil) {
         self.network = network
         self.rules = .rules(for: network)
@@ -240,9 +218,15 @@ public actor HeaderChain {
         createStorageDirectory()
         installBundledCacheIfNeeded(from: bundledCacheDirectory)
         openOrCreateDatabase()
-        migrateFromBinaryIfNeeded()
         loadTipFromDatabase()
         initializeGenesisIfNeeded()
+    }
+
+    /// Whether the header database opened. When it did not — a full disk,
+    /// an unwritable directory — the chain can neither read nor store
+    /// headers, and a sync built on it could only stall.
+    public var isOpen: Bool {
+        database != nil
     }
 
     // MARK: - Database Setup
@@ -252,7 +236,7 @@ public actor HeaderChain {
     }
 
     private func openOrCreateDatabase() {
-        let dbPath = storageURL.appendingPathComponent("headers.sqlite").path
+        let dbPath = storageURL.appendingPathComponent(Self.databaseFileName).path
         do {
             database = try HeaderDatabase(path: dbPath)
             logger.info("Opened header database at \(dbPath)")
@@ -273,122 +257,153 @@ public actor HeaderChain {
         }
     }
 
-    /// Migrate from legacy binary format to SQLite
-    private func migrateFromBinaryIfNeeded() {
-        let binaryURL = storageURL.appendingPathComponent("headers.bin")
-        guard FileManager.default.fileExists(atPath: binaryURL.path),
-              let db = database else {
-            return
-        }
+    // MARK: - Bundled Cache
 
-        do {
-            let existingCount = try db.getHeaderCount()
-            if existingCount > 0 {
-                logger.info("Database already has \(existingCount) headers, skipping migration")
-                return
-            }
-        } catch {
-            logger.error("Failed to check database: \(error.localizedDescription)")
-            return
-        }
-
-        logger.info("Migrating from binary format to SQLite...")
-
-        do {
-            let data = try Data(contentsOf: binaryURL)
-            let recordCount = data.count / Self.binaryRecordSize
-
-            var records: [HeaderRecord] = []
-            records.reserveCapacity(min(recordCount, 10000))
-
-            for i in 0..<recordCount {
-                let offset = i * Self.binaryRecordSize
-                guard let recordData = data.bytes(at: offset, count: Self.binaryRecordSize),
-                      let stored = StoredHeader.deserializeBinary(from: recordData) else {
-                    logger.warning("Failed to parse binary record at offset \(offset)")
-                    continue
-                }
-
-                let record = HeaderRecord(storedHeader: stored, isInBestChain: true)
-                records.append(record)
-
-                if records.count >= 10000 {
-                    try db.insertHeaders(records)
-                    records.removeAll(keepingCapacity: true)
-                    logger.debug("Migrated \(i + 1) / \(recordCount) headers")
-                }
-            }
-
-            if !records.isEmpty {
-                try db.insertHeaders(records)
-            }
-
-            // Backup and remove old binary file
-            let backupURL = binaryURL.appendingPathExtension("migrated")
-            try? FileManager.default.moveItem(at: binaryURL, to: backupURL)
-
-            logger.info("Successfully migrated \(recordCount) headers to SQLite")
-        } catch {
-            logger.error("Migration from binary failed: \(error.localizedDescription)")
-        }
+    /// What stands where the local database should be
+    private enum LocalDatabase {
+        /// Nothing worth keeping: no file, no headers, or a file SQLite
+        /// cannot read (which has been deleted)
+        case none
+        /// A working database whose best chain reaches this height
+        case tip(Int32)
+        /// A file that could not be inspected but is not provably damaged
+        case indeterminate
     }
 
-    /// Attempt to install bundled cache if it's newer than local cache
-    /// Called BEFORE opening the database to avoid close/reopen issues
+    /// Installs the bundled header cache when it reaches further than the
+    /// local database, or when there is no usable local database.
+    ///
+    /// Runs before the database is opened. The bundled file is copied next
+    /// to the live one and checked there first, so a failed or interrupted
+    /// install leaves the previous database in place, and a cache for the
+    /// wrong network — or one that does not hold the checkpointed chain — is
+    /// never installed.
     private func installBundledCacheIfNeeded(from bundledDirectory: URL?) {
+        let localURL = storageURL.appendingPathComponent(Self.databaseFileName)
+        let local = inspectLocalDatabase(at: localURL)
+
         guard let bundledDirectory else { return }
 
-        let bundledDBPath = bundledDirectory.appendingPathComponent("headers.sqlite")
-        let bundledMetadataPath = bundledDirectory.appendingPathComponent("metadata.json")
+        let bundledURL = bundledDirectory.appendingPathComponent(Self.databaseFileName)
+        let metadataURL = bundledDirectory.appendingPathComponent(Self.metadataFileName)
 
-        guard FileManager.default.fileExists(atPath: bundledDBPath.path) else {
-            logger.info("No bundled SQLite database found at \(bundledDBPath.path)")
+        guard FileManager.default.fileExists(atPath: bundledURL.path) else {
+            logger.info("No bundled SQLite database found at \(bundledURL.path)")
             return
         }
 
-        guard FileManager.default.fileExists(atPath: bundledMetadataPath.path) else {
-            logger.info("No bundled metadata found at \(bundledMetadataPath.path)")
-            return
-        }
-
+        let metadata: HeaderCacheMetadata
         do {
-            // Read bundled count from metadata (don't open the DB - bundle is read-only)
-            let metadataData = try Data(contentsOf: bundledMetadataPath)
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
-            let metadata = try decoder.decode(HeaderCacheMetadata.self, from: metadataData)
-            let bundledCount = metadata.headerCount
+            metadata = try decoder.decode(HeaderCacheMetadata.self, from: Data(contentsOf: metadataURL))
+        } catch {
+            logger.error("Bundled cache has no readable metadata at \(metadataURL.path): \(error.localizedDescription)")
+            return
+        }
 
-            // Check local database count (if it exists)
-            let localDBPath = storageURL.appendingPathComponent("headers.sqlite")
-            var localCount = 0
+        let networkName = network == .mainnet ? "mainnet" : "testnet"
+        guard metadata.network == networkName else {
+            logger.error("Bundled cache is for \(metadata.network), not \(networkName). Skipping install.")
+            return
+        }
 
-            if FileManager.default.fileExists(atPath: localDBPath.path) {
-                // Temporarily open local DB just to get count, then close
-                let tempDB = try HeaderDatabase(path: localDBPath.path)
-                localCount = try tempDB.getHeaderCount()
-                // tempDB will be deallocated here, closing the connection
+        switch local {
+        case .none:
+            break
+        case .tip(let height) where metadata.tipHeight > Int(height):
+            break
+        case .tip(let height):
+            logger.info("Local database is at height \(height), bundled cache at \(metadata.tipHeight). Skipping install.")
+            return
+        case .indeterminate:
+            logger.error("Local database could not be inspected; leaving it in place and skipping the bundled cache.")
+            return
+        }
+
+        logger.info("Installing bundled cache up to height \(metadata.tipHeight)")
+
+        let stagingURL = storageURL.appendingPathComponent(Self.databaseFileName + ".installing")
+        removeDatabaseFiles(at: stagingURL)
+
+        do {
+            try FileManager.default.copyItem(at: bundledURL, to: stagingURL)
+            try verifyStagedCache(at: stagingURL, expectedTipHeight: metadata.tipHeight)
+
+            // Verification folded everything into the staged file itself,
+            // so what is left beside it is empty scaffolding.
+            guard writeAheadLogIsEmpty(for: stagingURL) else {
+                throw HeaderDatabaseError.invalidCache("its staged copy could not be finalized")
             }
-
-            guard bundledCount > localCount else {
-                logger.info("Local database has \(localCount) headers, bundled has \(bundledCount). Skipping install.")
-                return
-            }
-
-            logger.info("Installing bundled cache: \(bundledCount) headers (local has \(localCount))")
-
-            // Remove local database files (including WAL/SHM)
-            try? FileManager.default.removeItem(at: localDBPath)
-            try? FileManager.default.removeItem(atPath: localDBPath.path + "-wal")
-            try? FileManager.default.removeItem(atPath: localDBPath.path + "-shm")
-
-            // Copy bundled database to local storage
-            try FileManager.default.copyItem(at: bundledDBPath, to: localDBPath)
+            removeSidecarFiles(of: stagingURL)
+            removeDatabaseFiles(at: localURL)
+            try FileManager.default.moveItem(at: stagingURL, to: localURL)
 
             logger.info("Successfully installed bundled header cache")
         } catch {
             logger.error("Failed to install bundled cache: \(error.localizedDescription)")
+            removeDatabaseFiles(at: stagingURL)
         }
+    }
+
+    /// Looks at the local database before anything is installed over it.
+    ///
+    /// A file SQLite cannot read is deleted: left in place it would fail to
+    /// open on every launch, and nothing would ever replace it.
+    private func inspectLocalDatabase(at url: URL) -> LocalDatabase {
+        guard FileManager.default.fileExists(atPath: url.path) else { return .none }
+
+        do {
+            guard let tip = try HeaderDatabase(path: url.path).getTip() else { return .none }
+            return .tip(tip.height)
+        } catch where HeaderDatabase.indicatesUnreadableFile(error) {
+            logger.error("Local header database is unreadable and will be replaced: \(error.localizedDescription)")
+            removeDatabaseFiles(at: url)
+            return .none
+        } catch {
+            logger.error("Could not inspect the local header database: \(error.localizedDescription)")
+            return .indeterminate
+        }
+    }
+
+    /// Checks a staged copy of a bundled cache before it replaces anything:
+    /// it must open, reach the height its metadata claims, and hold this
+    /// network's genesis block and the highest checkpoint it reaches.
+    private func verifyStagedCache(at url: URL, expectedTipHeight: Int) throws {
+        let staged = try HeaderDatabase(path: url.path)
+
+        guard let tip = try staged.getTip(), Int(tip.height) >= expectedTipHeight else {
+            throw HeaderDatabaseError.invalidCache("it does not reach height \(expectedTipHeight)")
+        }
+
+        let highestCheckpoint = checkpoints.keys.filter { $0 <= tip.height }.max()
+        for height in Set([0, highestCheckpoint].compactMap { $0 }) {
+            guard let expectedHash = checkpoints[height],
+                  let record = try staged.getHeader(height: height),
+                  Data(record.hash.reversed()).hexString == expectedHash else {
+                throw HeaderDatabaseError.invalidCache("its block at height \(height) is not on this chain")
+            }
+        }
+
+        // Opening the copy may have migrated its schema. Fold that back
+        // into the file, so that the file alone is the whole database.
+        try staged.executeWithoutTransaction("PRAGMA wal_checkpoint(TRUNCATE)")
+    }
+
+    private func writeAheadLogIsEmpty(for url: URL) -> Bool {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path + "-wal")
+        return (attributes?[.size] as? NSNumber)?.intValue ?? 0 == 0
+    }
+
+    /// Removes a database file together with its write-ahead log and index.
+    private func removeDatabaseFiles(at url: URL) {
+        try? FileManager.default.removeItem(at: url)
+        removeSidecarFiles(of: url)
+    }
+
+    private func removeSidecarFiles(of url: URL) {
+        try? FileManager.default.removeItem(atPath: url.path + "-wal")
+        try? FileManager.default.removeItem(atPath: url.path + "-shm")
     }
 
     // MARK: - Public API
@@ -402,6 +417,11 @@ public actor HeaderChain {
         /// Everything after it was skipped — it would have built on a
         /// rejected header anyway.
         public let failure: ValidationError?
+
+        /// Set when these headers made another branch the best chain: the
+        /// height of the last block both branches share. Every block above
+        /// it on the best chain is new, even at heights seen before.
+        public let forkHeight: Int32?
     }
 
     /// Add a header to the chain with full validation
@@ -434,6 +454,14 @@ public actor HeaderChain {
         _ = try store(header, auxpow: auxpow)
     }
 
+    private enum StoreOutcome {
+        case alreadyKnown
+        /// Stored, extending the best chain or a side branch
+        case stored
+        /// Stored, and its branch replaced the best chain above `forkHeight`
+        case reorganized(forkHeight: Int32)
+    }
+
     /// Add multiple headers
     public func addHeaders(_ headers: [BlockHeader]) -> Int {
         addHeaders(headers.map { HeadersMessage.Entry(header: $0) }).added
@@ -442,19 +470,26 @@ public actor HeaderChain {
     /// Add headers received from a peer, stopping at the first invalid one
     public func addHeaders(_ entries: [HeadersMessage.Entry]) -> BatchResult {
         var added = 0
+        var forkHeight: Int32?
         for entry in entries {
             do {
-                if try store(entry.header, auxpow: entry.auxpow) {
+                switch try store(entry.header, auxpow: entry.auxpow) {
+                case .alreadyKnown:
+                    break
+                case .stored:
                     added += 1
+                case .reorganized(let height):
+                    added += 1
+                    forkHeight = min(forkHeight ?? height, height)
                 }
             } catch let error as ValidationError {
                 logger.warning("Header validation failed: \(String(describing: error))")
-                return BatchResult(added: added, failure: error)
+                return BatchResult(added: added, failure: error, forkHeight: forkHeight)
             } catch {
-                return BatchResult(added: added, failure: .databaseError(error))
+                return BatchResult(added: added, failure: .databaseError(error), forkHeight: forkHeight)
             }
         }
-        return BatchResult(added: added, failure: nil)
+        return BatchResult(added: added, failure: nil, forkHeight: forkHeight)
     }
 
     /// Flush is a no-op with SQLite (writes are immediate)
@@ -509,8 +544,7 @@ public actor HeaderChain {
     // MARK: - Storing
 
     /// Validates and stores one header.
-    /// - Returns: `false` if the header was already known.
-    private func store(_ header: BlockHeader, auxpow: AuxPoW?) throws -> Bool {
+    private func store(_ header: BlockHeader, auxpow: AuxPoW?) throws -> StoreOutcome {
         guard let db = database else {
             throw ValidationError.databaseError(HeaderDatabaseError.databaseNotOpen)
         }
@@ -519,11 +553,11 @@ public actor HeaderChain {
 
         // Check if we already have this header
         if recentHeaders.contains(hash) {
-            return false
+            return .alreadyKnown
         }
         do {
             if try db.headerExists(hash: hash) {
-                return false
+                return .alreadyKnown
             }
         } catch {
             throw ValidationError.databaseError(error)
@@ -553,7 +587,11 @@ public actor HeaderChain {
         let isNewTip = currentTip.map { stored.header.prevBlock == $0.header.hash } ?? true
         let shouldReorg = !isNewTip && currentTip.map { chainWork > UInt256(littleEndian: $0.chainWork) } == true
 
-        let record = HeaderRecord(storedHeader: stored, isInBestChain: isNewTip || shouldReorg)
+        // A header that overtakes the best chain is stored unflagged; the
+        // reorganization then flags its whole branch in one transaction. If
+        // that fails, the old chain is still the one, consistently, marked
+        // best — and the next header on the new branch tries again.
+        let record = HeaderRecord(storedHeader: stored, isInBestChain: isNewTip)
         do {
             try db.insertHeader(record)
         } catch {
@@ -565,10 +603,10 @@ public actor HeaderChain {
         if isNewTip {
             tipCache = stored
         } else if shouldReorg, let currentTip {
-            try reorganize(from: currentTip, to: stored, db: db)
+            return .reorganized(forkHeight: try reorganize(from: currentTip, to: stored, db: db))
         }
 
-        return true
+        return .stored
     }
 
     // MARK: - Validation Methods
@@ -693,10 +731,12 @@ public actor HeaderChain {
 
     // MARK: - Chain Reorganization
 
-    private func reorganize(from currentTip: StoredHeader, to newTip: StoredHeader, db: HeaderDatabase) throws {
+    /// Makes `newTip`'s branch the best chain.
+    /// - Returns: The height of the last block the two branches share
+    private func reorganize(from currentTip: StoredHeader, to newTip: StoredHeader, db: HeaderDatabase) throws -> Int32 {
         guard let commonAncestor = findCommonAncestor(between: currentTip, and: newTip) else {
             logger.error("Unable to find common ancestor for reorg")
-            return
+            throw ValidationError.invalidPreviousBlock
         }
 
         var cursor: StoredHeader? = newTip
@@ -704,6 +744,13 @@ public actor HeaderChain {
         while let header = cursor, header.height > commonAncestor.height {
             newChainHashes.append(header.header.hash)
             cursor = getCachedHeader(hash: header.header.prevBlock)
+        }
+
+        // Flagging a branch with a hole in it would leave heights where no
+        // block is on the best chain.
+        guard cursor?.header.hash == commonAncestor.header.hash else {
+            logger.error("New branch does not lead back to the common ancestor")
+            throw ValidationError.invalidPreviousBlock
         }
 
         do {
@@ -714,6 +761,7 @@ public actor HeaderChain {
 
         tipCache = newTip
         logger.info("Chain reorganized at height \(commonAncestor.height), new tip at \(newTip.height)")
+        return commonAncestor.height
     }
 
     private func findCommonAncestor(between first: StoredHeader, and second: StoredHeader) -> StoredHeader? {

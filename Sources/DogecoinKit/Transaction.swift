@@ -100,12 +100,16 @@ public actor TransactionBuilder {
     /// Whatever `totalAmount` leaves over after the outputs and `fee` goes to
     /// `changeAddress`. Once finalized, inputs and outputs can no longer change.
     /// - Parameters:
-    ///   - destinationAddress: The primary recipient address
+    ///   - destinationAddress: An address that is only checked for validity; it
+    ///     need not be one of the outputs
     ///   - fee: The transaction fee
     ///   - totalAmount: The total value of the inputs being spent
     ///   - changeAddress: The address to receive change; required when there is change
     /// - Returns: The unsigned raw transaction hex
-    /// - Throws: `DogecoinError.finalizationFailed` if the amounts do not balance
+    /// - Throws: `DogecoinError.finalizationFailed` if the amounts do not
+    ///   balance, `DogecoinError.invalidAddress` for an invalid
+    ///   `destinationAddress`, or `DogecoinError.internalError` if the
+    ///   builder was already finalized
     public func finalize(
         destinationAddress: String,
         fee: DogecoinAmount,
@@ -441,7 +445,6 @@ struct TransactionPlan: Sendable, Equatable {
     let change: DogecoinAmount
     let changeAddress: String?
     let outputCount: Int
-    let estimatedSize: Int
 }
 
 // MARK: - Convenience Functions
@@ -643,22 +646,13 @@ func planTransaction(
         throw DogecoinError.transactionValidationFailed("Transaction exceeds standard size limit")
     }
 
-    let effectiveChangeAddress: String?
-    if shouldIncludeChange {
-        effectiveChangeAddress = changeAddress ?? inputs.first?.address
-        guard effectiveChangeAddress != nil else {
-            throw DogecoinError.transactionValidationFailed("Missing change address")
-        }
-    } else {
-        effectiveChangeAddress = nil
-    }
-
+    // Without a change address, change returns to the first input's
+    // address (there is always one: empty inputs were rejected above).
     return TransactionPlan(
         fee: feeToUse,
         change: change,
-        changeAddress: effectiveChangeAddress,
-        outputCount: outputCount,
-        estimatedSize: estimatedSize
+        changeAddress: shouldIncludeChange ? changeAddress ?? inputs.first?.address : nil,
+        outputCount: outputCount
     )
 }
 

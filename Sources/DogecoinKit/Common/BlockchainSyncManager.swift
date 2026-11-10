@@ -1,6 +1,6 @@
 import Foundation
 
-/// Unified sync state enum used by both SPV and Electrum
+/// Sync state reported through ``BlockchainSyncManager``
 public enum SyncState: Sendable {
     case idle
     case syncing
@@ -8,7 +8,8 @@ public enum SyncState: Sendable {
     case failed
 }
 
-/// Protocol that both SPVSyncManager and ElectrumSyncManager conform to
+/// Protocol for sync managers. ``ElectrumSyncManager`` conforms;
+/// ``SPVSyncManager`` has its own ``SPVSyncDelegate`` and ``SPVSyncState``.
 public protocol BlockchainSyncManager: Actor {
     nonisolated var network: DogecoinNetwork { get }
     var syncState: SyncState { get }
