@@ -1,6 +1,10 @@
+// The Keychain is Apple-only; on Android, keep secrets in the Android Keystore.
+#if canImport(Security)
 import Foundation
 import Security
+#if canImport(os)
 import os.log
+#endif
 
 private let keychainLogger = Logger(subsystem: "DogecoinKit", category: "keychain")
 
@@ -122,20 +126,6 @@ public struct StoredWalletCredentials: Codable, Sendable {
         self.passphrase = passphrase
         self.network = network
         self.storedAt = Date()
-    }
-}
-
-/// Codable conformance for DogecoinNetwork
-extension DogecoinNetwork: Codable {
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        let value = try container.decode(Int.self)
-        self = value == 1 ? .testnet : .mainnet
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        var container = encoder.singleValueContainer()
-        try container.encode(self == .testnet ? 1 : 0)
     }
 }
 
@@ -477,8 +467,10 @@ extension SecureKeyStorage {
     public func restoreWallet(keychainID: String) async throws -> HDWallet {
         let credentials = try retrieveWalletCredentials(id: keychainID)
 
+        // The phrase was validated when it was stored; a wallet holding funds
+        // must stay restorable even if validation gets stricter later.
         return try await HDWallet(
-            mnemonic: credentials.mnemonic,
+            acceptedMnemonic: credentials.mnemonic,
             passphrase: credentials.passphrase,
             network: credentials.network
         )
@@ -509,3 +501,4 @@ extension SecureKeyStorage {
         return (wallet, keychainID)
     }
 }
+#endif

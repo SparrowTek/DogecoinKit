@@ -1,6 +1,12 @@
 import Foundation
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
+#if canImport(os)
 import os.log
+#endif
 
 private let electrumProtocolLogger = Logger(subsystem: "DogecoinKit", category: "electrum")
 
@@ -47,6 +53,26 @@ public struct ElectrumResponse<T: Decodable>: Decodable, Sendable where T: Senda
     public let id: Int?
     public let result: T?
     public let error: ElectrumRPCError?
+
+    private enum CodingKeys: String, CodingKey {
+        case jsonrpc
+        case id
+        case result
+        case error
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        jsonrpc = (try? container.decodeIfPresent(String.self, forKey: .jsonrpc)) ?? "2.0"
+        // We always send numeric ids; tolerate servers that echo them as strings.
+        if let numeric = try? container.decodeIfPresent(Int.self, forKey: .id) {
+            id = numeric
+        } else {
+            id = (try? container.decodeIfPresent(String.self, forKey: .id)).flatMap { Int($0) }
+        }
+        result = try container.decodeIfPresent(T.self, forKey: .result)
+        error = try container.decodeIfPresent(ElectrumRPCError.self, forKey: .error)
+    }
 }
 
 public struct ElectrumRPCError: Decodable, Sendable {
@@ -71,25 +97,12 @@ public struct ElectrumScriptHash: Sendable {
         self.scriptHash = try Self.computeScriptHash(for: address, network: network)
     }
 
+    /// Electrum indexes outputs by `sha256(scriptPubKey)`, byte-reversed.
     private static func computeScriptHash(for address: String, network: DogecoinNetwork) throws -> String {
-        guard let detectedNetwork = Address.detectNetwork(address),
-              detectedNetwork == network else {
+        guard Address.detectNetwork(address) == network,
+              let scriptPubKey = Address.scriptPubKey(for: address) else {
             electrumProtocolLogger.error("Address network mismatch: \(address, privacy: .private)")
             throw ElectrumError.invalidAddress(address)
-        }
-
-        // toPubkeyHash returns the full P2PKH scriptPubKey hex
-        // (OP_DUP OP_HASH160 <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG)
-        let scriptPubKeyHex: String
-        do {
-            scriptPubKeyHex = try Address.toPubkeyHash(address)
-        } catch {
-            electrumProtocolLogger.error("Failed to get scriptPubKey for \(address, privacy: .private): \(error.localizedDescription, privacy: .public)")
-            throw ElectrumError.invalidAddress(address)
-        }
-        guard let scriptPubKey = Data(hexString: scriptPubKeyHex) else {
-            electrumProtocolLogger.error("Invalid scriptPubKey hex (length \(scriptPubKeyHex.count, privacy: .public))")
-            throw ElectrumError.serializationError("Invalid scriptPubKey")
         }
 
         return Data(SHA256.hash(data: scriptPubKey).reversed()).hexString
@@ -98,10 +111,30 @@ public struct ElectrumScriptHash: Sendable {
 
 public struct ElectrumBalance: Decodable, Sendable {
     public let confirmed: Int64
+    /// Can be negative while an outgoing spend is in the mempool
     public let unconfirmed: Int64
 
+    /// Confirmed plus unconfirmed, saturating instead of trapping when a
+    /// misbehaving server reports values whose sum overflows `Int64`.
     public var total: Int64 {
-        confirmed + unconfirmed
+        let (sum, overflow) = confirmed.addingReportingOverflow(unconfirmed)
+        guard overflow else { return sum }
+        return unconfirmed < 0 ? .min : .max
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case confirmed
+        case unconfirmed
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let confirmed = try container.decode(Int64.self, forKey: .confirmed)
+        guard confirmed >= 0 else {
+            throw DecodingError.dataCorruptedError(forKey: .confirmed, in: container, debugDescription: "Negative confirmed balance")
+        }
+        self.confirmed = confirmed
+        self.unconfirmed = try container.decode(Int64.self, forKey: .unconfirmed)
     }
 }
 
@@ -141,6 +174,30 @@ public struct ElectrumUTXO: Decodable, Sendable {
     public var isConfirmed: Bool {
         height > 0
     }
+
+    /// Rejects outputs no honest server reports — negative values or indexes,
+    /// malformed txids — so callers can convert them to unsigned types and
+    /// hand them to the transaction builder without trapping.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let txHash = try container.decode(String.self, forKey: .txHash)
+        guard txHash.utf8.count == 64, Data(hexString: txHash) != nil else {
+            throw DecodingError.dataCorruptedError(forKey: .txHash, in: container, debugDescription: "Malformed txid")
+        }
+        let txPos = try container.decode(Int.self, forKey: .txPos)
+        guard UInt32(exactly: txPos) != nil else {
+            throw DecodingError.dataCorruptedError(forKey: .txPos, in: container, debugDescription: "Output index out of range")
+        }
+        let value = try container.decode(Int64.self, forKey: .value)
+        guard value >= 0, UInt64(value) <= DogecoinAmount.maxMoney.koinu else {
+            throw DecodingError.dataCorruptedError(forKey: .value, in: container, debugDescription: "Output value out of range")
+        }
+
+        self.txHash = txHash
+        self.txPos = txPos
+        self.height = try container.decode(Int.self, forKey: .height)
+        self.value = value
+    }
 }
 
 public struct ElectrumTransaction: Sendable {
@@ -160,6 +217,23 @@ public struct ElectrumTransaction: Sendable {
 public struct ElectrumHeader: Decodable, Sendable {
     public let height: Int
     public let hex: String
+
+    private enum CodingKeys: String, CodingKey {
+        case height
+        case hex
+    }
+
+    /// Heights outside `Int32` are rejected here so they can never trap a
+    /// later conversion to the chain-height type used everywhere else.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let height = try container.decode(Int.self, forKey: .height)
+        guard Int32(exactly: height).map({ $0 >= 0 }) == true else {
+            throw DecodingError.dataCorruptedError(forKey: .height, in: container, debugDescription: "Block height out of range")
+        }
+        self.height = height
+        self.hex = try container.decode(String.self, forKey: .hex)
+    }
 }
 
 public struct ElectrumServerInfo: Decodable, Sendable {

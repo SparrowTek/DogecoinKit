@@ -154,10 +154,8 @@ struct AuxPoWTests {
             parentMerkleRoot: Data(repeating: 0, count: 32)
         )
 
-        let blockHash = Data(repeating: 0xAA, count: 32)
-
         #expect(throws: AuxPoW.ValidationError.self) {
-            try auxpow.validate(dogecoinBlockHash: blockHash)
+            try auxpow.validate(for: mergeMinedHeader(merkleRoot: Data(repeating: 0xAA, count: 32)))
         }
     }
 
@@ -169,17 +167,15 @@ struct AuxPoWTests {
             parentBits: 0x207fffff  // Easy difficulty for test
         )
 
-        let blockHash = Data(repeating: 0xBB, count: 32)
-
         #expect(throws: AuxPoW.ValidationError.self) {
-            try auxpow.validate(dogecoinBlockHash: blockHash)
+            try auxpow.validate(for: mergeMinedHeader(merkleRoot: Data(repeating: 0xBB, count: 32)))
         }
     }
 
     // MARK: - HeaderChain Integration Tests
 
-    @Test("HeaderChain requires AuxPoW for blocks above checkpoint")
-    func testHeaderChainRequiresAuxPoW() async throws {
+    @Test("Mainnet rejects merge-mined headers with a foreign chain ID")
+    func testMainnetRejectsForeignChainID() async throws {
         let storageURL = temporaryStorageURL()
         let chain = HeaderChain(network: .mainnet, storageDirectory: storageURL)
         await chain.setup()
@@ -190,10 +186,10 @@ struct AuxPoWTests {
             return
         }
 
-        // Create an AuxPoW header that would be above checkpoint
-        // We simulate this by testing the error type
+        // Chain ID 0x642 is not Dogecoin's 0x62 — Core rejects this header
+        // outright, with or without a proof attached.
         let auxpowHeader = BlockHeader(
-            version: 0x6422100,  // AuxPoW version
+            version: 0x6422100,
             prevBlock: genesis.header.hash,
             merkleRoot: Data(repeating: 0x01, count: 32),
             timestamp: genesis.header.timestamp + 1,
@@ -201,10 +197,13 @@ struct AuxPoWTests {
             nonce: 1
         )
 
-        // For blocks at height 1 (below checkpoint), AuxPoW is not required
-        // The header should be accepted without AuxPoW data since height 1 < 5,400,000
-        let added = await chain.addHeader(auxpowHeader, auxpow: nil)
-        #expect(added == true)
+        await #expect {
+            try await chain.addHeaderValidated(auxpowHeader, auxpow: nil)
+        } throws: { error in
+            guard case HeaderChain.ValidationError.invalidVersion = error else { return false }
+            return true
+        }
+        #expect(await chain.height == 0)
     }
 
     @Test("HeaderChain accepts AuxPoW blocks below checkpoint without validation")
@@ -341,6 +340,18 @@ struct AuxPoWTests {
     }
 
     // MARK: - Helper Functions
+
+    /// A header flagged as merge-mined, carrying Dogecoin's chain ID.
+    private func mergeMinedHeader(merkleRoot: Data) -> BlockHeader {
+        BlockHeader(
+            version: 0x0062_0104,
+            prevBlock: Data(count: 32),
+            merkleRoot: merkleRoot,
+            timestamp: 1_700_000_000,
+            bits: 0x1e0fffff,
+            nonce: 0
+        )
+    }
 
     private func temporaryStorageURL() -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)

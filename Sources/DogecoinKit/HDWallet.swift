@@ -12,19 +12,36 @@ public final class HDWallet: Sendable {
 
     /// The network this wallet belongs to
     public let network: DogecoinNetwork
-    
 
     /// Create an HD wallet from a mnemonic phrase
+    ///
+    /// The phrase must pass full BIP39 validation — known words and a
+    /// matching checksum. BIP39 seeds can be derived from *any* string, so a
+    /// mistyped word would otherwise silently open a different, empty wallet.
     /// - Parameters:
     ///   - mnemonic: The BIP39 mnemonic phrase (12-24 words)
     ///   - passphrase: Optional BIP39 passphrase (default: empty)
     ///   - network: The network to use
     /// - Throws: `DogecoinError.invalidMnemonic` if the mnemonic is invalid
-    public init(mnemonic: String, passphrase: String = "", network: DogecoinNetwork = .mainnet) async throws {
+    public convenience init(mnemonic: String, passphrase: String = "", network: DogecoinNetwork = .mainnet) async throws {
+        guard verifyMnemonic(mnemonic) else {
+            throw DogecoinError.invalidMnemonic
+        }
+        try await self.init(acceptedMnemonic: mnemonic, passphrase: passphrase, network: network)
+    }
+
+    /// Derives the wallet for a mnemonic that was accepted earlier, without
+    /// re-running BIP39 validation.
+    ///
+    /// Restoring from secure storage goes through here: the phrase was
+    /// validated when it was imported, and a wallet that already holds funds
+    /// must stay reachable even if validation rules change later.
+    init(acceptedMnemonic mnemonic: String, passphrase: String, network: DogecoinNetwork) async throws {
         try await Dogecoin.ensureInitialized()
-        ECC.armCurrentThread()
 
         var seed = [UInt8](repeating: 0, count: Int(MAX_SEED_SIZE))
+        defer { zeroize(&seed) }
+
         let seedResult = mnemonic.withCString { mnemonicPtr in
             passphrase.withCString { passPtr in
                 seed.withUnsafeMutableBufferPointer { seedBuffer in
@@ -37,7 +54,11 @@ public final class HDWallet: Sendable {
             throw DogecoinError.invalidMnemonic
         }
 
+        ECC.armCurrentThread()
+
         var masterKeyBuffer = [CChar](repeating: 0, count: Int(HDKEYLEN))
+        defer { zeroize(&masterKeyBuffer) }
+
         let masterResult: dogecoin_bool = seed.withUnsafeBufferPointer { seedBuffer in
             guard let seedPtr = seedBuffer.baseAddress else { return dogecoin_bool(0) }
             return getHDRootKeyFromSeed(seedPtr, Int32(MAX_SEED_SIZE), network.isTestnet, &masterKeyBuffer)
@@ -48,8 +69,6 @@ public final class HDWallet: Sendable {
         }
 
         let masterKey = Self.stringFromCStringBuffer(masterKeyBuffer)
-        zeroize(&masterKeyBuffer)
-        zeroize(&seed)
         guard !masterKey.isEmpty else {
             throw DogecoinError.keyGenerationFailed
         }
@@ -85,6 +104,7 @@ public final class HDWallet: Sendable {
 
         var masterKeyBuffer = [CChar](repeating: 0, count: Int(HDKEYLEN))
         var addressBuffer = [CChar](repeating: 0, count: Int(P2PKHLEN))
+        defer { zeroize(&masterKeyBuffer) }
 
         let result = generateHDMasterPubKeypair(&masterKeyBuffer, &addressBuffer, network.isTestnet)
 
@@ -92,13 +112,12 @@ public final class HDWallet: Sendable {
             throw DogecoinError.keyGenerationFailed
         }
 
-        let wallet = HDWallet(
-            masterKey: Self.stringFromCStringBuffer(masterKeyBuffer),
-            mnemonic: nil,
-            network: network
-        )
+        let masterKey = Self.stringFromCStringBuffer(masterKeyBuffer)
+        guard !masterKey.isEmpty else {
+            throw DogecoinError.keyGenerationFailed
+        }
 
-        return wallet
+        return HDWallet(masterKey: masterKey, mnemonic: nil, network: network)
     }
 
     /// Internal initializer
@@ -116,41 +135,7 @@ public final class HDWallet: Sendable {
     /// - Returns: The derived P2PKH address
     /// - Throws: `DogecoinError.derivationFailed` if derivation fails
     public func deriveAddress(account: UInt32 = 0, index: UInt32 = 0, change: Bool = false) async throws -> String {
-        try await Dogecoin.ensureInitialized()
-        ECC.armCurrentThread()
-        return try deriveAddressFromMasterKey(account: account, index: index, change: change)
-    }
-
-    /// Derive an address using the master key directly
-    private func deriveAddressFromMasterKey(account: UInt32, index: UInt32, change: Bool) throws -> String {
-        var masterKeyBuffer = Array(masterKey.utf8CString)
-        while masterKeyBuffer.count < Int(HDKEYLEN) { masterKeyBuffer.append(0) }
-
-        let path = network.bip44Path(account: account, change: change, index: index)
-
-        var pathBuffer = Array(path.utf8CString)
-        while pathBuffer.count < Int(KEYPATHMAXLEN) { pathBuffer.append(0) }
-
-        var addressBuffer = [CChar](repeating: 0, count: Int(P2PKHLEN))
-
-        let result = getDerivedHDAddressByPath(
-            &masterKeyBuffer,
-            &pathBuffer,
-            &addressBuffer
-        )
-
-        guard result == 1 else {
-            zeroize(&masterKeyBuffer)
-            zeroize(&pathBuffer)
-            zeroize(&addressBuffer)
-            throw DogecoinError.derivationFailed
-        }
-
-        let address = Self.stringFromCStringBuffer(addressBuffer)
-        zeroize(&masterKeyBuffer)
-        zeroize(&pathBuffer)
-        zeroize(&addressBuffer)
-        return address
+        try await deriveAddress(path: network.bip44Path(account: account, change: change, index: index))
     }
 
     /// Derive an address at a custom derivation path
@@ -160,33 +145,25 @@ public final class HDWallet: Sendable {
     /// - Throws: `DogecoinError.derivationFailed` if derivation fails
     public func deriveAddress(path: String) async throws -> String {
         try await Dogecoin.ensureInitialized()
+        try Self.validateLength(of: path)
         ECC.armCurrentThread()
 
-        var masterKeyBuffer = Array(masterKey.utf8CString)
-        while masterKeyBuffer.count < Int(HDKEYLEN) { masterKeyBuffer.append(0) }
-
-        var pathBuffer = Array(path.utf8CString)
-        while pathBuffer.count < Int(KEYPATHMAXLEN) { pathBuffer.append(0) }
-
+        var masterKeyBuffer = Self.paddedCString(masterKey, length: Int(HDKEYLEN))
+        var pathBuffer = Self.paddedCString(path, length: Int(KEYPATHMAXLEN))
         var addressBuffer = [CChar](repeating: 0, count: Int(P2PKHLEN))
-
-        let result = getDerivedHDAddressByPath(
-            &masterKeyBuffer,
-            &pathBuffer,
-            &addressBuffer
-        )
-
-        guard result == 1 else {
+        defer {
             zeroize(&masterKeyBuffer)
             zeroize(&pathBuffer)
-            zeroize(&addressBuffer)
+        }
+
+        guard getDerivedHDAddressByPath(&masterKeyBuffer, &pathBuffer, &addressBuffer) == 1 else {
             throw DogecoinError.derivationFailed
         }
 
         let address = Self.stringFromCStringBuffer(addressBuffer)
-        zeroize(&masterKeyBuffer)
-        zeroize(&pathBuffer)
-        zeroize(&addressBuffer)
+        guard !address.isEmpty else {
+            throw DogecoinError.derivationFailed
+        }
         return address
     }
 
@@ -197,17 +174,24 @@ public final class HDWallet: Sendable {
     ///   - change: Whether to generate change addresses
     ///   - startIndex: The starting index
     /// - Returns: An array of addresses
+    /// - Throws: `DogecoinError.derivationFailed` if `count` is negative or
+    ///   the range runs past the last address index
     public func deriveAddresses(
         count: Int,
         account: UInt32 = 0,
         change: Bool = false,
         startIndex: UInt32 = 0
     ) async throws -> [String] {
-        var addresses: [String] = []
-        addresses.reserveCapacity(count)
+        guard let count = UInt32(exactly: count),
+              case (_, false) = startIndex.addingReportingOverflow(count) else {
+            throw DogecoinError.derivationFailed
+        }
 
-        for i in 0..<UInt32(count) {
-            let address = try await deriveAddress(account: account, index: startIndex + i, change: change)
+        var addresses: [String] = []
+        addresses.reserveCapacity(Int(count))
+
+        for offset in 0..<count {
+            let address = try await deriveAddress(account: account, index: startIndex + offset, change: change)
             addresses.append(address)
         }
 
@@ -222,52 +206,8 @@ public final class HDWallet: Sendable {
     /// - Returns: The derived private key in WIF format
     /// - Throws: `DogecoinError.derivationFailed` if derivation fails
     public func derivePrivateKey(account: UInt32 = 0, index: UInt32 = 0, change: Bool = false) async throws -> String {
-        try await Dogecoin.ensureInitialized()
-        ECC.armCurrentThread()
-
         // Centralized path builder — see DogecoinNetwork.bip44Path.
-        let path = network.bip44Path(account: account, change: change, index: index)
-
-        var masterKeyBuffer = Array(masterKey.utf8CString)
-        while masterKeyBuffer.count < Int(HDKEYLEN) { masterKeyBuffer.append(0) }
-
-        var pathBuffer = Array(path.utf8CString)
-        while pathBuffer.count < Int(KEYPATHMAXLEN) { pathBuffer.append(0) }
-
-        // getHDNodePrivateKeyWIFByPath's prototype declares this parameter as
-        // char[P2PKHLEN], but with outprivkey=true the implementation
-        // serializes the full base58 EXTENDED private key ("dgpv...", 111
-        // chars) into it via dogecoin_hdnode_serialize_private(..., HDKEYLEN).
-        // A P2PKHLEN (35) buffer is overrun by 77 bytes on every call — size
-        // it for what the function actually writes.
-        var extendedKeyBuffer = [CChar](repeating: 0, count: Int(HDKEYLEN))
-
-        // Use getHDNodePrivateKeyWIFByPath to get the private key
-        guard let privateKeyPtr = getHDNodePrivateKeyWIFByPath(
-            &masterKeyBuffer,
-            &pathBuffer,
-            &extendedKeyBuffer,
-            true  // Output private key
-        ) else {
-            zeroize(&masterKeyBuffer)
-            zeroize(&pathBuffer)
-            zeroize(&extendedKeyBuffer)
-            throw DogecoinError.derivationFailed
-        }
-
-        let privateKeyWIF = String(cString: privateKeyPtr)
-
-        // Free the allocated memory from the C function
-        dogecoin_free(UnsafeMutableRawPointer(mutating: privateKeyPtr))
-        zeroize(&masterKeyBuffer)
-        zeroize(&pathBuffer)
-        zeroize(&extendedKeyBuffer)
-
-        guard !privateKeyWIF.isEmpty else {
-            throw DogecoinError.derivationFailed
-        }
-
-        return privateKeyWIF
+        try await derivePrivateKey(path: network.bip44Path(account: account, change: change, index: index))
     }
 
     /// Derive a private key in WIF format at a custom derivation path
@@ -277,36 +217,38 @@ public final class HDWallet: Sendable {
     /// - Throws: `DogecoinError.derivationFailed` if derivation fails
     public func derivePrivateKey(path: String) async throws -> String {
         try await Dogecoin.ensureInitialized()
+        try Self.validateLength(of: path)
         ECC.armCurrentThread()
 
-        var masterKeyBuffer = Array(masterKey.utf8CString)
-        while masterKeyBuffer.count < Int(HDKEYLEN) { masterKeyBuffer.append(0) }
+        var masterKeyBuffer = Self.paddedCString(masterKey, length: Int(HDKEYLEN))
+        var pathBuffer = Self.paddedCString(path, length: Int(KEYPATHMAXLEN))
 
-        var pathBuffer = Array(path.utf8CString)
-        while pathBuffer.count < Int(KEYPATHMAXLEN) { pathBuffer.append(0) }
-
-        // Sized HDKEYLEN, not P2PKHLEN: the C function serializes the full
-        // extended private key into this buffer despite its prototype — see
-        // derivePrivateKey(account:index:change:).
+        // getHDNodePrivateKeyWIFByPath's prototype declares this parameter as
+        // char[P2PKHLEN], but with outprivkey=true the implementation
+        // serializes the full base58 EXTENDED private key ("dgpv...", 111
+        // chars) into it via dogecoin_hdnode_serialize_private(..., HDKEYLEN).
+        // A P2PKHLEN (35) buffer is overrun by 77 bytes on every call — size
+        // it for what the function actually writes.
         var extendedKeyBuffer = [CChar](repeating: 0, count: Int(HDKEYLEN))
+        defer {
+            zeroize(&masterKeyBuffer)
+            zeroize(&pathBuffer)
+            zeroize(&extendedKeyBuffer)
+        }
 
         guard let privateKeyPtr = getHDNodePrivateKeyWIFByPath(
             &masterKeyBuffer,
             &pathBuffer,
             &extendedKeyBuffer,
-            true
+            true  // Output private key
         ) else {
-            zeroize(&masterKeyBuffer)
-            zeroize(&pathBuffer)
-            zeroize(&extendedKeyBuffer)
             throw DogecoinError.derivationFailed
         }
 
         let privateKeyWIF = String(cString: privateKeyPtr)
+
+        // Free the allocated memory from the C function
         dogecoin_free(UnsafeMutableRawPointer(mutating: privateKeyPtr))
-        zeroize(&masterKeyBuffer)
-        zeroize(&pathBuffer)
-        zeroize(&extendedKeyBuffer)
 
         guard !privateKeyWIF.isEmpty else {
             throw DogecoinError.derivationFailed
@@ -349,11 +291,11 @@ public enum MnemonicStrength: Int, Sendable, CaseIterable {
 /// - Throws: `DogecoinError.keyGenerationFailed` if generation fails
 public func generateMnemonic(strength: MnemonicStrength = .words12) async throws -> String {
     try await Dogecoin.ensureInitialized()
-    ECC.armCurrentThread()
 
     var mnemonic = [CChar](repeating: 0, count: Int(MAX_MNEMONIC_SIZE))
     var strengthBuffer = Array("\(strength.rawValue)".utf8CString)
     while strengthBuffer.count < 4 { strengthBuffer.append(0) }
+    defer { zeroize(&mnemonic) }
 
     let result = generateRandomEnglishMnemonic(&strengthBuffer, &mnemonic)
 
@@ -361,27 +303,47 @@ public func generateMnemonic(strength: MnemonicStrength = .words12) async throws
         throw DogecoinError.keyGenerationFailed
     }
 
-    let bytes = Data(mnemonic.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
-    return String(decoding: bytes, as: UTF8.self)
+    let phrase = String(decoding: mnemonic.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+
+    // Defense in depth: never hand out a phrase that would not restore.
+    guard phrase.split(separator: " ").count == strength.wordCount, verifyMnemonic(phrase) else {
+        throw DogecoinError.keyGenerationFailed
+    }
+
+    return phrase
 }
 
 private extension HDWallet {
+    /// libdogecoin documents paths as at most `KEYPATHMAXLEN - 1` characters
+    /// and asserts — aborting the process — on very long ones.
+    static func validateLength(of path: String) throws {
+        guard path.utf8.count < Int(KEYPATHMAXLEN) else {
+            throw DogecoinError.derivationFailed
+        }
+    }
+
     static func stringFromCStringBuffer(_ buffer: [CChar]) -> String {
         let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
         return String(bytes: bytes, encoding: .utf8) ?? ""
     }
+
+    /// NUL-terminated copy of `string`, zero-padded to at least `length` bytes
+    /// for C functions whose prototypes declare fixed-size arrays.
+    static func paddedCString(_ string: String, length: Int) -> [CChar] {
+        var buffer = Array(string.utf8CString)
+        if buffer.count < length {
+            buffer.append(contentsOf: repeatElement(0, count: length - buffer.count))
+        }
+        return buffer
+    }
 }
 
 private func zeroize(_ buffer: inout [UInt8]) {
-    for index in buffer.indices {
-        buffer[index] = 0
-    }
+    buffer.withUnsafeMutableBufferPointer { $0.update(repeating: 0) }
 }
 
 private func zeroize(_ buffer: inout [CChar]) {
-    for index in buffer.indices {
-        buffer[index] = 0
-    }
+    buffer.withUnsafeMutableBufferPointer { $0.update(repeating: 0) }
 }
 
 /// Validate a BIP39 mnemonic phrase using full BIP39 checksum validation

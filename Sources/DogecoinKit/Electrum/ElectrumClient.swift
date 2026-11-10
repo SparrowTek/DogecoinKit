@@ -1,29 +1,39 @@
 import Foundation
-import Network
+#if canImport(os)
 import os.log
+#endif
 
 public actor ElectrumClient {
 
     // MARK: - Properties
 
     private let server: ElectrumServer
-    private var connection: NWConnection?
+    private let makeStream: ByteStreamFactory
+
+    /// The live connection. Callbacks from any other stream are stale and ignored.
+    private var stream: (any ByteStream)?
+    private var writer: OrderedStreamWriter?
+    private var connectTask: Task<Void, Error>?
+
     private var requestId: Int = 0
     private var pendingRequests: [Int: CheckedContinuation<Data, Error>] = [:]
-    private var receiveBuffer = Data()
-    private var isConnected = false
+    private var requestTimeouts: [Int: Task<Void, Never>] = [:]
+    private var lineBuffer = Data()
+
     private var subscriptionHandlers: [String: @Sendable (String) -> Void] = [:]
     private var headersHandler: (@Sendable (ElectrumHeader) -> Void)?
-    private var didResumeConnectionContinuation = false
-    private var connectionContinuation: CheckedContinuation<Void, Error>?
+    private var disconnectHandler: (@Sendable () -> Void)?
 
-    private let connectionTimeout: TimeInterval = 30
-    private let requestTimeout: TimeInterval = 60
+    /// Whether the version handshake has completed on a live connection
+    public private(set) var isConnected = false
+
+    private let connectionTimeout: Duration = .seconds(30)
+    private let requestTimeout: Duration
 
     /// Upper bound for a single newline-delimited JSON-RPC line. A server (or
     /// MITM on the wire) that streams data without ever sending a newline
-    /// would otherwise grow `receiveBuffer` without limit until the app is
-    /// killed for memory. Large-wallet history responses fit comfortably.
+    /// would otherwise grow the buffer without limit until the app is killed
+    /// for memory. Large-wallet history responses fit comfortably.
     private let maxReceiveBufferBytes = 8 * 1024 * 1024
 
     private let logger = Logger(subsystem: "DogecoinKit", category: "electrum")
@@ -31,197 +41,174 @@ public actor ElectrumClient {
     // MARK: - Initialization
 
     public init(server: ElectrumServer) {
+        self.init(server: server, streamFactory: defaultByteStreamFactory)
+    }
+
+    init(server: ElectrumServer, streamFactory: @escaping ByteStreamFactory, requestTimeout: Duration = .seconds(60)) {
         self.server = server
+        self.makeStream = streamFactory
+        self.requestTimeout = requestTimeout
     }
 
     // MARK: - Connection Management
 
+    /// Connects and performs the version handshake.
+    ///
+    /// Concurrent callers share one attempt; cancelling a caller abandons it.
     public func connect() async throws {
-        guard !isConnected else {
+        if isConnected {
             logger.debug("Already connected to \(self.server.host, privacy: .public), skipping")
             return
         }
-        didResumeConnectionContinuation = false
 
-        logger.info("Connecting to \(self.server.host, privacy: .public):\(self.server.port) (SSL: \(self.server.useSSL))")
-
-        let endpoint = NWEndpoint.hostPort(
-            host: NWEndpoint.Host(server.host),
-            port: NWEndpoint.Port(integerLiteral: UInt16(server.port))
-        )
-
-        let parameters: NWParameters
-        if server.useSSL {
-            parameters = NWParameters(tls: Self.makeTLSOptions(serverHost: server.host))
+        let attempt: Task<Void, Error>
+        if let connectTask {
+            attempt = connectTask
         } else {
-            parameters = NWParameters.tcp
+            attempt = Task { try await self.establishConnection() }
+            connectTask = attempt
         }
 
-        let connection = NWConnection(to: endpoint, using: parameters)
-        self.connection = connection
-
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connectionContinuation = continuation
-            connection.stateUpdateHandler = { [weak self] state in
-                Task { [weak self] in
-                    await self?.handleStateUpdate(state)
-                }
-            }
-            connection.start(queue: .global())
-
-            Task { [weak self] in
-                guard let self else { return }
-                try? await Task.sleep(nanoseconds: UInt64(self.connectionTimeout * 1_000_000_000))
-                await self.handleConnectionTimeout()
+        // A disconnect() and a fresh connect() may have replaced the attempt
+        // while this caller waited; only the attempt's own callers clear it.
+        defer {
+            if connectTask == attempt {
+                connectTask = nil
             }
         }
 
-        // Start receiving data
-        Task {
-            await receiveLoop()
-        }
-
-        // Perform version handshake
-        do {
-            logger.debug("Connection established, performing version handshake")
-            let version = try await serverVersion()
-            logger.info("Connected to \(self.server.host, privacy: .public) — server version \(version.joined(separator: " "), privacy: .public)")
-            isConnected = true
-        } catch {
-            logger.error("Version handshake with \(self.server.host, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
-            disconnect()
-            throw error
+        try await withTaskCancellationHandler {
+            try await attempt.value
+        } onCancel: {
+            attempt.cancel()
         }
     }
 
     public func disconnect() {
-        connection?.cancel()
-        connection = nil
-        isConnected = false
+        connectTask?.cancel()
+        connectTask = nil
+        teardown(failingWith: ElectrumError.serverDisconnected)
         headersHandler = nil
         subscriptionHandlers.removeAll()
-        receiveBuffer.removeAll()
-        resumeConnectionContinuation(throwing: ElectrumError.serverDisconnected)
-
-        // Cancel all pending requests
-        for (_, continuation) in pendingRequests {
-            continuation.resume(throwing: ElectrumError.serverDisconnected)
-        }
-        pendingRequests.removeAll()
     }
 
-    /// Single point of resume for `connectionContinuation`. Guarantees that the
-    /// checked continuation is resumed at most once across `connect()`'s three
-    /// concurrent completion paths (state updates, timeout task, and
-    /// `disconnect()`). Calling after the continuation has already been
-    /// resumed is a no-op.
-    private func resumeConnectionContinuation(throwing error: Error? = nil) {
-        guard !didResumeConnectionContinuation,
-              let continuation = connectionContinuation else {
-            return
-        }
-        didResumeConnectionContinuation = true
-        connectionContinuation = nil
-        if let error {
-            continuation.resume(throwing: error)
-        } else {
-            continuation.resume()
-        }
+    /// Called once whenever an established connection drops unexpectedly —
+    /// not after `disconnect()`.
+    public func setDisconnectHandler(_ handler: (@Sendable () -> Void)?) {
+        disconnectHandler = handler
     }
 
-    private func handleStateUpdate(_ state: NWConnection.State) {
-        logger.debug("\(self.server.host, privacy: .public) connection state: \(String(describing: state), privacy: .public)")
+    private func establishConnection() async throws {
+        guard let port = UInt16(exactly: server.port) else {
+            throw ElectrumError.connectionFailed("Invalid port \(server.port)")
+        }
 
-        switch state {
-        case .ready:
-            resumeConnectionContinuation()
-        case .failed(let error):
+        logger.info("Connecting to \(self.server.host, privacy: .public):\(port) (SSL: \(self.server.useSSL))")
+
+        let stream = makeStream(server.host, port, server.useSSL)
+        teardown(failingWith: ElectrumError.serverDisconnected)
+        self.stream = stream
+        writer = OrderedStreamWriter(stream: stream) { [weak self] _ in
+            await self?.connectionEnded(stream)
+        }
+
+        do {
+            try await stream.open(timeout: connectionTimeout)
+        } catch {
+            if self.stream === stream {
+                teardown(failingWith: ElectrumError.serverDisconnected)
+            }
+            if Task.isCancelled {
+                throw CancellationError()
+            }
+            if error is CancellationError {
+                // disconnect() closed the stream mid-handshake
+                throw ElectrumError.serverDisconnected
+            }
             logger.error("Connection to \(self.server.host, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
-            resumeConnectionContinuation(throwing: ElectrumError.connectionFailed(error.localizedDescription))
-        case .cancelled:
-            logger.info("Connection to \(self.server.host, privacy: .public) cancelled")
-            resumeConnectionContinuation(throwing: ElectrumError.serverDisconnected)
-        default:
-            break
+            if let streamError = error as? ByteStreamError, streamError == .timedOut {
+                throw ElectrumError.connectionTimeout
+            }
+            throw ElectrumError.connectionFailed(error.localizedDescription)
+        }
+
+        guard self.stream === stream else {
+            throw ElectrumError.serverDisconnected
+        }
+        startReceiving(on: stream)
+
+        do {
+            logger.debug("Connection established, performing version handshake")
+            let version = try await serverVersion()
+            guard self.stream === stream else {
+                throw ElectrumError.serverDisconnected
+            }
+            logger.info("Connected to \(self.server.host, privacy: .public) — server version \(version.joined(separator: " "), privacy: .public)")
+            isConnected = true
+        } catch {
+            logger.error("Version handshake with \(self.server.host, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+            if self.stream === stream {
+                teardown(failingWith: ElectrumError.serverDisconnected)
+            }
+            throw error
         }
     }
 
-    private func handleConnectionTimeout() {
-        guard !didResumeConnectionContinuation else { return }
-        resumeConnectionContinuation(throwing: ElectrumError.connectionTimeout)
-        connection?.cancel()
-    }
+    /// Closes the current stream and fails everything waiting on it.
+    private func teardown(failingWith error: Error) {
+        stream?.close()
+        stream = nil
+        writer = nil
+        isConnected = false
+        lineBuffer = Data()
 
-    // MARK: - TLS
-
-    /// Builds hardened TLS options for Electrum connections.
-    ///
-    /// Hardening applied:
-    /// - Minimum TLS protocol pinned to 1.2 (blocks legacy TLS 1.0/1.1 downgrade).
-    /// - Explicit SNI set to the configured server hostname — ensures the
-    ///   server presents a certificate for the host we intended to reach and
-    ///   prevents accidental matching against an unrelated cert on shared
-    ///   hosting.
-    ///
-    /// Default system trust-chain evaluation remains in place. A future pass
-    /// can layer certificate pinning via `sec_protocol_options_set_verify_block`
-    /// on top of this; for now the defaults plus min-version + SNI are the
-    /// correctness floor we want.
-    private static func makeTLSOptions(serverHost: String) -> NWProtocolTLS.Options {
-        let options = NWProtocolTLS.Options()
-        let securityOptions = options.securityProtocolOptions
-        sec_protocol_options_set_min_tls_protocol_version(securityOptions, .TLSv12)
-        serverHost.withCString { cString in
-            sec_protocol_options_set_tls_server_name(securityOptions, cString)
+        for task in requestTimeouts.values {
+            task.cancel()
         }
-        return options
+        requestTimeouts.removeAll()
+
+        let waiting = pendingRequests
+        pendingRequests.removeAll()
+        for continuation in waiting.values {
+            continuation.resume(throwing: error)
+        }
     }
 
     // MARK: - Send/Receive
 
     private func sendRequest<T: Decodable & Sendable>(_ method: ElectrumMethod, params: [ElectrumParam] = []) async throws -> T {
-        guard let connection = connection else {
+        guard let writer else {
             logger.error("sendRequest(\(method.rawValue, privacy: .public)) failed: not connected")
             throw ElectrumError.serverDisconnected
         }
 
         requestId += 1
-        let currentId = requestId
+        let id = requestId
 
-        let request = ElectrumRequest(id: currentId, method: method.rawValue, params: params)
-        let encoder = JSONEncoder()
-        var data = try encoder.encode(request)
-        data.append(0x0a) // Newline delimiter
+        // Newline-delimited JSON-RPC
+        let payload = try JSONEncoder().encode(ElectrumRequest(id: id, method: method.rawValue, params: params)) + Data([0x0a])
 
-        // Send request
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connection.send(content: data, completion: .contentProcessed { error in
-                if let error = error {
-                    continuation.resume(throwing: ElectrumError.connectionFailed(error.localizedDescription))
-                } else {
-                    continuation.resume()
+        let responseData = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+                // Register before the request leaves, so even an instant reply
+                // finds someone waiting for it.
+                pendingRequests[id] = continuation
+                requestTimeouts[id] = Task { [weak self, requestTimeout] in
+                    try? await Task.sleep(for: requestTimeout)
+                    guard !Task.isCancelled else { return }
+                    await self?.requestTimedOut(id)
                 }
-            })
-        }
-
-        // Wait for response
-        let responseData = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
-            pendingRequests[currentId] = continuation
-
-            // Set timeout
-            Task { [weak self] in
-                guard let self else { return }
-                try? await Task.sleep(nanoseconds: UInt64(self.requestTimeout * 1_000_000_000))
-                await self.handleRequestTimeout(id: currentId)
+                // A failed write ends the connection, failing this request too.
+                writer.write(payload)
             }
+        } onCancel: {
+            Task { await self.failRequest(id, with: CancellationError()) }
         }
 
-        // Parse response
-        let decoder = JSONDecoder()
-        let response = try decoder.decode(ElectrumResponse<T>.self, from: responseData)
+        let response = try JSONDecoder().decode(ElectrumResponse<T>.self, from: responseData)
 
         if let error = response.error {
-            logger.error("Request #\(currentId, privacy: .public) (\(method.rawValue, privacy: .public)) error: \(error.code, privacy: .public) — \(error.message, privacy: .public)")
+            logger.error("Request #\(id, privacy: .public) (\(method.rawValue, privacy: .public)) error: \(error.code, privacy: .public) — \(error.message, privacy: .public)")
             throw ElectrumError.requestFailed(code: error.code, message: error.message)
         }
 
@@ -244,99 +231,96 @@ public actor ElectrumClient {
         throw ElectrumError.invalidResponse("No result in response")
     }
 
-    private func handleRequestTimeout(id: Int) {
-        if let pending = pendingRequests.removeValue(forKey: id) {
-            pending.resume(throwing: ElectrumError.connectionTimeout)
+    private func failRequest(_ id: Int, with error: Error) {
+        requestTimeouts.removeValue(forKey: id)?.cancel()
+        pendingRequests.removeValue(forKey: id)?.resume(throwing: error)
+    }
+
+    /// Servers answer in well under a second; a request left unanswered this
+    /// long means the connection is dead even if TCP has not noticed. Drop it
+    /// so the owner reconnects instead of timing out request after request.
+    private func requestTimedOut(_ id: Int) {
+        guard pendingRequests[id] != nil else { return }
+        logger.error("Request #\(id, privacy: .public) to \(self.server.host, privacy: .public) timed out — dropping the connection")
+        failRequest(id, with: ElectrumError.connectionTimeout)
+        if let stream {
+            connectionEnded(stream)
         }
     }
 
-    private func receiveLoop() async {
-        guard let connection = connection else { return }
-
-        while true {
+    private func startReceiving(on stream: any ByteStream) {
+        Task { [weak self] in
             do {
-                let data = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
-                    connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, _, error in
-                        if let error = error {
-                            continuation.resume(throwing: error)
-                        } else if let data = data {
-                            continuation.resume(returning: data)
-                        } else {
-                            continuation.resume(throwing: ElectrumError.serverDisconnected)
-                        }
-                    }
+                while let chunk = try await stream.read() {
+                    guard let self else { return }
+                    await self.handle(chunk, from: stream)
                 }
-
-                receiveBuffer.append(data)
-                await processReceiveBuffer()
-
-                // A line that exceeds the cap without a newline is a protocol
-                // violation (or an attack) — drop the connection instead of
-                // buffering until out-of-memory.
-                if receiveBuffer.count > maxReceiveBufferBytes {
-                    logger.error("\(self.server.host, privacy: .public) exceeded \(self.maxReceiveBufferBytes) byte line limit — disconnecting")
-                    handleReceiveFailure()
-                    break
-                }
-
+                await self?.connectionEnded(stream)
             } catch {
-                // The connection is dead: fail every in-flight request now
-                // rather than leaving callers to stall on the 60 s timeout.
-                handleReceiveFailure()
-                break
+                await self?.connectionEnded(stream)
             }
         }
     }
 
-    private func handleReceiveFailure() {
-        isConnected = false
-        connection?.cancel()
-        connection = nil
-        receiveBuffer.removeAll()
+    private func handle(_ chunk: Data, from source: any ByteStream) {
+        guard source === stream else { return }
 
-        for (_, continuation) in pendingRequests {
-            continuation.resume(throwing: ElectrumError.serverDisconnected)
+        lineBuffer.append(chunk)
+        var consumed = lineBuffer.startIndex
+        while let newline = lineBuffer[consumed...].firstIndex(of: 0x0a) {
+            let line = Data(lineBuffer[consumed..<newline])
+            consumed = lineBuffer.index(after: newline)
+            handleMessage(line)
+            // A handler may have torn the connection down.
+            guard source === stream else { return }
         }
-        pendingRequests.removeAll()
+        // Copy the unconsumed tail so consumed bytes are actually released.
+        lineBuffer = Data(lineBuffer[consumed...])
+
+        // A line that exceeds the cap without a newline is a protocol
+        // violation (or an attack) — drop the connection instead of
+        // buffering until out-of-memory.
+        if lineBuffer.count > maxReceiveBufferBytes {
+            logger.error("\(self.server.host, privacy: .public) exceeded \(self.maxReceiveBufferBytes) byte line limit — disconnecting")
+            connectionEnded(source)
+        }
     }
 
-    private func processReceiveBuffer() async {
-        while let newlineIndex = receiveBuffer.firstIndex(of: 0x0a) {
-            let messageData = receiveBuffer[..<newlineIndex]
-            receiveBuffer = receiveBuffer[(newlineIndex + 1)...]
-
-            await handleMessage(Data(messageData))
+    /// The live stream closed or failed: fail every in-flight request now
+    /// rather than leaving callers to stall on the request timeout.
+    private func connectionEnded(_ source: any ByteStream) {
+        guard source === stream else { return }
+        let wasConnected = isConnected
+        teardown(failingWith: ElectrumError.serverDisconnected)
+        if wasConnected {
+            logger.info("Connection to \(self.server.host, privacy: .public) lost")
+            disconnectHandler?()
         }
     }
 
-    private func handleMessage(_ data: Data) async {
-        // Try to parse as a response with ID
-        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let id = json["id"] as? Int,
-           let continuation = pendingRequests.removeValue(forKey: id) {
+    private func handleMessage(_ data: Data) {
+        let decoder = JSONDecoder()
+        guard let envelope = try? decoder.decode(ElectrumEnvelope.self, from: data) else { return }
+
+        if let id = envelope.id, let continuation = pendingRequests.removeValue(forKey: id) {
+            requestTimeouts.removeValue(forKey: id)?.cancel()
             continuation.resume(returning: data)
             return
         }
 
-        // Try to parse as a subscription notification
-        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let method = json["method"] as? String,
-           let params = json["params"] as? [Any] {
-
-            if method == ElectrumMethod.blockchainHeadersSubscribe.rawValue,
-               let headerObject = params.first,
-               let headerData = try? JSONSerialization.data(withJSONObject: headerObject),
-               let header = try? JSONDecoder().decode(ElectrumHeader.self, from: headerData) {
+        switch envelope.method {
+        case ElectrumMethod.blockchainHeadersSubscribe.rawValue:
+            if let header = (try? decoder.decode(ElectrumHeaderNotification.self, from: data))?.params.first {
                 headersHandler?(header)
-                return
             }
-
-            if params.count >= 2, let scriptHash = params[0] as? String {
-                if let handler = subscriptionHandlers[scriptHash] {
-                    let status = params[1] as? String ?? ""
-                    handler(status)
-                }
+        case ElectrumMethod.blockchainScripthashSubscribe.rawValue:
+            if let params = (try? decoder.decode(ElectrumScriptHashNotification.self, from: data))?.params,
+               params.count >= 2,
+               let scriptHash = params[0] {
+                subscriptionHandlers[scriptHash]?(params[1] ?? "")
             }
+        default:
+            break
         }
     }
 
@@ -384,7 +368,12 @@ public actor ElectrumClient {
 
     public func subscribeScriptHash(_ scriptHash: String, handler: @escaping @Sendable (String) -> Void) async throws -> String? {
         subscriptionHandlers[scriptHash] = handler
-        return try await sendRequest(.blockchainScripthashSubscribe, params: [.string(scriptHash)])
+        do {
+            return try await sendRequest(.blockchainScripthashSubscribe, params: [.string(scriptHash)])
+        } catch {
+            subscriptionHandlers.removeValue(forKey: scriptHash)
+            throw error
+        }
     }
 
     public func unsubscribeScriptHash(_ scriptHash: String) async throws -> Bool {
@@ -405,4 +394,38 @@ public actor ElectrumClient {
     public func broadcastTransaction(rawHex: String) async throws -> String {
         try await sendRequest(.blockchainTransactionBroadcast, params: [.string(rawHex)])
     }
+}
+
+// MARK: - Wire Envelopes
+
+/// Just enough of a JSON-RPC message to route it: a response carries the id
+/// of the request it answers, a notification carries a method name.
+private struct ElectrumEnvelope: Decodable {
+    let id: Int?
+    let method: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case method
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        // We always send numeric ids; tolerate servers that echo them as strings.
+        if let numeric = try? container.decodeIfPresent(Int.self, forKey: .id) {
+            id = numeric
+        } else {
+            id = (try? container.decodeIfPresent(String.self, forKey: .id)).flatMap { Int($0) }
+        }
+        method = try? container.decodeIfPresent(String.self, forKey: .method)
+    }
+}
+
+private struct ElectrumHeaderNotification: Decodable {
+    let params: [ElectrumHeader]
+}
+
+/// `[scripthash, status]` — the status is `null` for an address with no history.
+private struct ElectrumScriptHashNotification: Decodable {
+    let params: [String?]
 }

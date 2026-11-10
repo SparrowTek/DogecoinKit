@@ -9,7 +9,7 @@ Add Dogecoin wallet functionality to your iOS or macOS app.
 
 ## Overview
 
-This guide walks you through integrating DogecoinKit into your iOS or macOS project. By the end, you'll have a working foundation for a Dogecoin wallet.
+This guide walks you through integrating DogecoinKit into your iOS or macOS project. By the end, you'll have a working foundation for a Dogecoin wallet. To build for Android, see <doc:UsingDogecoinKitOnAndroid>.
 
 ## Adding DogecoinKit to Your Project
 
@@ -61,7 +61,7 @@ import DogecoinKit
 struct MyWalletApp: App {
     init() {
         // Initialize DogecoinKit's cryptographic context
-        Dogecoin.initialize()
+        Task { await Dogecoin.initialize() }
     }
 
     var body: some Scene {
@@ -86,13 +86,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) -> Bool {
         // Initialize DogecoinKit's cryptographic context
-        Dogecoin.initialize()
+        Task { await Dogecoin.initialize() }
         return true
     }
 }
 ```
 
-> Important: Call ``Dogecoin/initialize()`` before using any wallet, key, or transaction functions. It's safe to call multiple times—subsequent calls are no-ops.
+> Important: ``Dogecoin/initialize()`` is `async`, and wallet, key, and transaction functions throw ``DogecoinError/initializationFailed`` until it has finished. A `Task` started at launch may still be running when your first view appears. It's safe to call multiple times—subsequent calls are no-ops—so `await` it again before your first wallet call.
 
 ## Your First Wallet
 
@@ -101,9 +101,9 @@ Let's create a simple wallet and generate an address:
 ```swift
 import DogecoinKit
 
-func createWallet() throws -> (wallet: HDWallet, address: String) {
+func createWallet() async throws -> (wallet: HDWallet, address: String) {
     // Create a new HD wallet with a 12-word mnemonic
-    let wallet = try HDWallet.create(
+    let wallet = try await HDWallet.create(
         strength: .words12,
         network: .mainnet
     )
@@ -115,7 +115,7 @@ func createWallet() throws -> (wallet: HDWallet, address: String) {
     print("Recovery phrase: \(mnemonic)")
 
     // Derive the first receiving address
-    let address = try wallet.deriveAddress(account: 0, index: 0)
+    let address = try await wallet.deriveAddress(account: 0, index: 0)
     print("Address: \(address)")
 
     return (wallet, address)
@@ -149,7 +149,7 @@ A wallet can generate unlimited addresses from a single mnemonic:
 
 ```swift
 // Generate 10 receiving addresses
-let receivingAddresses = try wallet.deriveAddresses(
+let receivingAddresses = try await wallet.deriveAddresses(
     count: 10,
     account: 0,
     change: false,
@@ -157,7 +157,7 @@ let receivingAddresses = try wallet.deriveAddresses(
 )
 
 // Generate change addresses
-let changeAddresses = try wallet.deriveAddresses(
+let changeAddresses = try await wallet.deriveAddresses(
     count: 5,
     account: 0,
     change: true,
@@ -171,11 +171,11 @@ DogecoinKit supports both mainnet (real Dogecoin) and testnet (for development):
 
 ```swift
 // For production - real Dogecoin
-let mainnetWallet = try HDWallet.create(network: .mainnet)
+let mainnetWallet = try await HDWallet.create(network: .mainnet)
 // Addresses start with 'D'
 
 // For development - test Dogecoin
-let testnetWallet = try HDWallet.create(network: .testnet)
+let testnetWallet = try await HDWallet.create(network: .testnet)
 // Addresses start with 'n'
 ```
 

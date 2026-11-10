@@ -1,5 +1,6 @@
 import Foundation
 import clibdogecoin
+import DogecoinKitShims
 
 // MARK: - BIP39 Mnemonic Validation
 
@@ -36,14 +37,12 @@ private enum BIP39Wordlist {
         return index
     }()
 
+    /// libdogecoin's compiled-in list — the same one `verifyMnemonic` checks
+    /// against — so no resource bundle is needed on any platform.
     private static func loadWordlist() -> [String] {
-        guard let url = Bundle.module.url(forResource: "bip39_english", withExtension: "txt"),
-              let data = try? Data(contentsOf: url),
-              let content = String(data: data, encoding: .utf8) else {
-            return []
+        let words = (0..<Int32(bip39WordCount)).compactMap { index in
+            dogecoinkit_bip39_english_word(index).map { String(cString: $0) }
         }
-
-        let words = content.split(whereSeparator: { $0.isNewline }).map(String.init)
         return words.count == bip39WordCount ? words : []
     }
 }
@@ -69,7 +68,7 @@ public func isValidBIP39Word(_ word: String) -> Bool {
 }
 
 /// Returns the BIP39 English wordlist
-/// - Returns: The bundled wordlist in alphabetical order
+/// - Returns: The wordlist in alphabetical order
 public func getBIP39Wordlist() -> [String] {
     BIP39Wordlist.english
 }
@@ -143,9 +142,8 @@ public enum MnemonicValidationError: Error, Sendable, Equatable {
     case invalidWordCount
     case invalidWords([Int])
     case invalidChecksum
-    /// The bundled BIP39 wordlist resource could not be loaded. Raised only
-    /// when the wordlist is genuinely missing (e.g., resource bundle broken);
-    /// distinct from `invalidChecksum` so support can tell the two apart.
+    /// The BIP39 wordlist could not be loaded. Kept for source
+    /// compatibility; the list is compiled in, so this no longer occurs.
     case wordlistUnavailable
 }
 
@@ -174,7 +172,7 @@ public func validateMnemonicDetailed(_ mnemonic: String) -> MnemonicValidationRe
         )
     }
 
-    // If the bundled wordlist is missing, we can only partially validate
+    // If the wordlist is missing, we can only partially validate
     // (libdogecoin's checksum check still works), but we cannot identify
     // specific bad words, which would otherwise appear to the user as an
     // indistinguishable "bad checksum." Surface this case distinctly.

@@ -1,13 +1,33 @@
 import Foundation
 
 extension Data {
+    /// The same bytes indexed from zero.
+    ///
+    /// Message parsers use fixed offsets, so their public entry points rebase
+    /// first: a caller passing a slice (whose indices start mid-buffer) would
+    /// otherwise shift every field or trap on an out-of-range subscript.
+    var rebased: Data {
+        startIndex == 0 ? self : Data(self)
+    }
+
+    /// Copies `length` bytes starting at `offset` (relative to `startIndex`),
+    /// or returns nil if the range does not fit.
+    func bytes(at offset: Int, count length: Int) -> Data? {
+        guard offset >= 0, length >= 0, count - offset >= length else { return nil }
+        let start = startIndex + offset
+        return Data(self[start..<(start + length)])
+    }
+
+    /// Reads a fixed-width integer in memory byte order at `offset`, which is
+    /// relative to `startIndex` so slices behave like zero-based buffers.
     func readInteger<T: FixedWidthInteger>(at offset: Int) -> T? {
         let size = MemoryLayout<T>.size
-        guard offset >= 0, count >= offset + size else { return nil }
+        guard offset >= 0, count - offset >= size else { return nil }
 
+        let start = startIndex + offset
         var value: T = 0
         Swift.withUnsafeMutableBytes(of: &value) { (buffer: UnsafeMutableRawBufferPointer) in
-            _ = copyBytes(to: buffer, from: offset..<(offset + size))
+            _ = copyBytes(to: buffer, from: start..<(start + size))
         }
 
         return value

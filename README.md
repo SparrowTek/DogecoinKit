@@ -1,6 +1,6 @@
 # DogecoinKit
 
-A pure Swift SDK for building Dogecoin wallets on iOS and macOS.
+A pure Swift SDK for building Dogecoin wallets on iOS, macOS, and Android.
 
 DogecoinKit provides a complete toolkit for creating SPV (Simplified Payment Verification) Dogecoin wallets, including HD wallet generation, address derivation, transaction building, and peer-to-peer network synchronization.
 
@@ -10,17 +10,18 @@ DogecoinKit provides a complete toolkit for creating SPV (Simplified Payment Ver
 - **Mnemonic Phrases** — Generate and restore wallets using 12-24 word recovery phrases
 - **Address Management** — P2PKH address generation and derivation; P2PKH + P2SH validation
 - **Transaction Building** — Create, sign, and serialize Dogecoin transactions
-- **Electrum + SPV Networking** — Electrum protocol client (SSL) and native Swift P2P networking using Network.framework
-- **Header Sync** — Download and validate block headers (scrypt PoW, AuxPoW, checkpoints) for lightweight verification
-- **Secure Storage** — Keychain-backed mnemonic storage (`SecureKeyStorage`)
+- **Electrum + SPV Networking** — Electrum protocol client (SSL) and native Swift P2P networking, over Network.framework on Apple platforms and SwiftNIO on Android
+- **Header Sync** — Download and validate block headers (checkpoints, scrypt PoW, AuxPoW, DigiShield difficulty, timestamps) for lightweight verification
+- **Secure Storage** — Keychain-backed mnemonic storage (`SecureKeyStorage`, Apple platforms)
 - **Swift 6 Ready** — Full concurrency support with Sendable conformance
-- **Cross-Platform** — iOS 17+ and macOS 14+
+- **Cross-Platform** — iOS 17+, macOS 14+, and Android (API 28+)
 
 ## Requirements
 
 - iOS 17.0+ / macOS 14.0+
 - Swift 6.0+
 - Xcode 16.0+
+- Android: API 28+, built with the Swift SDK for Android (tested with Swift 6.4.1); see [Android](#android)
 
 ## Installation
 
@@ -58,6 +59,7 @@ Then add the dependency to your target:
 `Dogecoin.initialize()` is async — kick it off once when your app launches:
 
 ```swift
+import SwiftUI
 import DogecoinKit
 
 @main
@@ -74,7 +76,12 @@ struct MyApp: App {
 }
 ```
 
-Every API that touches libdogecoin awaits initialization internally, so it is safe to call wallet APIs immediately.
+APIs that reach into libdogecoin (`HDWallet`, `generateMnemonic`, `KeyPair`,
+`TransactionBuilder`, and the `Address` key conversions) do not wait for
+initialization. They throw `DogecoinError.initializationFailed` until it has
+finished, and the `Task` above may still be running when your first view
+appears. Repeat calls are no-ops, so `await Dogecoin.initialize()` again before
+your first wallet call.
 
 ### Create a New Wallet
 
@@ -101,6 +108,10 @@ let wallet = try await HDWallet(mnemonic: mnemonic, network: .mainnet)
 // Derive multiple addresses (external chain, starting at index 0)
 let addresses = try await wallet.deriveAddresses(count: 10, account: 0, change: false, startIndex: 0)
 ```
+
+`HDWallet(mnemonic:)` rejects any phrase that fails full BIP39 validation (an
+unknown word or a bad checksum) with `DogecoinError.invalidMnemonic`, so a typo
+can't silently open a different, empty wallet.
 
 ### Store Credentials in the Keychain
 
@@ -184,6 +195,10 @@ print("Broadcast this hex: \(signed.rawHex)")
 print("txid: \(signed.txid)")
 ```
 
+Before building anything, `createTransaction` rejects duplicate inputs and
+checks that each signing key really owns its input's P2PKH address, so a wrong
+key fails fast instead of producing an unspendable signature.
+
 Or drive the `TransactionBuilder` actor directly:
 
 ```swift
@@ -192,6 +207,7 @@ let tx = try await TransactionBuilder()
 try await tx.addInput(txid: "abc123...", vout: 0)
 try await tx.addOutput(address: "DRecipientAddress...", amount: DogecoinAmount(doge: 50))
 
+// The 49 DOGE left after the output and fee goes to the change address
 _ = try await tx.finalize(
     destinationAddress: "DRecipientAddress...",
     fee: DogecoinAmount(doge: 1),
@@ -202,6 +218,12 @@ _ = try await tx.finalize(
 try await tx.sign(privateKeyWIF: "QPrivateKeyInWIF...")
 let signedHex = try await tx.getRawTransaction()
 ```
+
+`finalize` sends whatever `totalAmount` leaves after the outputs and fee to
+`changeAddress` and throws if there is change but no change address. After
+that the builder is sealed: no more inputs or outputs. Signing requires a
+finalized builder (otherwise the leftover would all go to fees), and each
+input can be signed only once.
 
 ### Sync with the Network
 
@@ -244,8 +266,26 @@ final class WalletSync: SPVSyncDelegate {
 }
 ```
 
+Callbacks arrive in order, and `spvSyncDidComplete` fires each time the chain
+catches up, including after every new block. Every header is validated before
+it is accepted (checkpoints, scrypt or AuxPoW proof of work, DigiShield
+difficulty, version rules, timestamps). Peers that send headers breaking
+consensus are banned; headers that merely fail a clock-based check are not
+held against the peer, matching Dogecoin Core.
+
 For the default lightweight mode, `ElectrumSyncManager` speaks the Electrum
-protocol over SSL and exposes balance, UTXO, history, and broadcast APIs.
+protocol over SSL and exposes balance, UTXO, history, and broadcast APIs. If the
+server drops, it reconnects on its own with backoff, restores your address
+subscriptions, retries an interrupted read once (broadcasts are never retried),
+and calls `syncManagerDidComplete` when it is back so you can refresh. A server
+that stops answering is dropped and replaced the same way.
+
+Electrum servers are not trusted with amounts. `fetchUTXOs` checks every UTXO
+against its funding transaction, which must hash to the claimed txid, and
+throws `ElectrumError.invalidResponse` if the server misreports a value or
+script. Legacy signatures do not commit to input amounts, so an understated
+value could otherwise be signed away as fee. `getTransaction` checks the txid
+the same way.
 
 ## Architecture
 
@@ -253,7 +293,7 @@ DogecoinKit is built on top of [libdogecoin](https://github.com/dogecoinfoundati
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                   Your iOS App                       │
+│                     Your App                         │
 ├─────────────────────────────────────────────────────┤
 │                   DogecoinKit                        │
 │  ┌─────────────┐ ┌─────────────┐ ┌───────────────┐  │
@@ -283,6 +323,41 @@ DogecoinKit is built on top of [libdogecoin](https://github.com/dogecoinfoundati
 | `SPVSyncManager` | Block header synchronization |
 | `HeaderChain` | Block header storage and validation |
 
+## Android
+
+DogecoinKit builds for Android with the
+[Swift SDK for Android](https://www.swift.org/documentation/articles/swift-sdk-for-android-getting-started.html).
+The wallet, transaction, SPV, and Electrum code is the same as on Apple
+platforms; SwiftNIO and NIOSSL replace Network.framework, swift-crypto
+replaces CryptoKit, and logs go to logcat. `SecureKeyStorage` (Keychain) and
+installing legacy `headers.bin.lzfse` caches stay Apple-only. There is no
+Kotlin interface yet: an app calls DogecoinKit through a JNI bridge such as
+swift-java.
+
+GRDB needs SQLite, which the NDK doesn't ship, so build it first, then point
+`swift build` at it:
+
+```sh
+Scripts/build-android-sqlite.sh arm64-v8a
+swift build \
+    --swift-sdk swift-6.4.1-RELEASE_android \
+    --triple aarch64-unknown-linux-android28 \
+    -Xcc -I.build/android-sqlite/include \
+    -Xlinker -L.build/android-sqlite/arm64-v8a
+```
+
+Ship `libsqlite3.so` in the app's `jniLibs/<ABI>` folder with the Swift
+runtime libraries. Android apps have no home directory, so pass a
+`storageDirectory` inside the app's files directory to `SPVSyncManager` or
+`HeaderChain`. To run the test suite on a connected device or emulator:
+
+```sh
+SWIFT=/path/to/swift-6.4.1-RELEASE/usr/bin/swift Scripts/test-android.sh arm64-v8a
+```
+
+See [Using DogecoinKit on Android](Sources/DogecoinKit/Documentation.docc/Articles/UsingDogecoinKitOnAndroid.md)
+for the details.
+
 ## Network Support
 
 | Network | Port | Address Prefix |
@@ -296,7 +371,10 @@ DogecoinKit is designed with Swift concurrency in mind:
 
 - `Dogecoin.initialize()` is thread-safe and idempotent
 - Core types (`KeyPair`, `DogecoinAmount`, `DogecoinAddress`) are `Sendable`
-- `PeerManager` and `HeaderChain` use internal synchronization
+- `TransactionBuilder`, `SecureKeyStorage`, `SPVSyncManager`, `PeerManager`,
+  `Peer`, `HeaderChain`, and the Electrum client and sync manager are actors.
+  `await` their methods and properties, and use methods like `setDelegate(_:)`,
+  because actor properties can't be assigned from outside
 - `HDWallet` is a `Sendable` final class safe for concurrent reads
 
 For mutable wallet state management, we recommend using Swift actors:
@@ -321,7 +399,8 @@ actor WalletState {
 - **Never** log or display private keys or mnemonic phrases in production
 - Store mnemonic phrases with `SecureKeyStorage` — it writes to the iOS Keychain
   as `WhenUnlockedThisDeviceOnly`, non-synchronizable, and reads raw `Data` to
-  avoid leaving non-zeroizable `String` copies around
+  avoid leaving non-zeroizable `String` copies around. On Android, use the
+  Android Keystore
 - Use the **same `serviceName`** for every `SecureKeyStorage` you construct in
   an app — the Keychain scopes items by service, so mismatched names read as
   "key not found"
@@ -340,11 +419,13 @@ let (wallet, keychainID) = try await storage.importAndStoreWallet(
 
 ## Error Handling
 
-DogecoinKit uses Swift's native error handling. All throwing functions use `DogecoinError`:
+DogecoinKit uses Swift's native error handling. Wallet, key, address, amount,
+transaction, and keychain APIs throw `DogecoinError`. The Electrum types throw
+`ElectrumError`.
 
 ```swift
 do {
-    let wallet = try HDWallet(mnemonic: userInput, network: .mainnet)
+    let wallet = try await HDWallet(mnemonic: userInput, network: .mainnet)
 } catch DogecoinError.invalidMnemonic {
     showAlert("Invalid recovery phrase. Please check and try again.")
 } catch {
@@ -368,6 +449,7 @@ See the [Documentation](Sources/DogecoinKit/Documentation.docc) for comprehensiv
 - [Creating a Wallet](Sources/DogecoinKit/Documentation.docc/Articles/CreatingAWallet.md)
 - [Sending Transactions](Sources/DogecoinKit/Documentation.docc/Articles/SendingTransactions.md)
 - [SPV Synchronization](Sources/DogecoinKit/Documentation.docc/Articles/SPVSynchronization.md)
+- [Using DogecoinKit on Android](Sources/DogecoinKit/Documentation.docc/Articles/UsingDogecoinKitOnAndroid.md)
 
 ## Contributing
 

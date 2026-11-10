@@ -28,7 +28,7 @@ A Dogecoin transaction consists of:
 │  │ UTXO from TX abc123 │        │ 50 DOGE to DRecip.. │    │
 │  │ 100 DOGE            │   →    │                     │    │
 │  └─────────────────────┘        ├─────────────────────┤    │
-│                                 │ 48 DOGE to DChange. │    │
+│                                 │ 49 DOGE to DChange. │    │
 │                                 │ (change)            │    │
 │                                 ├─────────────────────┤    │
 │                                 │ 1 DOGE fee          │    │
@@ -44,12 +44,12 @@ A Dogecoin transaction consists of:
 An Unspent Transaction Output (UTXO) represents funds you can spend. Each UTXO is the output of a previous transaction that sent funds to your address.
 
 ```swift
-struct UTXO: Sendable, Codable {
+struct UTXO: Sendable, Equatable, Hashable, Codable {
     let txid: String           // Transaction ID containing this output
     let vout: Int              // Output index within the transaction
     let address: String        // Your address
     let amount: DogecoinAmount // Amount available
-    let scriptPubKey: String?  // Locking script (for signing)
+    let scriptPubKey: String?  // Locking script, if known (checked before signing)
     let confirmations: Int     // Number of confirmations
 }
 ```
@@ -123,52 +123,62 @@ func selectUTXOs(
 ```swift
 import DogecoinKit
 
-// 1. Create a transaction builder
-let tx = try TransactionBuilder()
+func sendDoge() async throws {
+    // 1. Create a transaction builder
+    let tx = try await TransactionBuilder()
 
-// 2. Add inputs (UTXOs you're spending)
-try tx.addInput(txid: "abc123def456...", vout: 0)
+    // 2. Add inputs (UTXOs you're spending)
+    try await tx.addInput(txid: "abc123def456...", vout: 0)
 
-// 3. Add outputs (recipients)
-try tx.addOutput(
-    address: "DRecipientAddress...",
-    amount: DogecoinAmount(doge: 50)
-)
+    // 3. Add outputs (recipients)
+    try await tx.addOutput(
+        address: "DRecipientAddress...",
+        amount: DogecoinAmount(doge: 50)
+    )
 
-// 4. Finalize with fee and change
-let rawTx = try tx.finalize(
-    destinationAddress: "DRecipientAddress...",
-    fee: DogecoinAmount(doge: 1),
-    totalAmount: DogecoinAmount(doge: 100),  // Total input amount
-    changeAddress: "DMyChangeAddress..."
-)
+    // 4. Finalize with fee and change (the 49 DOGE left over goes to the change address)
+    let rawTx = try await tx.finalize(
+        destinationAddress: "DRecipientAddress...",
+        fee: DogecoinAmount(doge: 1),
+        totalAmount: DogecoinAmount(doge: 100),  // Total input amount
+        changeAddress: "DMyChangeAddress..."
+    )
 
-// 5. Sign with your private key
-try tx.sign(privateKeyWIF: "QPrivateKeyInWIF...")
+    // 5. Sign with your private key
+    try await tx.sign(privateKeyWIF: "QPrivateKeyInWIF...")
 
-// 6. Get the signed transaction hex
-let signedHex = try tx.getRawTransaction()
-print("Broadcast this: \(signedHex)")
+    // 6. Get the signed transaction hex
+    let signedHex = try await tx.getRawTransaction()
+    print("Broadcast this: \(signedHex)")
+}
 ```
+
+``TransactionBuilder`` is an actor, so every call is `try await`. Keep these rules in mind:
+
+- Each output must be more than zero and at most ``DogecoinAmount/maxMoney``. All outputs must be on the same network, and they can pay P2PKH or P2SH addresses.
+- `finalize` sends whatever `totalAmount` leaves after the outputs and fee to `changeAddress`. It throws if there is change but no change address. When the amounts balance exactly, no change output is needed.
+- Finalizing seals the builder, so adding more inputs or outputs throws.
+- Signing requires a finalized builder. Without `finalize` there is no change output, and everything the outputs leave over would go to miners as fee.
+- Each input can be signed once. Signing it again throws instead of stacking a second signature that nodes refuse to relay.
 
 ### Multiple Inputs and Outputs
 
 ```swift
-let tx = try TransactionBuilder()
+let tx = try await TransactionBuilder()
 
 // Multiple inputs
-try tx.addInput(txid: "txid1...", vout: 0)  // 50 DOGE
-try tx.addInput(txid: "txid2...", vout: 1)  // 30 DOGE
-try tx.addInput(txid: "txid3...", vout: 0)  // 20 DOGE
+try await tx.addInput(txid: "txid1...", vout: 0)  // 50 DOGE
+try await tx.addInput(txid: "txid2...", vout: 1)  // 30 DOGE
+try await tx.addInput(txid: "txid3...", vout: 0)  // 20 DOGE
 // Total: 100 DOGE
 
 // Multiple outputs
-try tx.addOutput(address: "DRecipient1...", amount: DogecoinAmount(doge: 40))
-try tx.addOutput(address: "DRecipient2...", amount: DogecoinAmount(doge: 30))
+try await tx.addOutput(address: "DRecipient1...", amount: DogecoinAmount(doge: 40))
+try await tx.addOutput(address: "DRecipient2...", amount: DogecoinAmount(doge: 30))
 // Total outputs: 70 DOGE
 
 // Finalize
-_ = try tx.finalize(
+_ = try await tx.finalize(
     destinationAddress: "DRecipient1...",
     fee: DogecoinAmount(doge: 1),
     totalAmount: DogecoinAmount(doge: 100),
@@ -192,7 +202,7 @@ let outputs: [(address: String, amount: DogecoinAmount)] = [
     ("DRecipient...", DogecoinAmount(doge: 50))
 ]
 
-let signedTx = try createTransaction(
+let signedTx = try await createTransaction(
     inputs: utxos,
     outputs: outputs,
     privateKey: "QPrivateKey...",
@@ -212,7 +222,7 @@ let signingKeys = [
     "DMyAddr2...": "QPrivateKey2..."
 ]
 
-let signedTx = try createTransaction(
+let signedTx = try await createTransaction(
     inputs: utxos,
     outputs: outputs,
     signingKeysByAddress: signingKeys,
@@ -220,6 +230,14 @@ let signedTx = try createTransaction(
     fee: DogecoinAmount(doge: 1)
 )
 ```
+
+Before building anything, `createTransaction` throws ``DogecoinError/transactionValidationFailed(_:)`` if a check fails:
+
+- The same output is spent twice.
+- An input isn't a P2PKH address, or its recorded `scriptPubKey` doesn't pay to that address.
+- A signing key is missing, or it doesn't actually own its input's address.
+
+These checks mean a wrong key fails fast instead of producing an unspendable signature. The function also raises a fee below ``FeeEstimation/minimumFee`` to that minimum and adds change smaller than the dust threshold to the fee. Without a `changeAddress`, change goes back to the first input's address.
 
 ## Calculating Fees
 
@@ -246,6 +264,8 @@ func estimateFee(inputCount: Int, outputCount: Int) -> DogecoinAmount {
 let fee = estimateFee(inputCount: 2, outputCount: 2)
 print("Estimated fee: \(fee)")  // ~0.37 DOGE
 ```
+
+``FeeEstimation`` performs this same calculation. `FeeEstimation.estimateFee(inputCount: 2, outputCount: 2)` returns the same 0.374 DOGE, and the type also offers priority levels and UTXO selection helpers.
 
 ### Fee Priority
 
@@ -294,33 +314,35 @@ class TransactionService {
         }
 
         // 4. Get a change address
-        let changeAddress = try wallet.deriveAddress(account: 0, index: 0, change: true)
+        let changeAddress = try await wallet.deriveAddress(account: 0, index: 0, change: true)
 
         // 5. Build the transaction
-        let tx = try TransactionBuilder()
+        let tx = try await TransactionBuilder()
 
         for utxo in selectedUTXOs {
-            try tx.addInput(txid: utxo.txid, vout: utxo.vout)
+            try await tx.addInput(txid: utxo.txid, vout: utxo.vout)
         }
 
-        try tx.addOutput(address: recipientAddress, amount: amount)
+        try await tx.addOutput(address: recipientAddress, amount: amount)
 
         let totalInput = selectedUTXOs.reduce(.zero) { $0 + $1.amount }
 
-        _ = try tx.finalize(
+        _ = try await tx.finalize(
             destinationAddress: recipientAddress,
             fee: estimatedFee,
             totalAmount: totalInput,
             changeAddress: changeAddress
         )
 
-        // 6. Sign the transaction
-        // In a real app, you'd retrieve the private key securely
-        let privateKey = try getPrivateKey(for: selectedUTXOs.first!.address)
-        try tx.sign(privateKeyWIF: privateKey)
+        // 6. Sign each input with the key for the address it spends from
+        // In a real app, you'd retrieve the private keys securely
+        for (index, utxo) in selectedUTXOs.enumerated() {
+            let privateKey = try getPrivateKey(for: utxo.address)
+            try await tx.signInput(index: index, privateKeyWIF: privateKey)
+        }
 
         // 7. Get the raw transaction
-        let rawHex = try tx.getRawTransaction()
+        let rawHex = try await tx.getRawTransaction()
 
         // 8. Mark UTXOs as spent (pending)
         for utxo in selectedUTXOs {
@@ -339,19 +361,14 @@ class TransactionService {
 Broadcast through connected peers:
 
 ```swift
-func broadcastTransaction(_ tx: SignedTransaction, via peerManager: PeerManager) {
-    // Create the tx message
-    let txData = Data(hexString: tx.rawHex)!
-    let message = ProtocolMessage(
-        network: .mainnet,
-        command: ProtocolMessage.Command.tx,
-        payload: txData
-    )
-
-    // Send to all connected peers
-    peerManager.broadcast(message)
+func broadcastTransaction(_ tx: SignedTransaction, via peerManager: PeerManager) async throws -> String {
+    // Announces the transaction to every connected peer, serves it to the
+    // peers that request it, and returns its txid
+    try await peerManager.broadcastTransaction(tx.rawHex)
 }
 ```
+
+This throws ``DogecoinError/noPeersAvailable`` when no peer is connected. ``SPVSyncManager`` has the same `broadcastTransaction(_:)` method, which also accepts a ``SignedTransaction``.
 
 ### Via Block Explorer API
 
@@ -359,7 +376,9 @@ Many wallets broadcast via HTTP API for reliability:
 
 ```swift
 func broadcastViaAPI(_ tx: SignedTransaction) async throws {
-    let url = URL(string: "https://api.blockcypher.com/v1/doge/main/txs/push")!
+    guard let url = URL(string: "https://api.blockcypher.com/v1/doge/main/txs/push") else {
+        throw URLError(.badURL)
+    }
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -367,7 +386,7 @@ func broadcastViaAPI(_ tx: SignedTransaction) async throws {
     let body = ["tx": tx.rawHex]
     request.httpBody = try JSONEncoder().encode(body)
 
-    let (data, response) = try await URLSession.shared.data(for: request)
+    let (_, response) = try await URLSession.shared.data(for: request)
 
     guard let httpResponse = response as? HTTPURLResponse,
           (200...299).contains(httpResponse.statusCode) else {
@@ -384,20 +403,22 @@ Handle transaction errors gracefully:
 
 ```swift
 do {
-    let tx = try TransactionBuilder()
-    try tx.addInput(txid: txid, vout: vout)
-    try tx.addOutput(address: recipient, amount: amount)
+    let tx = try await TransactionBuilder()
+    try await tx.addInput(txid: txid, vout: vout)
+    try await tx.addOutput(address: recipient, amount: amount)
     // ...
 } catch DogecoinError.transactionCreationFailed {
     showError("Failed to create transaction")
 } catch DogecoinError.addInputFailed {
-    showError("Invalid input - UTXO may already be spent")
+    showError("Invalid input - check the txid and output index")
 } catch DogecoinError.addOutputFailed {
-    showError("Invalid output - check the recipient address")
-} catch DogecoinError.transactionSigningFailed {
+    showError("Invalid output - check the recipient address and amount")
+} catch DogecoinError.transactionValidationFailed(let reason) {
+    showError("Transaction rejected: \(reason)")
+} catch DogecoinError.transactionSigningFailed, DogecoinError.invalidPrivateKey {
     showError("Failed to sign transaction - check your private key")
 } catch DogecoinError.finalizationFailed {
-    showError("Failed to finalize transaction - check amounts")
+    showError("Failed to finalize transaction - check amounts and the change address")
 } catch {
     showError("Transaction error: \(error.localizedDescription)")
 }

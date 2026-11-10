@@ -1,4 +1,6 @@
+#if canImport(Compression)
 import Compression
+#endif
 import Foundation
 import Testing
 @testable import DogecoinKit
@@ -122,6 +124,7 @@ struct HeaderCacheManagerTests {
     }
 }
 
+#if canImport(Compression)
 @Suite("LZFSEDecompressor Tests")
 struct LZFSEDecompressorTests {
     @Test("Decompression of valid LZFSE data succeeds")
@@ -197,3 +200,4 @@ struct LZFSEDecompressorTests {
         try compressed.write(to: url)
     }
 }
+#endif

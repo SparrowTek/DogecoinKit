@@ -1,6 +1,8 @@
 import Foundation
 import GRDB
+#if canImport(os)
 import os.log
+#endif
 
 /// Errors from header database operations
 public enum HeaderDatabaseError: Error, Sendable {
@@ -178,7 +180,7 @@ public final class HeaderDatabase: Sendable {
         let total = records.count
         var inserted = 0
 
-        for batch in records.chunks(ofCount: batchSize) {
+        for batch in records.chunks(ofCount: max(1, batchSize)) {
             try dbQueue.write { db in
                 for record in batch {
                     try record.insert(db)
@@ -213,6 +215,23 @@ public final class HeaderDatabase: Sendable {
             )
 
             // Set new best chain markers
+            for hash in hashes {
+                try db.execute(
+                    sql: "UPDATE headers SET isInBestChain = 1 WHERE hash = ?",
+                    arguments: [hash]
+                )
+            }
+        }
+    }
+
+    /// Makes `hashes` the best chain above `height`, atomically: a crash
+    /// part-way can never leave the database with no best-chain tip.
+    public func replaceBestChain(above height: Int32, with hashes: [Data]) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE headers SET isInBestChain = 0 WHERE height > ?",
+                arguments: [height]
+            )
             for hash in hashes {
                 try db.execute(
                     sql: "UPDATE headers SET isInBestChain = 1 WHERE hash = ?",

@@ -1,6 +1,6 @@
 # ``DogecoinKit``
 
-Build Dogecoin wallets for iOS and macOS with a pure Swift SDK.
+Build Dogecoin wallets for iOS, macOS, and Android with a pure Swift SDK.
 
 @Metadata {
     @DisplayName("DogecoinKit")
@@ -23,16 +23,20 @@ Whether you're building a simple wallet app or integrating Dogecoin payments int
 ```swift
 import DogecoinKit
 
-// Initialize the library
-Dogecoin.initialize()
+func quickStart() async throws {
+    // Initialize the library
+    await Dogecoin.initialize()
 
-// Create a new wallet
-let wallet = try HDWallet.create(strength: .words12, network: .mainnet)
-print("Backup these words: \(wallet.mnemonic!)")
+    // Create a new wallet
+    let wallet = try await HDWallet.create(strength: .words12, network: .mainnet)
+    if let mnemonic = wallet.mnemonic {
+        print("Backup these words: \(mnemonic)")
+    }
 
-// Generate a receiving address
-let address = try wallet.deriveAddress(account: 0, index: 0)
-print("Send DOGE to: \(address)")
+    // Generate a receiving address
+    let address = try await wallet.deriveAddress(account: 0, index: 0)
+    print("Send DOGE to: \(address)")
+}
 ```
 
 ## Topics
@@ -40,6 +44,7 @@ print("Send DOGE to: \(address)")
 ### Essentials
 
 - <doc:GettingStarted>
+- <doc:UsingDogecoinKitOnAndroid>
 - ``Dogecoin``
 - ``DogecoinNetwork``
 - ``DogecoinError``

@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os.log
+#endif
 
 /// Delegate for SPV sync events
 public protocol SPVSyncDelegate: AnyObject, Sendable {
@@ -70,13 +72,59 @@ public actor SPVSyncManager {
         let height: Int32
     }
 
+    // MARK: - Delegate Events
+
+    private enum DelegateEvent: Sendable {
+        case progress(Double, height: Int32)
+        case completed
+        case header(BlockHeader, height: Int32)
+        case failure(any Error)
+        case transaction(TxMessage, SPVTransactionState)
+        case filteredBlock(height: Int32, targetHeight: Int32)
+    }
+
+    /// Delivers delegate callbacks strictly in order — a transaction's
+    /// `.confirmed` must never overtake its `.unconfirmed`.
+    private lazy var delegateEvents = SerialEventQueue<DelegateEvent> { [weak self] event in
+        guard let self, let delegate = await self.delegate else { return }
+        switch event {
+        case .progress(let progress, let height):
+            await delegate.spvSync(self, progressUpdated: progress, height: height)
+        case .completed:
+            await delegate.spvSyncDidComplete(self)
+        case .header(let header, let height):
+            await delegate.spvSync(self, didReceiveHeader: header, height: height)
+        case .failure(let error):
+            await delegate.spvSync(self, didEncounterError: error)
+        case .transaction(let transaction, let state):
+            await delegate.spvSync(self, didUpdateTransaction: transaction, state: state)
+        case .filteredBlock(let height, let targetHeight):
+            await delegate.spvSync(self, didProcessFilteredBlock: height, targetHeight: targetHeight)
+        }
+    }
+
     // MARK: - Sync State
 
+    /// A `getheaders` awaiting its answer. At most one is outstanding, and
+    /// only the answer from the peer it went to steers the sync.
+    private struct HeaderRequest: Equatable {
+        let peer: Peer
+        let sentAt: Date
+    }
+
     private var syncState: SPVSyncState = .idle
+    /// Between `start()` and `stop()`; peer events outside it are ignored
+    private var isActive = false
+    /// Bumped by `start()` and `stop()`, so a start interrupted by a stop gives up
+    private var session = 0
     private var _targetHeight: Int32 = 0
+    /// Best height each connected peer announced in its `version` message
+    private var peerStartHeights: [UUID: Int32] = [:]
+    /// The peer whose chain is being followed
     private var syncPeer: Peer?
-    private var waitingForHeaders = false
-    private var headerRequestTime: Date?
+    private var headerRequest: HeaderRequest?
+    /// The peer most recently given up on; the next pick prefers anyone else
+    private var lastAbandonedPeer: Peer?
     private var lastProgressTime: Date?
     private var filteredBlockRequestTime: Date?
 
@@ -88,12 +136,16 @@ public actor SPVSyncManager {
     private var pendingTransactions: [Data: TxMessage] = [:]
     private var verifiedTransactions: [Data: VerifiedTransaction] = [:]
     private var nextFilteredHeight: Int32?
-    private var filteredBlocksInFlight: Int = 0
-    /// First block height of the currently-outstanding filtered-block window.
-    /// When the peer carrying that window disconnects, we rewind
-    /// `nextFilteredHeight` to this value so the new peer re-requests the
-    /// lost range instead of silently skipping it.
-    private var outstandingFilteredWindowStart: Int32?
+    /// Heights of the filtered blocks the scan has requested, by block hash.
+    /// When they are lost the scan rewinds to the lowest one, so nothing is
+    /// skipped. Blocks fetched because a peer announced them are not counted
+    /// here and can never make the scan look further along than it is.
+    private var filteredBlocksInFlight: [Data: Int32] = [:]
+    /// The peer serving the filtered blocks in flight
+    private var filteredWindowPeer: Peer?
+    /// Set while a filtered-block request is assembled across awaits, so
+    /// overlapping calls cannot request the same range twice
+    private var isRequestingFilteredBlocks = false
 
     /// Current sync state
     public var state: SPVSyncState { syncState }
@@ -163,85 +215,90 @@ public actor SPVSyncManager {
         timeoutTask = nil
     }
 
+    /// Runs every few seconds: expires unanswered requests and restarts a
+    /// header sync left without a peer to follow.
     private func checkTimeouts() async {
         let now = Date()
 
-        // Check header request timeout
-        if waitingForHeaders,
-           let requestTime = headerRequestTime,
-           now.timeIntervalSince(requestTime) > headerRequestTimeout {
-            logger.warning("Header request timed out")
-            await handleHeaderRequestTimeout()
+        if let request = headerRequest, now.timeIntervalSince(request.sentAt) > headerRequestTimeout {
+            logger.warning("Header request to \(request.peer.host) timed out")
+            await handleHeaderRequestTimeout(request)
         }
 
-        // Check filtered block timeout
-        if filteredBlocksInFlight > 0,
+        if !filteredBlocksInFlight.isEmpty,
            let requestTime = filteredBlockRequestTime,
            now.timeIntervalSince(requestTime) > filteredBlockTimeout {
             logger.warning("Filtered block request timed out")
             await handleFilteredBlockTimeout()
         }
-    }
 
-    private func handleHeaderRequestTimeout() async {
-        waitingForHeaders = false
-        headerRequestTime = nil
-        let currentPeer = syncPeer
-        syncPeer = nil
-
-        if let peer = currentPeer {
-            logger.info("Disconnecting unresponsive peer: \(peer.host)")
-            await peerManager.removePeer(peer)
-        }
-
-        await retryWithNextPeer()
-    }
-
-    private func handleFilteredBlockTimeout() async {
-        abandonOutstandingFilteredBlockWindow(reason: "request timeout")
-        await requestFilteredBlocksIfNeeded()
-    }
-
-    private func retryWithNextPeer() async {
-        let peers = await peerManager.connectedPeers
-        if let nextPeer = peers.first {
-            syncPeer = nextPeer
-            logger.info("Switching to peer: \(nextPeer.host)")
-            await requestHeaders(from: nextPeer)
-        } else {
-            logger.info("No peers available, waiting for connection")
-            scheduleRetryWhenPeersAvailable()
-        }
-    }
-
-    private func scheduleRetryWhenPeersAvailable() {
-        Task { [weak self] in
-            try? await Task.sleep(for: .seconds(5))
-            guard !Task.isCancelled else { return }
-            guard let self else { return }
-
-            guard await self.syncPeer == nil,
-                  case .syncing = await self.syncState else { return }
-
-            let peers = await self.peerManager.connectedPeers
-            if let peer = peers.first {
-                await self.setSyncPeer(peer)
-                await self.requestHeaders(from: peer)
-            } else {
-                await self.scheduleRetryWhenPeersAvailable()
+        // Every peer was lost, or none had anything new: start over with
+        // whoever is connected now.
+        if isActive, syncPeer == nil, headerRequest == nil {
+            let peers = await peerManager.connectedPeers
+            let others = peers.filter { $0 != lastAbandonedPeer }
+            if syncPeer == nil, let peer = others.randomElement() ?? peers.randomElement() {
+                await requestHeaders(from: peer)
             }
         }
     }
 
-    private func setSyncPeer(_ peer: Peer) {
-        syncPeer = peer
+    private func handleHeaderRequestTimeout(_ request: HeaderRequest) async {
+        guard headerRequest == request else { return }
+        headerRequest = nil
+        abandonSyncPeer(request.peer)
+
+        logger.info("Disconnecting unresponsive peer: \(request.peer.host)")
+        await peerManager.removePeer(request.peer)
+        await retryWithNextPeer(avoiding: request.peer)
+    }
+
+    private func handleFilteredBlockTimeout() async {
+        abandonFilteredBlocksInFlight(reason: "request timeout")
+        await requestFilteredBlocksIfNeeded()
+    }
+
+    /// Moves header sync to another connected peer right away. Without one,
+    /// the periodic check picks the sync up again. Does nothing while a
+    /// request is outstanding: whoever sent it is in charge.
+    private func retryWithNextPeer(avoiding previous: Peer) async {
+        guard isActive, headerRequest == nil else { return }
+
+        let candidates = await peerManager.connectedPeers.filter { $0 != previous }
+        guard isActive, headerRequest == nil else { return }
+
+        if let nextPeer = candidates.randomElement() {
+            logger.info("Switching to peer: \(nextPeer.host)")
+            await requestHeaders(from: nextPeer)
+        } else {
+            logger.info("No other peers available, retrying shortly")
+            abandonSyncPeer(previous)
+        }
+    }
+
+    /// Stops following `peer`; the periodic check chooses a new peer within
+    /// a few seconds. Deferring, rather than asking the next peer at once,
+    /// keeps peers that agree there is nothing new out of a tight loop.
+    private func abandonSyncPeer(_ peer: Peer) {
+        if syncPeer == peer {
+            syncPeer = nil
+        }
+        lastAbandonedPeer = peer
     }
 
     /// Create an SPV sync manager
     public init(network: DogecoinNetwork = .mainnet, storageDirectory: URL? = nil, bundledCacheDirectory: URL? = nil) {
+        self.init(
+            network: network,
+            peerManager: PeerManager(network: network),
+            headerChain: HeaderChain(network: network, storageDirectory: storageDirectory, bundledCacheDirectory: bundledCacheDirectory)
+        )
+    }
+
+    init(network: DogecoinNetwork, peerManager: PeerManager, headerChain: HeaderChain) {
         self.network = network
-        self.peerManager = PeerManager(network: network)
-        self.headerChain = HeaderChain(network: network, storageDirectory: storageDirectory, bundledCacheDirectory: bundledCacheDirectory)
+        self.peerManager = peerManager
+        self.headerChain = headerChain
     }
 
     /// Create an SPV sync manager asynchronously, offloading the heavy
@@ -267,16 +324,22 @@ public actor SPVSyncManager {
             return
         }
 
-        // Ensure header chain is set up (idempotent)
-        await headerChain.setup()
-
+        session += 1
+        let session = self.session
+        isActive = true
         syncState = .connecting
         lastProgressTime = Date()
 
         logger.info("Starting SPV sync")
 
-        startTimeoutTask()
+        // Ensure header chain is set up (idempotent)
+        await headerChain.setup()
         await peerManager.setDelegate(self)
+
+        // stop() ran while we were setting up.
+        guard self.session == session else { return }
+
+        startTimeoutTask()
         await peerManager.start()
     }
 
@@ -284,14 +347,19 @@ public actor SPVSyncManager {
     public func stop() async {
         logger.info("Stopping SPV sync")
 
+        // Peers report disconnecting while they are shut down below; those
+        // events must not start new requests.
+        session += 1
+        isActive = false
         stopTimeoutTask()
-        await peerManager.stop()
+        syncPeer = nil
+        headerRequest = nil
+        abandonFilteredBlocksInFlight(reason: "sync stopped")
 
+        await peerManager.stop()
         await headerChain.flush()
 
-        syncPeer = nil
-        waitingForHeaders = false
-        headerRequestTime = nil
+        peerStartHeights.removeAll()
         filteredBlockRequestTime = nil
         syncState = .idle
     }
@@ -331,7 +399,7 @@ public actor SPVSyncManager {
 
         bloomFilter = filter
         nextFilteredHeight = max(Int32(0), startHeight)
-        filteredBlocksInFlight = 0
+        resetFilteredBlocksInFlight()
 
         await sendFilterLoadToPeers()
         await requestFilteredBlocksIfNeeded()
@@ -353,7 +421,7 @@ public actor SPVSyncManager {
         guard bloomFilter != nil else { return }
         bloomFilter = nil
         nextFilteredHeight = nil
-        filteredBlocksInFlight = 0
+        resetFilteredBlocksInFlight()
 
         let peers = await peerManager.connectedPeers
         for peer in peers {
@@ -370,144 +438,222 @@ public actor SPVSyncManager {
     }
 
     private func requestFilteredBlocksIfNeeded() async {
-        guard let nextHeight = nextFilteredHeight,
-              bloomFilter != nil else {
+        guard isActive,
+              !isRequestingFilteredBlocks,
+              let nextHeight = nextFilteredHeight,
+              bloomFilter != nil,
+              filteredBlocksInFlight.count < maxFilteredBlocksInFlight else {
             return
         }
 
-        guard filteredBlocksInFlight < maxFilteredBlocksInFlight else { return }
+        isRequestingFilteredBlocks = true
+        defer { isRequestingFilteredBlocks = false }
 
         let chainHeight = await headerChain.height
         guard nextHeight <= chainHeight else { return }
 
+        // Blocks in flight stay with the peer serving them.
+        let windowPeer = filteredWindowPeer
         let peer: Peer
-        if let sp = syncPeer {
-            peer = sp
-        } else if let first = await peerManager.connectedPeers.first {
-            peer = first
+        if let windowPeer {
+            peer = windowPeer
+        } else if let syncPeer {
+            peer = syncPeer
+        } else if let connected = await peerManager.connectedPeers.randomElement() {
+            peer = connected
         } else {
             return
         }
 
-        var inventory: [InventoryVector] = []
+        var requested: [(hash: Data, height: Int32)] = []
         var height = nextHeight
-
         while height <= chainHeight,
-              inventory.count < filteredBlockBatchSize,
-              filteredBlocksInFlight + inventory.count < maxFilteredBlocksInFlight {
+              requested.count < filteredBlockBatchSize,
+              filteredBlocksInFlight.count + requested.count < maxFilteredBlocksInFlight {
             if let stored = await headerChain.getHeader(height: height) {
-                inventory.append(InventoryVector(type: .filteredBlock, hash: stored.header.hash))
+                requested.append((stored.header.hash, height))
             }
             height += 1
         }
 
-        guard !inventory.isEmpty else { return }
-
-        if outstandingFilteredWindowStart == nil {
-            outstandingFilteredWindowStart = nextHeight
-        }
-        nextFilteredHeight = height
-        filteredBlocksInFlight += inventory.count
-        filteredBlockRequestTime = Date()
-
-        await peer.sendGetData(inventory: inventory)
-    }
-
-    /// Reset the filtered-block in-flight state when the peer carrying the
-    /// outstanding window is lost. Rewinds `nextFilteredHeight` so the next
-    /// peer re-requests blocks that never arrived.
-    private func abandonOutstandingFilteredBlockWindow(reason: String) {
-        guard filteredBlocksInFlight > 0 || outstandingFilteredWindowStart != nil else {
+        // A timeout, disconnect, or filter change while the range was read
+        // has moved the scan; this request would be stale.
+        guard !requested.isEmpty,
+              nextFilteredHeight == nextHeight,
+              filteredWindowPeer == windowPeer else {
             return
         }
-        if let windowStart = outstandingFilteredWindowStart {
-            let current = nextFilteredHeight ?? windowStart
-            nextFilteredHeight = min(current, windowStart)
+
+        nextFilteredHeight = height
+        for block in requested {
+            filteredBlocksInFlight[block.hash] = block.height
         }
-        logger.info("Abandoning \(self.filteredBlocksInFlight) filtered blocks in flight (\(reason)); rewinding to height \(self.nextFilteredHeight ?? -1)")
-        filteredBlocksInFlight = 0
-        outstandingFilteredWindowStart = nil
+        filteredWindowPeer = peer
+        filteredBlockRequestTime = Date()
+
+        await peer.sendGetData(inventory: requested.map { InventoryVector(type: .filteredBlock, hash: $0.hash) })
+    }
+
+    /// Forgets the filtered blocks in flight after their peer is lost and
+    /// rewinds the scan to the lowest of them, so the next peer re-requests
+    /// every block that never arrived.
+    private func abandonFilteredBlocksInFlight(reason: String) {
+        guard let lowest = filteredBlocksInFlight.values.min() else { return }
+        nextFilteredHeight = nextFilteredHeight.map { min($0, lowest) }
+        logger.info("Abandoning \(self.filteredBlocksInFlight.count) filtered blocks in flight (\(reason)); rewinding to height \(self.nextFilteredHeight ?? -1)")
+        resetFilteredBlocksInFlight()
+    }
+
+    private func resetFilteredBlocksInFlight() {
+        filteredBlocksInFlight.removeAll()
+        filteredWindowPeer = nil
         filteredBlockRequestTime = nil
     }
 
-    /// Request headers from a peer
+    /// Sends `getheaders` to `peer` and follows it from now on. At most one
+    /// request is outstanding at a time.
     private func requestHeaders(from peer: Peer) async {
-        guard !waitingForHeaders else { return }
-        waitingForHeaders = true
-        headerRequestTime = Date()
+        guard isActive, headerRequest == nil else { return }
+
+        let request = HeaderRequest(peer: peer, sentAt: Date())
+        syncPeer = peer
+        headerRequest = request
 
         let locator = await headerChain.getBlockLocator()
-        logger.info("Requesting headers from \(peer.host), locator has \(locator.count) hashes")
 
+        // Timed out, lost its peer, or stopped while the locator was built.
+        guard headerRequest == request else { return }
+
+        logger.info("Requesting headers from \(peer.host), locator has \(locator.count) hashes")
         await peer.sendGetHeaders(locatorHashes: locator)
     }
 
+    /// Whether `peer` still leads the sync with nothing outstanding — false
+    /// once a timeout, disconnect, or stop has taken over.
+    private func isFollowing(_ peer: Peer) -> Bool {
+        isActive && syncPeer == peer && headerRequest == nil
+    }
+
     /// Handle received headers
-    private func handleHeaders(_ headers: [BlockHeader], from peer: Peer) async {
-        waitingForHeaders = false
-        headerRequestTime = nil
-        lastProgressTime = Date()
+    private func handleHeaders(_ entries: [HeadersMessage.Entry], from peer: Peer) async {
+        guard isActive else { return }
 
-        guard !headers.isEmpty else {
-            logger.info("No more headers from \(peer.host)")
-
-            let chainHeight = await headerChain.height
-            if chainHeight >= _targetHeight {
-                syncState = .synchronized
-                let delegate = self.delegate
-                Task { [weak self] in
-                    guard let self else { return }
-                    await delegate?.spvSyncDidComplete(self)
+        guard let request = headerRequest, request.peer == peer else {
+            // Unsolicited headers (an announcement, or the late answer to an
+            // abandoned request) still carry validated data worth keeping,
+            // but never steer the sync.
+            if !entries.isEmpty {
+                let result = await headerChain.addHeaders(entries)
+                if result.added > 0 {
+                    await didAddHeaders(entries)
                 }
-            } else {
-                logger.info("Still below target height (\(chainHeight) < \(self._targetHeight)), trying next peer")
-                await retryWithNextPeer()
+                await penalizeIfInvalid(result.failure, from: peer)
             }
             return
         }
 
-        logger.info("Received \(headers.count) headers from \(peer.host)")
+        headerRequest = nil
+        lastProgressTime = Date()
 
-        let added = await headerChain.addHeaders(headers)
-        let chainHeight = await headerChain.height
-        logger.info("Added \(added) headers, height now \(chainHeight)")
+        guard !entries.isEmpty else {
+            logger.info("No more headers from \(peer.host)")
 
-        if added > 0 {
-            await refreshPendingMerkleBlocks()
-            await refreshVerifiedTransactionsForReorg()
-            await requestFilteredBlocksIfNeeded()
-        }
+            let chainHeight = await headerChain.height
+            guard isFollowing(peer) else { return }
 
-        // Notify delegate
-        for header in headers.prefix(added) {
-            if let stored = await headerChain.getHeader(hash: header.hash) {
-                let delegate = self.delegate
-                let h = stored.height
-                Task { [weak self] in
-                    guard let self else { return }
-                    await delegate?.spvSync(self, didReceiveHeader: header, height: h)
-                }
+            if chainHeight >= _targetHeight {
+                markSynchronized()
+            } else {
+                logger.info("Still below target height (\(chainHeight) < \(self._targetHeight)), trying another peer")
+                abandonSyncPeer(peer)
             }
+            return
         }
 
-        // Update progress (snapshot target + clamp through the shared helper)
-        let prog = Self.computeProgress(height: chainHeight, target: _targetHeight)
-        let delegate = self.delegate
-        Task { [weak self] in
-            guard let self else { return }
-            await delegate?.spvSync(self, progressUpdated: prog, height: chainHeight)
+        logger.info("Received \(entries.count) headers from \(peer.host)")
+
+        let result = await headerChain.addHeaders(entries)
+        let chainHeight = await headerChain.height
+        logger.info("Added \(result.added) headers, height now \(chainHeight)")
+
+        if result.added > 0 {
+            await didAddHeaders(entries)
         }
+
+        if let failure = result.failure {
+            await penalizeIfInvalid(failure, from: peer)
+            await retryWithNextPeer(avoiding: peer)
+            return
+        }
+
+        guard isFollowing(peer) else { return }
 
         // Request more headers or mark as synchronized
         if chainHeight >= _targetHeight {
-            syncState = .synchronized
-            Task { [weak self] in
-                guard let self else { return }
-                await delegate?.spvSyncDidComplete(self)
-            }
-        } else {
+            markSynchronized()
+        } else if result.added > 0 {
+            syncState = .syncing
             await requestHeaders(from: peer)
+        } else {
+            // A full batch of headers we already had: the peer is not
+            // helping us advance.
+            abandonSyncPeer(peer)
         }
+    }
+
+    /// Brings transaction state and the delegate up to date after `entries`
+    /// extended (or reorganized) the chain.
+    private func didAddHeaders(_ entries: [HeadersMessage.Entry]) async {
+        await refreshPendingMerkleBlocks()
+        await refreshVerifiedTransactionsForReorg()
+        await requestFilteredBlocksIfNeeded()
+
+        for entry in entries {
+            if let stored = await headerChain.getHeader(hash: entry.header.hash) {
+                delegateEvents.yield(.header(entry.header, height: stored.height))
+            }
+        }
+
+        let chainHeight = await headerChain.height
+        delegateEvents.yield(.progress(Self.computeProgress(height: chainHeight, target: _targetHeight), height: chainHeight))
+    }
+
+    /// Reports completion every time the chain catches up — including after
+    /// each new block — since delegates record the synced height from it.
+    private func markSynchronized() {
+        syncState = .synchronized
+        delegateEvents.yield(.completed)
+    }
+
+    /// Bans a peer whose headers prove it misbehaved.
+    private func penalizeIfInvalid(_ failure: HeaderChain.ValidationError?, from peer: Peer) async {
+        guard let failure, Self.isBannable(failure) else { return }
+        logger.warning("Banning \(peer.host) for invalid headers: \(String(describing: failure))")
+        await peerManager.banPeer(peer, reason: .invalidHeaders)
+    }
+
+    /// Whether a header failing this way proves its sender misbehaved, as
+    /// Dogecoin Core judges it. Spared: headers that do not connect (the
+    /// peer may be on a branch we have not seen), timestamps — judged
+    /// against our own clock, which may be wrong — and obsolete versions,
+    /// none of which Core penalizes either.
+    nonisolated static func isBannable(_ failure: HeaderChain.ValidationError) -> Bool {
+        switch failure {
+        case .checkpointMismatch, .invalidProofOfWork, .invalidDifficulty, .auxPowRequired,
+             .auxPowValidationFailed, .forkBelowCheckpoint, .incorrectDifficulty, .invalidVersion:
+            true
+        case .invalidPreviousBlock, .databaseError, .futureTooFar, .invalidTimestamp, .obsoleteVersion:
+            false
+        }
+    }
+
+    /// The median of connected peers' announced heights, so one peer
+    /// claiming an absurd height cannot keep the sync from ever finishing.
+    private func updateTargetHeight() {
+        let heights = peerStartHeights.values.sorted()
+        guard !heights.isEmpty else { return }
+        let median = heights[(heights.count - 1) / 2]
+        _targetHeight = max(median, 0)
     }
 }
 
@@ -516,18 +662,20 @@ public actor SPVSyncManager {
 extension SPVSyncManager: PeerManagerDelegate {
     public func peerManager(_ manager: PeerManager, peerDidBecomeReady peer: Peer) async {
         logger.info("Peer ready: \(peer.host)")
+        guard isActive else { return }
 
         // Update target height from peer version
         if let version = await peer.peerVersion {
-            if version.startHeight > _targetHeight {
-                _targetHeight = version.startHeight
-            }
+            peerStartHeights[peer.id] = version.startHeight
+            updateTargetHeight()
         }
 
-        // Start syncing if we don't have a sync peer
-        if syncPeer == nil, syncState == .connecting {
-            syncPeer = peer
-            syncState = .syncing
+        // Follow this peer if the sync has nobody to follow — at the start,
+        // or after every earlier peer was lost.
+        if isActive, syncPeer == nil, headerRequest == nil {
+            if syncState == .connecting {
+                syncState = .syncing
+            }
             await requestHeaders(from: peer)
         }
 
@@ -541,24 +689,33 @@ extension SPVSyncManager: PeerManagerDelegate {
     public func peerManager(_ manager: PeerManager, peerDidDisconnect peer: Peer) async {
         logger.info("Peer disconnected: \(peer.host)")
 
-        // Filtered-block requests were routed to this peer or the sync peer.
-        // Either way, any in-flight window is now lost — rewind so the next
-        // peer re-requests the missing range rather than silently skipping it.
-        abandonOutstandingFilteredBlockWindow(reason: "peer \(peer.host) disconnected")
+        peerStartHeights.removeValue(forKey: peer.id)
+        updateTargetHeight()
 
-        guard peer == syncPeer else { return }
-        syncPeer = nil
-        waitingForHeaders = false
-        headerRequestTime = nil
+        guard isActive else { return }
 
-        await retryWithNextPeer()
+        if peer == filteredWindowPeer {
+            abandonFilteredBlocksInFlight(reason: "peer \(peer.host) disconnected")
+        }
+
+        if headerRequest?.peer == peer {
+            headerRequest = nil
+        }
+        if peer == syncPeer {
+            syncPeer = nil
+            await retryWithNextPeer(avoiding: peer)
+        }
+
+        await requestFilteredBlocksIfNeeded()
     }
 
     public func peerManager(_ manager: PeerManager, peer: Peer, didReceiveMessage message: ProtocolMessage) async {
         switch message.command {
         case ProtocolMessage.Command.headers:
             if let headersMsg = HeadersMessage.parse(from: message.payload) {
-                await handleHeaders(headersMsg.headers, from: peer)
+                await handleHeaders(headersMsg.entries, from: peer)
+            } else {
+                await peerManager.banPeer(peer, reason: .invalidMessage)
             }
 
         case ProtocolMessage.Command.inv:
@@ -600,8 +757,10 @@ extension SPVSyncManager: PeerManagerDelegate {
     }
 
     private func handleInventory(_ inventory: [InventoryVector], from peer: Peer) async {
+        // Without a bloom filter nothing can match the wallet; fetching every
+        // announced transaction would only waste bandwidth.
         let txInv = inventory.filter { $0.type == .transaction }
-        if !txInv.isEmpty {
+        if !txInv.isEmpty, bloomFilter != nil {
             await peer.sendGetData(inventory: txInv)
         }
 
@@ -640,21 +799,13 @@ extension SPVSyncManager: PeerManagerDelegate {
             matches = try merkleBlock.extractMatches()
         } catch {
             await peerManager.banPeer(peer, reason: .invalidTransaction)
-            let delegate = self.delegate
-            Task { [weak self] in
-                guard let self else { return }
-                await delegate?.spvSync(self, didEncounterError: error)
-            }
+            delegateEvents.yield(.failure(error))
             return
         }
 
         guard matches.merkleRoot == merkleBlock.header.merkleRoot else {
             await peerManager.banPeer(peer, reason: .invalidTransaction)
-            let delegate = self.delegate
-            Task { [weak self] in
-                guard let self else { return }
-                await delegate?.spvSync(self, didEncounterError: DogecoinError.syncFailed("Invalid merkle proof"))
-            }
+            delegateEvents.yield(.failure(DogecoinError.syncFailed("Invalid merkle proof")))
             return
         }
 
@@ -709,26 +860,17 @@ extension SPVSyncManager: PeerManagerDelegate {
             pendingMerkleBlocks[blockHash] = pending
         }
 
-        let delegate = self.delegate
         for event in events {
-            Task { [weak self] in
-                guard let self else { return }
-                await delegate?.spvSync(self, didUpdateTransaction: event.0, state: event.1)
-            }
+            delegateEvents.yield(.transaction(event.0, event.1))
         }
 
         // Report filtered block scan progress
         if let height {
-            let target = _targetHeight
-            Task { [weak self] in
-                guard let self else { return }
-                await delegate?.spvSync(self, didProcessFilteredBlock: height, targetHeight: target)
-            }
+            delegateEvents.yield(.filteredBlock(height: height, targetHeight: _targetHeight))
         }
 
-        filteredBlocksInFlight = max(0, filteredBlocksInFlight - 1)
-        if filteredBlocksInFlight == 0 {
-            outstandingFilteredWindowStart = nil
+        if filteredBlocksInFlight.removeValue(forKey: blockHash) != nil, filteredBlocksInFlight.isEmpty {
+            filteredWindowPeer = nil
             filteredBlockRequestTime = nil
         }
         await requestFilteredBlocksIfNeeded()
@@ -778,12 +920,8 @@ extension SPVSyncManager: PeerManagerDelegate {
             events.append((txMessage, .unconfirmed))
         }
 
-        let delegate = self.delegate
         for event in events {
-            Task { [weak self] in
-                guard let self else { return }
-                await delegate?.spvSync(self, didUpdateTransaction: event.0, state: event.1)
-            }
+            delegateEvents.yield(.transaction(event.0, event.1))
         }
     }
 
@@ -892,11 +1030,7 @@ extension SPVSyncManager: PeerManagerDelegate {
         guard let merkleRoot = block.merkleRoot,
               merkleRoot == block.header.merkleRoot else {
             await peerManager.banPeer(peer, reason: .invalidTransaction)
-            let delegate = self.delegate
-            Task { [weak self] in
-                guard let self else { return }
-                await delegate?.spvSync(self, didEncounterError: DogecoinError.syncFailed("Invalid block merkle root"))
-            }
+            delegateEvents.yield(.failure(DogecoinError.syncFailed("Invalid block merkle root")))
             return
         }
 
@@ -936,12 +1070,8 @@ extension SPVSyncManager: PeerManagerDelegate {
             events.append((txMessage, .confirmed(blockHash: blockHash, height: height)))
         }
 
-        let delegate = self.delegate
         for event in events {
-            Task { [weak self] in
-                guard let self else { return }
-                await delegate?.spvSync(self, didUpdateTransaction: event.0, state: event.1)
-            }
+            delegateEvents.yield(.transaction(event.0, event.1))
         }
     }
 
@@ -984,12 +1114,8 @@ extension SPVSyncManager: PeerManagerDelegate {
             }
         }
 
-        let delegate = self.delegate
         for event in events {
-            Task { [weak self] in
-                guard let self else { return }
-                await delegate?.spvSync(self, didUpdateTransaction: event.0, state: event.1)
-            }
+            delegateEvents.yield(.transaction(event.0, event.1))
         }
     }
 
@@ -1008,12 +1134,8 @@ extension SPVSyncManager: PeerManagerDelegate {
             ))
         }
 
-        let delegate = self.delegate
         for event in events {
-            Task { [weak self] in
-                guard let self else { return }
-                await delegate?.spvSync(self, didUpdateTransaction: event.0, state: event.1)
-            }
+            delegateEvents.yield(.transaction(event.0, event.1))
         }
     }
 }

@@ -13,12 +13,14 @@ Dogecoin addresses are the public identifiers used to receive funds. DogecoinKit
 
 ## Address Formats
 
-Dogecoin uses Pay-to-Public-Key-Hash (P2PKH) addresses:
+DogecoinKit generates Pay-to-Public-Key-Hash (P2PKH) addresses:
 
 | Network | Prefix | Example |
 |---------|--------|---------|
 | Mainnet | D | `D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD` |
-| Testnet | n | `nXpY8ywPq3JYqErKhgEE7dV9kKAz2qQPMN` |
+| Testnet | n | `nmcez45bygdYA2CY9mP78eJy37AFwrUXp2` |
+
+Validation also accepts Pay-to-Script-Hash (P2SH) addresses, which start with `9` or `A` on mainnet and `2` on testnet. ``Address/kind(_:)`` tells the two kinds apart.
 
 ## Validating Addresses
 
@@ -107,17 +109,19 @@ case .failure(.unknownNetwork):
 Use ``DogecoinAddress`` for compile-time safety:
 
 ```swift
+let input = "D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD"  // e.g. text the user entered
+
 // This throws if the address is invalid
-let validAddress = try DogecoinAddress("D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD")
+let validAddress = try DogecoinAddress(input)
 print("Network: \(validAddress.network)")
 print("Value: \(validAddress.value)")
 
 // Specify expected network
-let mainnetAddress = try DogecoinAddress("D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD", network: .mainnet)
+let mainnetAddress = try DogecoinAddress(input, network: .mainnet)
 
 // This will throw because it's a mainnet address
 do {
-    let _ = try DogecoinAddress("D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD", network: .testnet)
+    let _ = try DogecoinAddress(input, network: .testnet)
 } catch DogecoinError.invalidAddress {
     print("Network mismatch!")
 }
@@ -135,51 +139,61 @@ struct PaymentRequest: Codable {
 }
 
 let request = PaymentRequest(
-    address: try DogecoinAddress("D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD"),
+    address: try DogecoinAddress(input),
     amount: DogecoinAmount(doge: 100)
 )
 let json = try JSONEncoder().encode(request)
 
 // Equatable & Hashable - for collections
 var usedAddresses: Set<DogecoinAddress> = []
-usedAddresses.insert(try DogecoinAddress("D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD"))
+usedAddresses.insert(try DogecoinAddress(input))
 
 // CustomStringConvertible - for display
-let address = try DogecoinAddress("D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD")
+let address = try DogecoinAddress(input)
 print(address)  // "D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD"
 ```
+
+``DogecoinAddress`` is not `ExpressibleByStringLiteral`: every address, even one fixed in source, goes through the throwing initializer, so a typo surfaces as an error instead of a crash.
 
 ## Address Components
 
 ### Public Key to Address
 
-Generate an address from a public key:
+Generate an address from a public key, compressed (33 bytes) or uncompressed (65 bytes). Each form controls a different address. A key that is not a point on secp256k1 throws ``DogecoinError/invalidPublicKey``, so keys pulled out of transactions are safe to pass:
 
 ```swift
 let publicKeyHex = "02a1633cafcc01ebfb6d78e39f687a1f0995c62fc95f51ead10a02ee0be551b5dc"
 
-let address = try Address.fromPublicKey(publicKeyHex, network: .mainnet)
+let address = try await Address.fromPublicKey(publicKeyHex, network: .mainnet)
 print(address)  // "D..."
 ```
 
 ### Address to Public Key Hash
 
-Extract the public key hash from an address:
+Get the output script for a P2PKH address. Despite its name, ``Address/toPubkeyHash(_:)`` returns the full P2PKH scriptPubKey (`76a914<hash160>88ac`) as hex, not the bare 20-byte hash, and it rejects P2SH addresses. ``Address/scriptPubKey(for:)`` returns the raw script for either kind:
 
 ```swift
 let address = "D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD"
-let pubkeyHash = try Address.toPubkeyHash(address)
-print(pubkeyHash)  // Hex string of the hash160
+let scriptHex = try Address.toPubkeyHash(address)
+print(scriptHex)  // "76a9141a489a9364888ba3e81b61d16f59899bdca5badd88ac"
+
+// Raw script bytes for P2PKH or P2SH, or nil if the address is invalid
+if let script = Address.scriptPubKey(for: "A9rmPAxPNGTojaWevb571EYNmCiRLpXzcM") {
+    print(script.count)  // 23: OP_HASH160 <hash160> OP_EQUAL
+}
 ```
 
 ### Public Key Hash to Address
 
-Convert a public key hash back to an address:
+``Address/fromPubkeyHash(_:network:)`` accepts either the bare 20-byte hash160 or the P2PKH script hex that ``Address/toPubkeyHash(_:)`` returns, so the two round-trip. Anything else throws ``DogecoinError/invalidPublicKey``:
 
 ```swift
-let pubkeyHash = "89abcdef..."  // Hex string
-let address = try Address.fromPubkeyHash(pubkeyHash, network: .mainnet)
-print(address)  // "D..."
+let scriptHex = "76a9141a489a9364888ba3e81b61d16f59899bdca5badd88ac"
+let address = try await Address.fromPubkeyHash(scriptHex, network: .mainnet)
+print(address)  // "D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD"
+
+// The bare hash gives the same address
+let sameAddress = try await Address.fromPubkeyHash("1a489a9364888ba3e81b61d16f59899bdca5badd", network: .mainnet)
 ```
 
 ## Generating Addresses
@@ -189,14 +203,14 @@ print(address)  // "D..."
 The recommended way to generate addresses:
 
 ```swift
-let wallet = try HDWallet.create(network: .mainnet)
+let wallet = try await HDWallet.create(network: .mainnet)
 
 // Receiving addresses (change = false)
-let receiving0 = try wallet.deriveAddress(account: 0, index: 0)
-let receiving1 = try wallet.deriveAddress(account: 0, index: 1)
+let receiving0 = try await wallet.deriveAddress(account: 0, index: 0)
+let receiving1 = try await wallet.deriveAddress(account: 0, index: 1)
 
 // Change addresses (change = true)
-let change0 = try wallet.deriveAddress(account: 0, index: 0, change: true)
+let change0 = try await wallet.deriveAddress(account: 0, index: 0, change: true)
 ```
 
 ### From Simple Key Pair
@@ -204,7 +218,7 @@ let change0 = try wallet.deriveAddress(account: 0, index: 0, change: true)
 For simpler use cases without HD derivation:
 
 ```swift
-let keyPair = try KeyPair.generate(network: .mainnet)
+let keyPair = try await KeyPair.generate(network: .mainnet)
 print("Address: \(keyPair.address)")
 print("Private Key (WIF): \(keyPair.privateKeyWIF)")
 ```
@@ -222,7 +236,7 @@ func scanForUsedAddresses(wallet: HDWallet, gapLimit: Int = 20) async throws -> 
     var index: UInt32 = 0
 
     while consecutiveUnused < gapLimit {
-        let address = try wallet.deriveAddress(account: 0, index: index)
+        let address = try await wallet.deriveAddress(account: 0, index: index)
 
         if await checkAddressHasTransactions(address) {
             usedAddresses.append(address)
@@ -277,21 +291,26 @@ func processScannedAddress(_ address: String) {
 Avoid reusing addresses when possible:
 
 ```swift
-class AddressManager {
+actor AddressManager {
     private let wallet: HDWallet
     private var nextReceivingIndex: UInt32 = 0
     private var nextChangeIndex: UInt32 = 0
 
-    func getNextReceivingAddress() throws -> String {
-        let address = try wallet.deriveAddress(account: 0, index: nextReceivingIndex)
-        nextReceivingIndex += 1
-        return address
+    init(wallet: HDWallet) {
+        self.wallet = wallet
     }
 
-    func getNextChangeAddress() throws -> String {
-        let address = try wallet.deriveAddress(account: 0, index: nextChangeIndex, change: true)
+    func getNextReceivingAddress() async throws -> String {
+        // Claim the index before awaiting so concurrent callers never share one
+        let index = nextReceivingIndex
+        nextReceivingIndex += 1
+        return try await wallet.deriveAddress(account: 0, index: index)
+    }
+
+    func getNextChangeAddress() async throws -> String {
+        let index = nextChangeIndex
         nextChangeIndex += 1
-        return address
+        return try await wallet.deriveAddress(account: 0, index: index, change: true)
     }
 }
 ```
@@ -312,7 +331,7 @@ extension String {
 }
 
 let address = "D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD"
-print(address.formattedAddress())  // "D7Y55r6Y...J7M6yD"
+print(address.formattedAddress())  // "D7Y55r6Y...GJJ7M6yD"
 ```
 
 ### Copy to Clipboard

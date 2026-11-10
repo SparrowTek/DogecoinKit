@@ -1,6 +1,5 @@
 import Testing
 @testable import DogecoinKit
-import CryptoKit
 import Foundation
 
 @Suite("Electrum Client Tests")
@@ -14,16 +13,25 @@ struct ElectrumClientTests {
         ProcessInfo.processInfo.environment["ELECTRUM_INTEGRATION_TESTS"] == "1"
     }
 
+    /// Connects to the first mainnet server that answers; any one of them
+    /// may be down at a given moment.
+    private func connectToAnyServer() async throws -> ElectrumClient {
+        for server in ElectrumServerList.servers(for: .mainnet).shuffled() {
+            let client = ElectrumClient(server: server)
+            do {
+                try await client.connect()
+                return client
+            } catch {
+                continue
+            }
+        }
+        throw ElectrumError.noServersAvailable
+    }
+
     @Test("Connect to mainnet server")
     func testConnect() async throws {
         guard requireIntegrationTests() else { return }
-        guard let server = ElectrumServerList.randomServer(for: .mainnet) else {
-            Issue.record("No servers available")
-            return
-        }
-
-        let client = ElectrumClient(server: server)
-        try await client.connect()
+        let client = try await connectToAnyServer()
 
         // Should be connected now
         try await client.serverPing()
@@ -34,17 +42,11 @@ struct ElectrumClientTests {
     @Test("Get balance for known address")
     func testGetBalance() async throws {
         guard requireIntegrationTests() else { return }
-        guard let server = ElectrumServerList.randomServer(for: .mainnet) else {
-            Issue.record("No servers available")
-            return
-        }
-
-        let client = ElectrumClient(server: server)
-        try await client.connect()
+        let client = try await connectToAnyServer()
 
         // Use a known Dogecoin address
         let scriptHash = try ElectrumScriptHash(
-            address: "D7Y55gKBKsQrXmgbVRH9bEP7BWCN3zwhSr",
+            address: "D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD",
             network: .mainnet
         )
 
@@ -59,13 +61,7 @@ struct ElectrumClientTests {
     @Test("Subscribe to headers")
     func testHeaderSubscription() async throws {
         guard requireIntegrationTests() else { return }
-        guard let server = ElectrumServerList.randomServer(for: .mainnet) else {
-            Issue.record("No servers available")
-            return
-        }
-
-        let client = ElectrumClient(server: server)
-        try await client.connect()
+        let client = try await connectToAnyServer()
 
         let header = try await client.subscribeHeaders()
 
@@ -79,12 +75,11 @@ struct ElectrumClientTests {
     func testScriptHashComputation() throws {
         let address = "D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD"
         // toPubkeyHash already returns the full P2PKH scriptPubKey hex (76a914...88ac)
-        let scriptPubKeyHex = try Address.toPubkeyHash(address)
-        let scriptPubKey = try #require(Data(hexString: scriptPubKeyHex))
-        let expected = Data(SHA256.hash(data: scriptPubKey).reversed()).hexString
+        #expect(try Address.toPubkeyHash(address) == "76a9141a489a9364888ba3e81b61d16f59899bdca5badd88ac")
 
+        // SHA-256 of that script, byte-reversed (computed independently).
         let scriptHash = try ElectrumScriptHash(address: address, network: .mainnet)
-        #expect(scriptHash.scriptHash == expected)
+        #expect(scriptHash.scriptHash == "774575bb5a9f803fde8be6804d24bc17ade79c45c9f28ee5a9835edf17b8ada0")
     }
 
     @Test("Testnet Electrum server list is populated")
@@ -117,6 +112,54 @@ struct ElectrumSyncManagerTests {
         await manager.stop()
         let stoppedState = await manager.state
         #expect(!stoppedState.isConnected)
+    }
+
+    @Test("Live UTXOs verify against their funding transactions")
+    func testLiveUTXOVerification() async throws {
+        guard requireIntegrationTests() else { return }
+        await Dogecoin.initialize()
+
+        let manager = ElectrumSyncManager(network: .mainnet)
+        try await manager.start()
+
+        // Find funded addresses by walking forward from a known address: the
+        // newest transactions of each hop pay the addresses of the next.
+        // Servers refuse addresses with very long histories ("history too
+        // large"); the walk skips those, and only those.
+        var frontier: Set<String> = ["D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD"]
+        var utxos: [(address: String, utxo: ElectrumUTXO)] = []
+        for _ in 0..<4 where utxos.isEmpty {
+            var next: Set<String> = []
+            for address in frontier.prefix(8) {
+                let history: [ElectrumHistoryItem]
+                do {
+                    history = try await manager.fetchTransactionHistory(for: [address])
+                } catch ElectrumError.requestFailed {
+                    continue
+                }
+                for item in history.prefix(3) {
+                    let transaction = try #require(RawTransaction(hex: try await manager.getTransaction(txid: item.txHash)))
+                    for output in transaction.outputs {
+                        // P2PKH outputs only; anything else has no address to query.
+                        if let payee = try? await Address.fromPubkeyHash(output.script.hexString) {
+                            next.insert(payee)
+                        }
+                    }
+                }
+            }
+            for address in next {
+                do {
+                    utxos += try await manager.fetchUTXOs(for: [address])
+                } catch ElectrumError.requestFailed {
+                    continue
+                }
+            }
+            frontier = next
+        }
+
+        #expect(!utxos.isEmpty, "found no funded address to verify")
+        print("Verified \(utxos.count) live UTXOs against their funding transactions")
+        await manager.stop()
     }
 
     @Test("Failed start allows retry")

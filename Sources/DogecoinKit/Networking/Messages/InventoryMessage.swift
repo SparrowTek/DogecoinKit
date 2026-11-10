@@ -28,6 +28,10 @@ public struct InventoryVector: Sendable, Equatable, Hashable {
     /// Hash of object (32 bytes)
     public let hash: Data
 
+    /// Most entries an inv/getdata/notfound message may carry — Dogecoin
+    /// Core's `MAX_INV_SZ`; larger messages are a protocol violation.
+    public static let maxEntriesPerMessage = 50_000
+
     /// Create an inventory vector
     public init(type: InventoryType, hash: Data) {
         self.type = type
@@ -47,11 +51,9 @@ public struct InventoryVector: Sendable, Equatable, Hashable {
 
     /// Parse from Data
     public static func parse(from data: Data) -> InventoryVector? {
-        guard data.count >= 36 else { return nil }
-
-        guard let typeRaw: UInt32 = data.readInteger(at: 0) else { return nil }
+        guard let typeRaw: UInt32 = data.readInteger(at: 0),
+              let hash = data.bytes(at: 4, count: 32) else { return nil }
         let type = InventoryType(rawValue: UInt32(littleEndian: typeRaw)) ?? .error
-        let hash = Data(data[4..<36])
 
         return InventoryVector(type: type, hash: hash)
     }
@@ -81,14 +83,16 @@ public struct InvMessage: Sendable {
 
     /// Parse from Data
     public static func parse(from data: Data) -> InvMessage? {
-        guard let (count, varIntSize) = VarInt.parse(from: data) else { return nil }
+        guard let (count, varIntSize) = data.readBoundedCount(at: 0, minItemSize: 36),
+              count <= InventoryVector.maxEntriesPerMessage else { return nil }
 
         var offset = varIntSize
         var inventory: [InventoryVector] = []
+        inventory.reserveCapacity(count)
 
         for _ in 0..<count {
-            guard data.count >= offset + 36 else { return nil }
-            guard let inv = InventoryVector.parse(from: Data(data[offset..<offset+36])) else { return nil }
+            guard let entry = data.bytes(at: offset, count: 36),
+                  let inv = InventoryVector.parse(from: entry) else { return nil }
             inventory.append(inv)
             offset += 36
         }
@@ -121,14 +125,16 @@ public struct GetDataMessage: Sendable {
 
     /// Parse from Data
     public static func parse(from data: Data) -> GetDataMessage? {
-        guard let (count, varIntSize) = VarInt.parse(from: data) else { return nil }
+        guard let (count, varIntSize) = data.readBoundedCount(at: 0, minItemSize: 36),
+              count <= InventoryVector.maxEntriesPerMessage else { return nil }
 
         var offset = varIntSize
         var inventory: [InventoryVector] = []
+        inventory.reserveCapacity(count)
 
         for _ in 0..<count {
-            guard data.count >= offset + 36 else { return nil }
-            guard let inv = InventoryVector.parse(from: Data(data[offset..<offset+36])) else { return nil }
+            guard let entry = data.bytes(at: offset, count: 36),
+                  let inv = InventoryVector.parse(from: entry) else { return nil }
             inventory.append(inv)
             offset += 36
         }
@@ -161,14 +167,16 @@ public struct NotFoundMessage: Sendable {
 
     /// Parse from Data
     public static func parse(from data: Data) -> NotFoundMessage? {
-        guard let (count, varIntSize) = VarInt.parse(from: data) else { return nil }
+        guard let (count, varIntSize) = data.readBoundedCount(at: 0, minItemSize: 36),
+              count <= InventoryVector.maxEntriesPerMessage else { return nil }
 
         var offset = varIntSize
         var inventory: [InventoryVector] = []
+        inventory.reserveCapacity(count)
 
         for _ in 0..<count {
-            guard data.count >= offset + 36 else { return nil }
-            guard let inv = InventoryVector.parse(from: Data(data[offset..<offset+36])) else { return nil }
+            guard let entry = data.bytes(at: offset, count: 36),
+                  let inv = InventoryVector.parse(from: entry) else { return nil }
             inventory.append(inv)
             offset += 36
         }

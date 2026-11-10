@@ -257,8 +257,16 @@ struct UntrustedInputHardeningTests {
 
         // Must throw a validation error — never trap. (It will fail earlier on
         // the merkle proof, which is fine; the point is it cannot crash.)
+        let header = BlockHeader(
+            version: 0x0062_0104,
+            prevBlock: Data(repeating: 0, count: 32),
+            merkleRoot: Data(repeating: 0, count: 32),
+            timestamp: 0,
+            bits: 0x1e0fffff,
+            nonce: 0
+        )
         #expect(throws: AuxPoW.ValidationError.self) {
-            try auxpow.validate(dogecoinBlockHash: Data(repeating: 0, count: 32))
+            try auxpow.validate(for: header)
         }
     }
 

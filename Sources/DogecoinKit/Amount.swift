@@ -1,5 +1,4 @@
 import Foundation
-import clibdogecoin
 
 /// Represents an amount of Dogecoin
 /// Internally stored as koinu (1 DOGE = 100,000,000 koinu)
@@ -14,6 +13,10 @@ public struct DogecoinAmount: Sendable, Equatable, Hashable, Comparable {
 
     /// Zero amount
     public static let zero = DogecoinAmount(koinu: 0)
+
+    /// The largest value a single transaction output may carry — Dogecoin
+    /// Core's `MAX_MONEY` of 10 billion DOGE. Nodes reject anything above it.
+    public static let maxMoney = DogecoinAmount(koinu: 10_000_000_000 * koinuPerDoge)
 
     /// Create an amount from koinu
     /// - Parameter koinu: The amount in koinu
@@ -57,19 +60,13 @@ public struct DogecoinAmount: Sendable, Equatable, Hashable, Comparable {
         Double(koinu) / Double(Self.koinuPerDoge)
     }
 
-    /// The amount as a Dogecoin string with up to 8 decimal places
+    /// The amount as a Dogecoin string with exactly 8 decimal places
+    /// (e.g. "1.50000000"), computed with integer arithmetic so every koinu
+    /// value converts exactly — the same format libdogecoin parses.
     public var dogeString: String {
-        var buffer = [CChar](repeating: 0, count: Int(KOINU_STRINGLEN))
-
-        let result = koinu_to_coins_str(koinu, &buffer, buffer.count)
-
-        guard result == 1 else {
-            // Fallback to manual conversion
-            return String(format: "%.8f", doge)
-        }
-
-        let bytes = Data(buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
-        return String(decoding: bytes, as: UTF8.self)
+        let whole = koinu / Self.koinuPerDoge
+        let fraction = String(koinu % Self.koinuPerDoge)
+        return "\(whole)." + String(repeating: "0", count: 8 - fraction.count) + fraction
     }
 
     /// Format the amount with a specific number of decimal places

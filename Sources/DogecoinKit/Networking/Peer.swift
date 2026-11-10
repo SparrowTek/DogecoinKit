@@ -1,6 +1,7 @@
 import Foundation
-import Network
+#if canImport(os)
 import os.log
+#endif
 
 /// Delegate for peer events
 public protocol PeerDelegate: AnyObject, Sendable {
@@ -15,6 +16,11 @@ public protocol PeerDelegate: AnyObject, Sendable {
 }
 
 /// A connection to a Dogecoin peer
+///
+/// Delegate callbacks arrive in exactly the order things happened on the
+/// wire, and the connection reads no further until the delegate has handled
+/// each message — a slow consumer throttles the peer through TCP instead of
+/// buffering without bound.
 public actor Peer {
     /// Connection state
     public enum State: Sendable {
@@ -65,12 +71,16 @@ public actor Peer {
 
     // MARK: - Private State
 
-    private var pendingPingNonce: UInt64?
-    private var didRequestAddresses = false
-    private var connectionTimeoutTask: Task<Void, Never>?
+    private let makeStream: ByteStreamFactory
+
+    /// The live connection. Events from any other stream are stale.
+    private var stream: (any ByteStream)?
+    private var writer: OrderedStreamWriter?
+    private var connectionTask: Task<Void, Never>?
     private var handshakeTimeoutTask: Task<Void, Never>?
     private var pingTimeoutTask: Task<Void, Never>?
-    private var connection: NWConnection?
+    private var pendingPingNonce: UInt64?
+    private var didRequestAddresses = false
     private var receiveBuffer = Data()
 
     // MARK: - Configuration
@@ -84,114 +94,120 @@ public actor Peer {
     /// Ping timeout in seconds (disconnect if no pong received)
     public var pingTimeout: TimeInterval = 120
 
-    /// Shared network queue for NWConnection callbacks
-    private static let networkQueue = DispatchQueue(label: "com.dogecoinkit.peer.network", qos: .utility)
+    /// Sets the timeouts — actor properties cannot be assigned from outside
+    /// the actor, so this is the way to change them. Applies to the next
+    /// connection attempt, handshake, or ping.
+    public func configureTimeouts(connection: TimeInterval? = nil, handshake: TimeInterval? = nil, ping: TimeInterval? = nil) {
+        if let connection { connectionTimeout = connection }
+        if let handshake { handshakeTimeout = handshake }
+        if let ping { pingTimeout = ping }
+    }
 
     /// Logger
     private let logger = Logger(subsystem: "DogecoinKit", category: "Peer")
 
     /// Create a peer connection
     public init(host: String, port: UInt16? = nil, network: DogecoinNetwork = .mainnet) {
+        self.init(host: host, port: port, network: network, streamFactory: defaultByteStreamFactory)
+    }
+
+    init(host: String, port: UInt16?, network: DogecoinNetwork, streamFactory: @escaping ByteStreamFactory) {
         self.id = UUID()
         self.host = host
         self.port = port ?? NetworkConstants.port(for: network)
         self.network = network
         self.nonce = UInt64.random(in: 0...UInt64.max)
+        self.makeStream = streamFactory
     }
 
     deinit {
-        connectionTimeoutTask?.cancel()
+        connectionTask?.cancel()
         handshakeTimeoutTask?.cancel()
         pingTimeoutTask?.cancel()
-        connection?.cancel()
+        stream?.close()
     }
 
     // MARK: - State Updates
 
-    private func updateState(_ newState: State) {
+    private func updateState(_ newState: State) async {
         guard state != newState else { return }
         state = newState
-        let delegate = self.delegate
-        Task { [weak self] in
-            guard let self else { return }
-            await delegate?.peer(self, didChangeState: newState)
-        }
+        await delegate?.peer(self, didChangeState: newState)
     }
 
     // MARK: - Public API
 
     /// Connect to the peer
-    public func connect() {
+    public func connect() async {
         guard state == .disconnected else {
             logger.warning("Cannot connect: peer is in state \(String(describing: self.state))")
             return
         }
 
-        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
-            logger.error("Invalid port: \(self.port)")
-            return
+        let stream = makeStream(host, port, false)
+        self.stream = stream
+        writer = OrderedStreamWriter(stream: stream) { [weak self] error in
+            await self?.connectionEnded(stream, error: error)
         }
+        receiveBuffer = Data()
+        pendingPingNonce = nil
+        peerVersion = nil
 
-        updateState(.connecting)
         logger.info("Connecting to \(self.host):\(self.port)")
+        await updateState(.connecting)
 
-        let endpoint = NWEndpoint.hostPort(
-            host: NWEndpoint.Host(host),
-            port: nwPort
-        )
+        let timeout = Duration.seconds(connectionTimeout)
+        connectionTask = Task { [weak self] in
+            do {
+                try await stream.open(timeout: timeout)
+            } catch {
+                await self?.connectionEnded(stream, error: error)
+                return
+            }
 
-        let parameters = NWParameters.tcp
-        parameters.prohibitExpensivePaths = false
-        parameters.prohibitConstrainedPaths = false
+            guard await self?.connectionOpened(stream) == true else { return }
 
-        let conn = NWConnection(to: endpoint, using: parameters)
-        connection = conn
-
-        conn.stateUpdateHandler = { [weak self] nwState in
-            Task { [weak self] in
-                await self?.handleConnectionState(nwState)
+            do {
+                while let chunk = try await stream.read() {
+                    guard let self else { return }
+                    await self.received(chunk, from: stream)
+                }
+                await self?.connectionEnded(stream, error: nil)
+            } catch {
+                await self?.connectionEnded(stream, error: error)
             }
         }
-
-        startReceiving()
-        conn.start(queue: Self.networkQueue)
-        startConnectionTimeout()
     }
 
     /// Disconnect from the peer
-    public func disconnect() {
+    public func disconnect() async {
         guard state != .disconnected && state != .disconnecting else { return }
 
-        updateState(.disconnecting)
         logger.info("Disconnecting from \(self.host):\(self.port)")
-
-        cancelAllTimeouts()
-        connection?.cancel()
-        connection = nil
-        updateState(.disconnected)
+        await updateState(.disconnecting)
+        closeStream()
+        await updateState(.disconnected)
     }
 
     /// Send a protocol message
     public func send(_ message: ProtocolMessage) {
-        guard let connection, state == .ready || state == .handshaking else {
+        guard let writer, state == .ready || state == .handshaking else {
             logger.warning("Cannot send message: not connected")
             return
         }
 
         let data = message.serialize()
         logger.debug("Sending \(message.command) message (\(data.count) bytes)")
-
-        connection.send(content: data, completion: .contentProcessed { [weak self] error in
-            if let error {
-                Task { [weak self] in
-                    self?.logger.error("Send error: \(error.localizedDescription)")
-                }
-            }
-        })
+        writer.write(data)
     }
 
     /// Send a ping message
+    ///
+    /// While a ping is unanswered no new one is sent, so the timeout keeps
+    /// running: a peer that never answers is dropped after ``pingTimeout``.
     public func sendPing() {
+        guard pendingPingNonce == nil else { return }
+
         let ping = PingMessage()
         pendingPingNonce = ping.nonce
         lastPingTime = Date()
@@ -204,34 +220,20 @@ public actor Peer {
 
     // MARK: - Timeout Management
 
-    private func startConnectionTimeout() {
-        connectionTimeoutTask?.cancel()
-        let timeout = connectionTimeout
-        connectionTimeoutTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(timeout))
-            guard !Task.isCancelled else { return }
-            guard let self else { return }
-            let currentState = await self.state
-            if currentState == .connecting || currentState == .connected {
-                self.logger.warning("Connection timeout for \(self.host)")
-                await self.handleTimeout(.connection)
-            }
-        }
-    }
-
     private func startHandshakeTimeout() {
         handshakeTimeoutTask?.cancel()
         let timeout = handshakeTimeout
         handshakeTimeoutTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(timeout))
             guard !Task.isCancelled else { return }
-            guard let self else { return }
-            let currentState = await self.state
-            if currentState == .handshaking {
-                self.logger.warning("Handshake timeout for \(self.host)")
-                await self.handleTimeout(.handshake)
-            }
+            await self?.handshakeTimedOut()
         }
+    }
+
+    private func handshakeTimedOut() async {
+        guard state == .handshaking || state == .connected else { return }
+        logger.warning("Handshake timeout for \(self.host)")
+        await handleTimeout(.handshake)
     }
 
     private func startPingTimeout() {
@@ -240,17 +242,17 @@ public actor Peer {
         pingTimeoutTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(timeout))
             guard !Task.isCancelled else { return }
-            guard let self else { return }
-            if await self.pendingPingNonce != nil {
-                self.logger.warning("Ping timeout for \(self.host)")
-                await self.handleTimeout(.ping)
-            }
+            await self?.pingTimedOut()
         }
     }
 
+    private func pingTimedOut() async {
+        guard pendingPingNonce != nil, state == .ready else { return }
+        logger.warning("Ping timeout for \(self.host)")
+        await handleTimeout(.ping)
+    }
+
     private func cancelAllTimeouts() {
-        connectionTimeoutTask?.cancel()
-        connectionTimeoutTask = nil
         handshakeTimeoutTask?.cancel()
         handshakeTimeoutTask = nil
         pingTimeoutTask?.cancel()
@@ -264,15 +266,10 @@ public actor Peer {
         case ping = "Ping timeout"
     }
 
-    private func handleTimeout(_ type: TimeoutType) {
-        let error = PeerError.timeout(type)
+    private func handleTimeout(_ type: TimeoutType) async {
         logger.error("Peer \(self.host): \(type.rawValue)")
-        let delegate = self.delegate
-        Task { [weak self] in
-            guard let self else { return }
-            await delegate?.peer(self, didFailWithError: error)
-        }
-        disconnect()
+        await delegate?.peer(self, didFailWithError: PeerError.timeout(type))
+        await disconnect()
     }
 
     /// Peer errors
@@ -297,10 +294,14 @@ public actor Peer {
     }
 
     /// Send a version message
+    ///
+    /// Announces `relay = false` (BIP 37): no transaction announcements until
+    /// a bloom filter is loaded, rather than the whole mempool.
     public func sendVersion(startHeight: Int32 = 0) {
         let version = VersionMessage(
             nonce: nonce,
-            startHeight: startHeight
+            startHeight: startHeight,
+            relay: false
         )
         let message = ProtocolMessage(network: network, command: ProtocolMessage.Command.version, payload: version.serialize())
         send(message)
@@ -370,119 +371,94 @@ public actor Peer {
         send(message)
     }
 
-    // MARK: - Private Methods
+    // MARK: - Connection Events
 
-    private func handleConnectionState(_ connectionState: NWConnection.State) {
-        switch connectionState {
-        case .ready:
-            logger.info("Connection ready to \(self.host):\(self.port)")
-            updateState(.connected)
-            beginHandshake()
+    /// - Returns: `false` if this stream has been replaced or closed meanwhile.
+    private func connectionOpened(_ source: any ByteStream) async -> Bool {
+        guard source === stream else { return false }
 
-        case .failed(let error):
-            logger.error("Connection failed: \(error.localizedDescription)")
-            updateState(.disconnected)
-            connection = nil
-            let delegate = self.delegate
-            Task { [weak self] in
-                guard let self else { return }
-                await delegate?.peer(self, didFailWithError: error)
-            }
+        logger.info("Connection ready to \(self.host):\(self.port)")
+        await updateState(.connected)
+        guard source === stream else { return false }
 
-        case .cancelled:
-            logger.info("Connection cancelled")
-            updateState(.disconnected)
-            connection = nil
-
-        case .waiting(let error):
-            logger.warning("Connection waiting: \(error.localizedDescription)")
-
-        default:
-            break
-        }
-    }
-
-    private func beginHandshake() {
-        updateState(.handshaking)
-        connectionTimeoutTask?.cancel()
-        connectionTimeoutTask = nil
+        await updateState(.handshaking)
         startHandshakeTimeout()
         sendVersion(startHeight: 0)
+        return source === stream
     }
 
-    private func startReceiving() {
-        connection?.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] content, _, isComplete, error in
-            Task { [weak self] in
-                guard let self else { return }
-                await self.handleReceived(content: content, isComplete: isComplete, error: error)
-            }
-        }
-    }
+    private func connectionEnded(_ source: any ByteStream, error: Error?) async {
+        guard source === stream else { return }
 
-    private func handleReceived(content: Data?, isComplete: Bool, error: NWError?) {
         if let error {
-            logger.error("Receive error: \(error.localizedDescription)")
-            disconnect()
-            return
-        }
-
-        if let data = content {
-            receiveBuffer.append(data)
-            processReceiveBuffer()
-        }
-
-        if isComplete {
-            logger.info("Connection closed by peer")
-            disconnect()
+            logger.error("Connection to \(self.host) failed: \(error.localizedDescription)")
         } else {
-            startReceiving()
+            logger.info("Connection closed by peer")
         }
+
+        let wasEstablished = state == .ready || state == .handshaking || state == .connected
+        closeStream()
+        if let error, !wasEstablished, !(error is CancellationError) {
+            let reported: Error = (error as? ByteStreamError) == .timedOut ? PeerError.timeout(.connection) : error
+            await delegate?.peer(self, didFailWithError: reported)
+        }
+        await updateState(.disconnected)
     }
 
-    private func processReceiveBuffer() {
+    private func closeStream() {
+        cancelAllTimeouts()
+        connectionTask?.cancel()
+        connectionTask = nil
+        stream?.close()
+        stream = nil
+        writer = nil
+        receiveBuffer = Data()
+        pendingPingNonce = nil
+    }
+
+    private func received(_ chunk: Data, from source: any ByteStream) async {
+        guard source === stream else { return }
+        receiveBuffer.append(chunk)
+
         let expectedMagic = NetworkConstants.magic(for: network)
 
-        while true {
+        while source === stream {
             switch ProtocolMessage.parseDetailed(from: receiveBuffer) {
             case .message(let message, let remaining):
                 receiveBuffer = remaining
 
                 guard message.magic == expectedMagic else {
-                    handleProtocolError(.invalidMagic(expected: expectedMagic, got: message.magic))
+                    await handleProtocolError(.invalidMagic(expected: expectedMagic, got: message.magic))
                     return
                 }
 
-                handleMessage(message)
+                await handleMessage(message)
 
             case .incomplete:
                 return
 
             case .invalid(let error):
-                handleProtocolError(.invalidMessage(error))
+                await handleProtocolError(.invalidMessage(error))
                 return
             }
         }
     }
 
-    private func handleProtocolError(_ error: PeerError) {
+    private func handleProtocolError(_ error: PeerError) async {
         logger.error("Protocol error from \(self.host): \(error.localizedDescription)")
-        let delegate = self.delegate
-        Task { [weak self] in
-            guard let self else { return }
-            await delegate?.peer(self, didFailWithError: error)
-        }
-        disconnect()
+        await delegate?.peer(self, didFailWithError: error)
+        await disconnect()
     }
 
-    private func handleMessage(_ message: ProtocolMessage) {
+    private func handleMessage(_ message: ProtocolMessage) async {
         logger.debug("Received \(message.command) message")
 
         switch message.command {
         case ProtocolMessage.Command.version:
-            handleVersionMessage(message.payload)
+            await handleVersionMessage(message.payload)
 
         case ProtocolMessage.Command.verack:
-            handleVerackMessage()
+            await handleVerackMessage()
 
         case ProtocolMessage.Command.ping:
             handlePingMessage(message.payload)
@@ -490,26 +466,24 @@ public actor Peer {
         case ProtocolMessage.Command.pong:
             handlePongMessage(message.payload)
 
-        case ProtocolMessage.Command.addr,
-             ProtocolMessage.Command.getaddr:
-            let delegate = self.delegate
-            Task { [weak self] in
-                guard let self else { return }
-                await delegate?.peer(self, didReceiveMessage: message)
-            }
-
         default:
-            let delegate = self.delegate
-            Task { [weak self] in
-                guard let self else { return }
-                await delegate?.peer(self, didReceiveMessage: message)
-            }
+            await delegate?.peer(self, didReceiveMessage: message)
         }
     }
 
-    private func handleVersionMessage(_ payload: Data) {
+    private func handleVersionMessage(_ payload: Data) async {
+        guard peerVersion == nil else { return }
+
         guard let version = VersionMessage.parse(from: payload) else {
             logger.error("Failed to parse version message")
+            await handleProtocolError(.connectionFailed)
+            return
+        }
+
+        // Our own nonce coming back means we dialed ourselves.
+        guard version.nonce != nonce else {
+            logger.warning("Connected to self via \(self.host); disconnecting")
+            await disconnect()
             return
         }
 
@@ -519,13 +493,15 @@ public actor Peer {
         sendVerack()
     }
 
-    private func handleVerackMessage() {
+    private func handleVerackMessage() async {
+        guard state == .handshaking else { return }
+
         handshakeTimeoutTask?.cancel()
         handshakeTimeoutTask = nil
         logger.info("Handshake complete with \(self.host):\(self.port)")
-        updateState(.ready)
+        await updateState(.ready)
 
-        if !didRequestAddresses {
+        if !didRequestAddresses, state == .ready {
             sendGetAddr()
             didRequestAddresses = true
         }
@@ -537,19 +513,21 @@ public actor Peer {
     }
 
     private func handlePongMessage(_ payload: Data) {
-        guard let pong = PongMessage.parse(from: payload) else { return }
-
-        if let pendingNonce = pendingPingNonce, pong.nonce == pendingNonce {
-            if let lastPing = lastPingTime {
-                pingTimeoutTask?.cancel()
-                pingTimeoutTask = nil
-                let rtt = Date().timeIntervalSince(lastPing)
-                roundTripTime = rtt
-                logger.debug("RTT: \(rtt)s")
-            }
+        guard let pong = PongMessage.parse(from: payload),
+              let pendingNonce = pendingPingNonce,
+              pong.nonce == pendingNonce else {
+            return
         }
 
+        pingTimeoutTask?.cancel()
+        pingTimeoutTask = nil
         pendingPingNonce = nil
+
+        if let lastPing = lastPingTime {
+            let rtt = Date().timeIntervalSince(lastPing)
+            roundTripTime = rtt
+            logger.debug("RTT: \(rtt)s")
+        }
     }
 }
 

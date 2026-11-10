@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Android)
+import Android
+#endif
 
 /// Version message for P2P handshake
 public struct VersionMessage: Sendable {
@@ -92,7 +95,15 @@ public struct VersionMessage: Sendable {
         return data
     }
 
+    /// Longest user agent a peer may send — Dogecoin Core's
+    /// `MAX_SUBVERSION_LENGTH`. Core rejects longer ones, and so do we.
+    public static let maxUserAgentLength = 256
+
     /// Parse from Data
+    ///
+    /// The user agent length is peer-supplied: it is bounded by both the
+    /// remaining bytes and ``maxUserAgentLength`` before use, so a hostile
+    /// length can only fail the parse, never trap on integer conversion.
     public static func parse(from data: Data) -> VersionMessage? {
         guard data.count >= 85 else { return nil }
 
@@ -110,36 +121,31 @@ public struct VersionMessage: Sendable {
         let timestamp = Int64(littleEndian: timestampRaw)
         offset += 8
 
-        guard let addrRecv = NetworkAddress.parse(from: Data(data[offset..<offset+26])) else { return nil }
+        guard let addrRecvBytes = data.bytes(at: offset, count: 26),
+              let addrRecv = NetworkAddress.parse(from: addrRecvBytes) else { return nil }
         offset += 26
 
-        guard let addrFrom = NetworkAddress.parse(from: Data(data[offset..<offset+26])) else { return nil }
+        guard let addrFromBytes = data.bytes(at: offset, count: 26),
+              let addrFrom = NetworkAddress.parse(from: addrFromBytes) else { return nil }
         offset += 26
 
         guard let nonceRaw: UInt64 = data.readInteger(at: offset) else { return nil }
         let nonce = UInt64(littleEndian: nonceRaw)
         offset += 8
 
-        // Parse var_str for user agent
-        guard let (userAgentLength, varIntSize) = VarInt.parse(from: Data(data[offset...])) else { return nil }
-        offset += varIntSize
+        // var_str user agent, followed by the 4-byte start height
+        guard let (userAgentLength, userAgentStart) = data.readBoundedLength(at: offset, trailing: 4),
+              userAgentLength <= maxUserAgentLength,
+              let userAgentBytes = data.bytes(at: userAgentStart, count: userAgentLength) else { return nil }
+        let userAgent = String(decoding: userAgentBytes, as: UTF8.self)
+        offset = userAgentStart + userAgentLength
 
-        let userAgentEnd = offset + Int(userAgentLength)
-        guard data.count >= userAgentEnd else { return nil }
-        let userAgent = String(data: Data(data[offset..<userAgentEnd]), encoding: .utf8) ?? ""
-        offset = userAgentEnd
-
-        guard data.count >= offset + 4 else { return nil }
         guard let startHeightRaw: Int32 = data.readInteger(at: offset) else { return nil }
         let startHeight = Int32(littleEndian: startHeightRaw)
         offset += 4
 
-        let relay: Bool
-        if data.count > offset {
-            relay = data[offset] != 0
-        } else {
-            relay = true
-        }
+        // The relay flag is optional (BIP 37); peers that omit it relay.
+        let relay = data.bytes(at: offset, count: 1).map { $0[$0.startIndex] != 0 } ?? true
 
         return VersionMessage(
             version: version,
@@ -295,12 +301,10 @@ public struct NetworkAddress: Sendable {
 
     /// Parse from Data
     public static func parse(from data: Data) -> NetworkAddress? {
-        guard data.count >= 26 else { return nil }
-
-        guard let servicesRaw: UInt64 = data.readInteger(at: 0) else { return nil }
+        guard let servicesRaw: UInt64 = data.readInteger(at: 0),
+              let address = data.bytes(at: 8, count: 16),
+              let portRaw: UInt16 = data.readInteger(at: 24) else { return nil }
         let services = UInt64(littleEndian: servicesRaw)
-        let address = Data(data[8..<24])
-        guard let portRaw: UInt16 = data.readInteger(at: 24) else { return nil }
         let port = UInt16(bigEndian: portRaw)
 
         return NetworkAddress(services: services, address: address, port: port)

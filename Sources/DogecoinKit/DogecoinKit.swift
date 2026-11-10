@@ -21,6 +21,44 @@ enum ECC {
         dogecoin_ecc_start()
         threadDictionary[armedKey] = true
     }
+
+    /// Destroys the current thread's context and forgets that it was armed,
+    /// so a later `armCurrentThread()` on this thread creates a fresh one
+    /// rather than trusting a flag that points at a destroyed context.
+    static func disarmCurrentThread() {
+        let threadDictionary = Thread.current.threadDictionary
+        guard threadDictionary[armedKey] != nil else { return }
+        dogecoin_ecc_stop()
+        threadDictionary.removeObject(forKey: armedKey)
+    }
+
+    // libdogecoin asserts — aborting the process — when handed a key that
+    // fails these checks, and its asserts stay enabled in release builds, so
+    // every key from outside the library is checked here first.
+
+    /// Whether `publicKey` is a point on secp256k1, in compressed (33-byte)
+    /// or uncompressed (65-byte) form.
+    static func isValidPublicKey(_ publicKey: Data) -> Bool {
+        guard publicKey.count == 33 || publicKey.count == 65 else { return false }
+        armCurrentThread()
+
+        var key = dogecoin_pubkey()
+        key.compressed = publicKey.count == 33 ? 1 : 0
+        withUnsafeMutableBytes(of: &key.pubkey) { $0.copyBytes(from: publicKey) }
+        return dogecoin_pubkey_is_valid(&key) == 1
+    }
+
+    /// Whether `privateKey` is a usable secp256k1 secret: 32 bytes encoding
+    /// a scalar between 1 and the curve order.
+    static func isValidPrivateKey(_ privateKey: Data) -> Bool {
+        guard privateKey.count == 32 else { return false }
+        armCurrentThread()
+
+        var key = dogecoin_key()
+        defer { dogecoin_privkey_cleanse(&key) }
+        withUnsafeMutableBytes(of: &key.privkey) { $0.copyBytes(from: privateKey) }
+        return dogecoin_privkey_is_valid(&key) == 1
+    }
 }
 
 /// Main entry point for the Dogecoin library.
@@ -38,7 +76,10 @@ public enum Dogecoin {
 
         func cleanup() {
             guard isInitialized else { return }
-            dogecoin_ecc_stop()
+            // Contexts are per thread, so only the one this actor happens to
+            // run on can be torn down here. Other pool threads keep theirs —
+            // they are re-armed on demand and never left half-destroyed.
+            ECC.disarmCurrentThread()
             isInitialized = false
         }
 
@@ -125,20 +166,18 @@ public enum DogecoinNetwork: Sendable {
     }
 }
 
-// MARK: - Utility Extensions
+// MARK: - Codable
 
-extension String {
-    /// Convert Swift String to C string buffer and call closure
-    internal func withCStringBuffer<T>(size: Int, _ body: (UnsafeMutablePointer<CChar>) throws -> T) rethrows -> T {
-        var buffer = [CChar](repeating: 0, count: size)
-        return try body(&buffer)
+/// Encoded as `0` (mainnet) or `1` (testnet).
+extension DogecoinNetwork: Codable {
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let value = try container.decode(Int.self)
+        self = value == 1 ? .testnet : .mainnet
     }
-}
 
-extension Array where Element == CChar {
-    /// Convert CChar array to Swift String, trimming null terminator
-    internal var asString: String {
-        let bytes = Data(self.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
-        return String(decoding: bytes, as: UTF8.self)
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(self == .testnet ? 1 : 0)
     }
 }

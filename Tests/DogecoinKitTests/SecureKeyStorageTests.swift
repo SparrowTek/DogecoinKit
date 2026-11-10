@@ -1,3 +1,4 @@
+#if canImport(Security)
 import Testing
 import Foundation
 @testable import DogecoinKit
@@ -282,3 +283,4 @@ struct SecureKeyStorageTests {
         #expect(credentials.passphrase.isEmpty)
     }
 }
+#endif

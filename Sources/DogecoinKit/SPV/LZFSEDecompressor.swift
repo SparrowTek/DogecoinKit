@@ -1,3 +1,4 @@
+#if canImport(Compression)
 import Compression
 import Foundation
 
@@ -158,3 +159,4 @@ private final class CompressionStreamHelper {
         dummyBuffer.deallocate()
     }
 }
+#endif

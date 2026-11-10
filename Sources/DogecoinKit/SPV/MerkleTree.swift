@@ -1,5 +1,9 @@
 import Foundation
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
 
 enum MerkleTree {
     static func doubleSHA256(_ data: Data) -> Data {

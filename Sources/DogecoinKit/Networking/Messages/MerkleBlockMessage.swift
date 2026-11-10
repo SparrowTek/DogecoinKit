@@ -35,65 +35,15 @@ public struct MerkleBlockMessage: Sendable {
         return data
     }
 
-    /// Check if block version indicates AuxPoW (merged mining)
-    private static func isAuxPow(version: Int32) -> Bool {
-        (version & 0x100) == 0x100
-    }
-
-    /// Skip AuxPoW data and return the new offset, or nil if parsing fails
-    /// AuxPoW structure (from Dogecoin's CAuxPow which extends CMerkleTx):
-    /// - coinbase_tx (variable)
-    /// - hashBlock (32 bytes) - block hash where coinbase was included
-    /// - vMerkleBranch (varint count + 32*count) - merkle proof for coinbase
-    /// - nIndex (4 bytes) - position in merkle tree
-    /// - vChainMerkleBranch (varint count + 32*count) - chain merkle branch
-    /// - nChainIndex (4 bytes)
-    /// - parentBlock (80 bytes) - parent chain block header
-    private static func skipAuxPow(in data: Data, from offset: Int) -> Int? {
-        var pos = offset
-
-        // Skip coinbase transaction
-        guard let txEnd = TransactionParser.skipTransaction(in: data, from: pos) else { return nil }
-        pos = txEnd
-
-        // Skip hashBlock (32 bytes)
-        guard data.count >= pos + 32 else { return nil }
-        pos += 32
-
-        // Skip coinbase merkle branch (varint count + 32*count bytes).
-        // The count is peer-supplied; bound it by the remaining bytes so a
-        // fabricated VarInt cannot trap on Int conversion or multiplication.
-        guard let (branchCount1, branchSize1) = data.readBoundedCount(at: pos, minItemSize: 32) else { return nil }
-        pos += branchSize1 + branchCount1 * 32
-
-        // Skip nIndex (4 bytes)
-        guard data.count >= pos + 4 else { return nil }
-        pos += 4
-
-        // Skip chain merkle branch (varint count + 32*count bytes)
-        guard let (branchCount2, branchSize2) = data.readBoundedCount(at: pos, minItemSize: 32) else { return nil }
-        pos += branchSize2 + branchCount2 * 32
-
-        // Skip nChainIndex (4 bytes)
-        guard data.count >= pos + 4 else { return nil }
-        pos += 4
-
-        // Skip parent block header (80 bytes)
-        guard data.count >= pos + 80 else { return nil }
-        pos += 80
-
-        return pos
-    }
-
     public static func parse(from data: Data) -> MerkleBlockMessage? {
-        guard data.count >= BlockHeader.size + 4 else { return nil }
-        guard let header = BlockHeader.parse(from: Data(data.prefix(BlockHeader.size))) else { return nil }
+        guard let headerBytes = data.bytes(at: 0, count: BlockHeader.size),
+              let header = BlockHeader.parse(from: headerBytes) else { return nil }
 
         var offset = BlockHeader.size
 
-        // If this is an AuxPoW block, skip the auxpow data
-        if isAuxPow(version: header.version) {
-            guard let newOffset = skipAuxPow(in: data, from: offset) else { return nil }
+        // Merge-mined blocks carry their AuxPoW between header and tree.
+        if header.isAuxPoW {
+            guard let (_, newOffset) = AuxPoW.parse(from: data, at: offset) else { return nil }
             offset = newOffset
         }
         guard let totalRaw: UInt32 = data.readInteger(at: offset) else { return nil }
@@ -108,13 +58,13 @@ public struct MerkleBlockMessage: Sendable {
         var hashes: [Data] = []
         hashes.reserveCapacity(hashCount)
         for _ in 0..<hashCount {
-            guard data.count >= offset + 32 else { return nil }
-            hashes.append(Data(data[offset..<offset + 32]))
+            guard let hash = data.bytes(at: offset, count: 32) else { return nil }
+            hashes.append(hash)
             offset += 32
         }
 
-        guard let (flagCount, flagStart) = data.readBoundedLength(at: offset) else { return nil }
-        let flags = Data(data[flagStart..<flagStart + flagCount])
+        guard let (flagCount, flagStart) = data.readBoundedLength(at: offset),
+              let flags = data.bytes(at: flagStart, count: flagCount) else { return nil }
 
         return MerkleBlockMessage(
             header: header,
@@ -145,6 +95,10 @@ public enum MerkleBlockError: Error, Sendable {
     case invalidTransactionCount
 }
 
+/// Most transactions a block can hold: Dogecoin's 1 MB block size limit
+/// divided by the 60-byte minimum transaction size.
+private let maximumTransactionsPerBlock: UInt32 = 1_000_000 / 60
+
 private final class PartialMerkleTree {
     private let totalTransactions: UInt32
     private let hashes: [Data]
@@ -160,14 +114,24 @@ private final class PartialMerkleTree {
         self.flags = [UInt8](flags)
     }
 
+    /// Bitcoin Core's `CPartialMerkleTree::ExtractMatches`, including every
+    /// sanity check it makes before trusting the tree.
     func calculateRoot() throws -> Data {
-        guard totalTransactions > 0 else { throw MerkleBlockError.invalidTransactionCount }
+        guard totalTransactions > 0, totalTransactions <= maximumTransactionsPerBlock else {
+            throw MerkleBlockError.invalidTransactionCount
+        }
+        // At most one hash per transaction, and at least one flag bit per hash.
+        guard hashes.count <= Int(totalTransactions), flags.count * 8 >= hashes.count else {
+            throw MerkleBlockError.invalidProof
+        }
 
         let height = treeHeight
         let root = try traverse(height: height, position: 0)
 
-        guard hashesUsed == hashes.count else { throw MerkleBlockError.invalidProof }
-        guard bitsUsed <= flags.count * 8 else { throw MerkleBlockError.invalidProof }
+        // Every hash used, and every flag byte needed — no unused trailing data.
+        guard hashesUsed == hashes.count, (bitsUsed + 7) / 8 == flags.count else {
+            throw MerkleBlockError.invalidProof
+        }
 
         return root
     }
@@ -203,6 +167,9 @@ private final class PartialMerkleTree {
 
         if position * 2 + 1 < treeWidth(height: height - 1) {
             right = try traverse(height: height - 1, position: position * 2 + 1)
+            // Identical sibling subtrees can only come from duplicated
+            // transactions (CVE-2012-2459), which a valid block never has.
+            guard right != left else { throw MerkleBlockError.invalidProof }
         }
 
         return MerkleTree.hashPair(left, right)

@@ -140,7 +140,7 @@ wallet -= spend
 print(wallet.doge)  // 70.0
 ```
 
-> Warning: Subtracting a larger amount from a smaller one will cause an underflow. Always validate before subtraction.
+> Warning: Subtraction saturates at zero. Subtracting a larger amount from a smaller one returns ``DogecoinAmount/zero`` instead of trapping, so a shortfall can go unnoticed. Always validate before subtraction. Addition and multiplication saturate at `UInt64.max` the same way.
 
 ### Multiplication
 
@@ -196,15 +196,17 @@ func calculateFee(inputCount: Int, outputCount: Int) -> DogecoinAmount {
     // Estimate transaction size
     let estimatedSize = inputCount * 148 + outputCount * 34 + 10
 
-    // Fee rate: 1 DOGE per KB (minimum)
-    let feePerByte = DogecoinAmount(koinu: 1000)  // 0.00001 DOGE per byte
+    // Standard fee rate: 1 DOGE per KB
+    let feePerByte = DogecoinAmount(koinu: 100_000)  // 0.001 DOGE per byte
 
     return feePerByte * UInt64(estimatedSize)
 }
 
 let fee = calculateFee(inputCount: 2, outputCount: 2)
-print("Estimated fee: \(fee)")
+print("Estimated fee: \(fee)")  // "0.37400000 DOGE"
 ```
+
+``FeeEstimation`` provides this calculation, with priority levels and the 0.01 DOGE minimum fee applied.
 
 ### Calculating Change
 

@@ -84,9 +84,13 @@ public enum FeeEstimation {
     ///   - outputCount: Number of P2PKH outputs
     /// - Returns: Estimated transaction size in bytes
     public static func estimateTransactionSize(inputCount: Int, outputCount: Int) -> Int {
-        let inputSize = p2pkhInputSize * inputCount
-        let outputSize = p2pkhOutputSize * outputCount
-        return baseTxSize + inputSize + outputSize
+        // Negative counts are meaningless; huge ones saturate instead of trapping.
+        let (inputSize, inputOverflow) = p2pkhInputSize.multipliedReportingOverflow(by: max(0, inputCount))
+        let (outputSize, outputOverflow) = p2pkhOutputSize.multipliedReportingOverflow(by: max(0, outputCount))
+        guard !inputOverflow, !outputOverflow else { return .max }
+
+        let (size, overflow) = (baseTxSize + inputSize).addingReportingOverflow(outputSize)
+        return overflow ? .max : size
     }
 
     /// Estimate virtual size for a typical send transaction (1 recipient + 1 change)
@@ -133,8 +137,9 @@ public enum FeeEstimation {
     ///   - feePerKB: Fee rate per kilobyte
     /// - Returns: Calculated fee amount (minimum fee enforced)
     public static func calculateFee(sizeBytes: Int, feePerKB: DogecoinAmount) -> DogecoinAmount {
-        // Calculate fee: (size * feePerKB) / 1000
-        let feeKoinu = (UInt64(sizeBytes) * feePerKB.koinu) / 1000
+        // Calculate fee: (size * feePerKB) / 1000, saturating rather than trapping
+        let (product, overflow) = UInt64(max(0, sizeBytes)).multipliedReportingOverflow(by: feePerKB.koinu)
+        let feeKoinu = overflow ? UInt64.max : product / 1000
 
         // Enforce minimum fee
         let finalFee = max(feeKoinu, minimumFee.koinu)

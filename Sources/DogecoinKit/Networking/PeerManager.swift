@@ -1,5 +1,10 @@
 import Foundation
+#if canImport(Android)
+import Android
+#endif
+#if canImport(os)
 import os.log
+#endif
 
 /// Delegate for peer manager events
 public protocol PeerManagerDelegate: AnyObject, Sendable {
@@ -64,6 +69,17 @@ public actor PeerManager {
     /// Maximum backoff delay
     public var maxBackoff: TimeInterval = 3600
 
+    /// Sets connection limits — actor properties cannot be assigned from
+    /// outside the actor, so this is the way to change them.
+    public func configure(minPeerConnections: Int? = nil, maxPeerConnections: Int? = nil) {
+        if let minPeerConnections {
+            self.minPeerConnections = max(0, minPeerConnections)
+        }
+        if let maxPeerConnections {
+            self.maxPeerConnections = max(1, maxPeerConnections)
+        }
+    }
+
     /// UserDefaults key for persisted banned peers
     private static let bannedPeersKey = "DogecoinKit.bannedPeers"
 
@@ -72,6 +88,12 @@ public actor PeerManager {
 
     /// Timer task for maintenance
     private var maintenanceTask: Task<Void, Never>?
+
+    /// DNS seed discovery, cancelled by `stop()`
+    private var discoveryTask: Task<Void, Never>?
+
+    /// Between `start()` and `stop()`; only then are new peers dialed on our own
+    private var isRunning = false
 
     /// Track ready/disconnected peer IDs locally to avoid N-await per peer
     private var readyPeerIDs: Set<UUID> = []
@@ -93,6 +115,13 @@ public actor PeerManager {
 
     /// Pending transactions waiting to be requested by peers
     private var pendingTransactions: [Data: TxMessage] = [:]
+
+    private let makeStream: ByteStreamFactory
+    private let dnsSeeds: [String]
+    /// Dialed when no DNS seed yields a working peer
+    private let fallbackNodes: [(host: String, port: UInt16)]
+    /// Where bans persist across launches; nil keeps them in memory only
+    private let banStore: UserDefaults?
 
     /// Number of connected peers
     public var connectedPeerCount: Int {
@@ -117,10 +146,29 @@ public actor PeerManager {
 
     /// Create a peer manager
     public init(network: DogecoinNetwork = .mainnet) {
+        self.init(
+            network: network,
+            streamFactory: defaultByteStreamFactory,
+            dnsSeeds: NetworkConstants.seeds(for: network),
+            fallbackNodes: network == .mainnet ? NetworkConstants.mainnetFallbackNodes : []
+        )
+    }
+
+    init(
+        network: DogecoinNetwork,
+        streamFactory: @escaping ByteStreamFactory,
+        dnsSeeds: [String],
+        fallbackNodes: [(host: String, port: UInt16)],
+        banStore: UserDefaults? = .standard
+    ) {
         self.network = network
+        self.makeStream = streamFactory
+        self.dnsSeeds = dnsSeeds
+        self.fallbackNodes = fallbackNodes
+        self.banStore = banStore
 
         // Inline banned peer loading (can't call actor-isolated methods from init)
-        if let data = UserDefaults.standard.data(forKey: Self.bannedPeersKey),
+        if let data = banStore?.data(forKey: Self.bannedPeersKey),
            let decoded = try? JSONDecoder().decode([String: Date].self, from: data) {
             let now = Date()
             self.bannedPeers = decoded.filter { $0.value > now }
@@ -129,6 +177,8 @@ public actor PeerManager {
 
     /// Start the peer manager
     public func start() {
+        guard !isRunning else { return }
+        isRunning = true
         logger.info("Starting peer manager for \(self.network == .mainnet ? "mainnet" : "testnet")")
         discoverPeers()
         startMaintenanceTask()
@@ -137,8 +187,11 @@ public actor PeerManager {
     /// Stop the peer manager
     public func stop() async {
         logger.info("Stopping peer manager")
+        isRunning = false
         maintenanceTask?.cancel()
         maintenanceTask = nil
+        discoveryTask?.cancel()
+        discoveryTask = nil
 
         let allPeers = peers
         for peer in allPeers {
@@ -152,7 +205,7 @@ public actor PeerManager {
 
     /// Add a peer by address
     public func addPeer(host: String, port: UInt16? = nil) async {
-        let peer = Peer(host: host, port: port, network: network)
+        let peer = Peer(host: host, port: port, network: network, streamFactory: makeStream)
         await addPeer(peer)
     }
 
@@ -181,10 +234,21 @@ public actor PeerManager {
     /// Remove a peer
     public func removePeer(_ peer: Peer) async {
         peers.removeAll { $0 == peer }
-        readyPeerIDs.remove(peer.id)
-        disconnectedPeerIDs.insert(peer.id)
         addrBudgetByPeer.removeValue(forKey: peer.id)
         await peer.disconnect()
+        // Disconnecting reports `.disconnected`, which tells the delegate;
+        // this covers a peer that was already down.
+        await peerWentDown(peer)
+    }
+
+    /// Records that `peer` is gone and, if it had been ready, tells the
+    /// delegate — exactly once, however the peer was lost.
+    private func peerWentDown(_ peer: Peer) async {
+        disconnectedPeerIDs.insert(peer.id)
+        guard readyPeerIDs.remove(peer.id) != nil else { return }
+        let count = connectedPeerCount
+        await delegate?.peerManager(self, peerDidDisconnect: peer)
+        await delegate?.peerManager(self, connectedPeerCountChanged: count)
     }
 
     // MARK: - Peer Banning
@@ -253,21 +317,10 @@ public actor PeerManager {
 
     // MARK: - Ban Persistence
 
-    private func loadBannedPeers() {
-        guard let data = UserDefaults.standard.data(forKey: Self.bannedPeersKey),
-              let decoded = try? JSONDecoder().decode([String: Date].self, from: data) else {
-            return
-        }
-
-        bannedPeers = decoded
-        cleanExpiredBans()
-        logger.info("Loaded \(self.bannedPeers.count) banned peers from storage")
-    }
-
     private func saveBannedPeers() {
         let toSave = bannedPeers
         if let data = try? JSONEncoder().encode(toSave) {
-            UserDefaults.standard.set(data, forKey: Self.bannedPeersKey)
+            banStore?.set(data, forKey: Self.bannedPeersKey)
         }
     }
 
@@ -349,42 +402,24 @@ public actor PeerManager {
     // MARK: - Private Methods
 
     private func discoverPeers() {
-        let network = self.network
-        Task { [weak self] in
+        let seeds = dnsSeeds
+        let fallbackNodes = self.fallbackNodes
+        let port = NetworkConstants.port(for: network)
+        discoveryTask = Task { [weak self] in
             guard let self else { return }
 
-            let seeds = NetworkConstants.seeds(for: network)
             self.logger.info("Discovering peers from \(seeds.count) DNS seeds")
 
-            let dnsTimeout: Duration = .seconds(10)
-
             // Resolve DNS seeds concurrently, connecting as each seed resolves
-            // rather than waiting for all seeds (dead seeds block CFHost indefinitely)
-            await withTaskGroup(of: [(String, UInt16)].self) { group in
-                let port = NetworkConstants.port(for: network)
+            // rather than waiting for all of them.
+            await withTaskGroup(of: [String].self) { group in
                 for seed in seeds {
                     group.addTask {
-                        // Race DNS resolution against a timeout so a dead seed
-                        // cannot stall peer discovery indefinitely
-                        await withTaskGroup(of: [(String, UInt16)]?.self) { inner in
-                            inner.addTask {
-                                Self.resolveHostOffActor(seed, port: port)
-                            }
-                            inner.addTask {
-                                try? await Task.sleep(for: dnsTimeout)
-                                return nil
-                            }
-                            for await result in inner {
-                                inner.cancelAll()
-                                return result ?? []
-                            }
-                            return []
-                        }
+                        await Self.resolve(seed, timeout: .seconds(10))
                     }
                 }
-                for await batch in group {
-                    guard !batch.isEmpty else { continue }
-                    for (host, port) in batch {
+                for await addresses in group where !addresses.isEmpty {
+                    for host in addresses {
                         await self.addDiscoveredAddress(host: host, port: port)
                     }
                     await self.connectToDiscoveredPeers()
@@ -395,14 +430,57 @@ public actor PeerManager {
             try? await Task.sleep(for: .seconds(3))
             guard !Task.isCancelled else { return }
 
-            if await self.connectedPeerCount == 0 && network == .mainnet {
+            if await self.connectedPeerCount == 0, !fallbackNodes.isEmpty {
                 self.logger.info("DNS seeds failed, trying fallback nodes")
-                for node in NetworkConstants.mainnetFallbackNodes {
+                for node in fallbackNodes {
                     await self.addDiscoveredAddress(host: node.host, port: node.port)
                 }
                 await self.connectToDiscoveredPeers()
             }
         }
+    }
+
+    /// Resolves a DNS seed to numeric addresses.
+    ///
+    /// `getaddrinfo` blocks and cannot be cancelled, so it runs on its own
+    /// thread — never a cooperative pool thread — and a lookup that outlives
+    /// `timeout` is abandoned (its result discarded) instead of stalling
+    /// discovery.
+    nonisolated private static func resolve(_ hostname: String, timeout: Duration) async -> [String] {
+        let addresses = try? await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[String], Error>) in
+            let once = ResumeOnce(continuation)
+            Thread.detachNewThread {
+                once.resume(returning: numericAddresses(for: hostname))
+            }
+            Task {
+                try? await Task.sleep(for: timeout)
+                once.resume(throwing: CancellationError())
+            }
+        }
+        return addresses ?? []
+    }
+
+    /// Blocking `getaddrinfo` lookup, deduplicated, in numeric form.
+    nonisolated private static func numericAddresses(for hostname: String) -> [String] {
+        var results: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(hostname, nil, nil, &results) == 0, let first = results else {
+            return []
+        }
+        defer { freeaddrinfo(first) }
+
+        var addresses: [String] = []
+        for info in sequence(first: first, next: { $0.pointee.ai_next }) {
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            // The buffer length is a `socklen_t` on Darwin and a `size_t` on Android.
+            let status = getnameinfo(info.pointee.ai_addr, info.pointee.ai_addrlen, &host, numericCast(host.count), nil, 0, NI_NUMERICHOST)
+            guard status == 0 else { continue }
+
+            let address = String(decoding: host.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            if !addresses.contains(address) {
+                addresses.append(address)
+            }
+        }
+        return addresses
     }
 
     private func handleAddrMessage(_ message: AddrMessage, from peer: Peer) {
@@ -468,73 +546,23 @@ public actor PeerManager {
         await peer.send(message)
     }
 
-    /// Resolve a DNS seed off-actor so the blocking CFHost call doesn't starve the actor.
-    nonisolated private static func resolveHostOffActor(_ hostname: String, port: UInt16) -> [(String, UInt16)] {
-        let host = CFHostCreateWithName(nil, hostname as CFString).takeRetainedValue()
-        CFHostStartInfoResolution(host, .addresses, nil)
-
-        var success: DarwinBoolean = false
-        guard let addresses = CFHostGetAddressing(host, &success)?.takeUnretainedValue() as? [Data], success.boolValue else {
-            return []
-        }
-
-        var results: [(String, UInt16)] = []
-        for addressData in addresses {
-            if let address = parseIPv4Address(addressData) {
-                results.append((address, port))
-            } else if let address = parseIPv6Address(addressData) {
-                results.append((address, port))
-            }
-        }
-        return results
-    }
-
-    nonisolated private static func parseIPv4Address(_ data: Data) -> String? {
-        guard data.count >= MemoryLayout<sockaddr_in>.size else { return nil }
-
-        return data.withUnsafeBytes { bytes -> String? in
-            guard let baseAddress = bytes.baseAddress else { return nil }
-            let sockaddr = baseAddress.assumingMemoryBound(to: sockaddr_in.self).pointee
-
-            guard sockaddr.sin_family == AF_INET else { return nil }
-
-            var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-            var addr = sockaddr.sin_addr
-            inet_ntop(AF_INET, &addr, &buffer, socklen_t(INET_ADDRSTRLEN))
-
-            let bytes = Data(buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
-            return String(decoding: bytes, as: UTF8.self)
-        }
-    }
-
-    nonisolated private static func parseIPv6Address(_ data: Data) -> String? {
-        guard data.count >= MemoryLayout<sockaddr_in6>.size else { return nil }
-
-        return data.withUnsafeBytes { bytes -> String? in
-            guard let baseAddress = bytes.baseAddress else { return nil }
-            let sockaddr = baseAddress.assumingMemoryBound(to: sockaddr_in6.self).pointee
-
-            guard sockaddr.sin6_family == AF_INET6 else { return nil }
-
-            var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
-            var addr = sockaddr.sin6_addr
-            inet_ntop(AF_INET6, &addr, &buffer, socklen_t(INET6_ADDRSTRLEN))
-
-            let bytes = Data(buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
-            return String(decoding: bytes, as: UTF8.self)
-        }
-    }
-
     private func connectToDiscoveredPeers() {
+        guard isRunning else { return }
+
         // Count only peers that are still actively connecting or connected,
         // not ones that have already disconnected and are awaiting cleanup.
-        let activePeerCount = peers.filter { !disconnectedPeerIDs.contains($0.id) }.count
-        let addressesToTry = discoveredAddresses
-
-        let needed = maxPeerConnections - activePeerCount
+        let activePeers = peers.filter { !disconnectedPeerIDs.contains($0.id) }
+        let needed = maxPeerConnections - activePeers.count
         guard needed > 0 else { return }
 
-        let candidates = addressesToTry.prefix(needed)
+        // Skip hosts we are already using or must not use yet, and shuffle so
+        // repeated rounds try different addresses instead of the same few.
+        let activeHosts = Set(activePeers.map(\.host))
+        let candidates = discoveredAddresses
+            .filter { host, _ in !activeHosts.contains(host) && !isHostBanned(host) && !isHostBackedOff(host) }
+            .shuffled()
+            .prefix(needed)
+
         for (address, port) in candidates {
             Task { [weak self] in
                 await self?.addPeer(host: address, port: port)
@@ -634,24 +662,12 @@ extension PeerManager: PeerDelegate {
             readyPeerIDs.insert(peer.id)
             disconnectedPeerIDs.remove(peer.id)
             recordSuccessfulConnection(for: peer)
-            let delegate = self.delegate
             let count = connectedPeerCount
-            Task { [weak self] in
-                guard let self else { return }
-                await delegate?.peerManager(self, peerDidBecomeReady: peer)
-                await delegate?.peerManager(self, connectedPeerCountChanged: count)
-            }
+            await delegate?.peerManager(self, peerDidBecomeReady: peer)
+            await delegate?.peerManager(self, connectedPeerCountChanged: count)
 
         case .disconnected:
-            readyPeerIDs.remove(peer.id)
-            disconnectedPeerIDs.insert(peer.id)
-            let delegate = self.delegate
-            let count = connectedPeerCount
-            Task { [weak self] in
-                guard let self else { return }
-                await delegate?.peerManager(self, peerDidDisconnect: peer)
-                await delegate?.peerManager(self, connectedPeerCountChanged: count)
-            }
+            await peerWentDown(peer)
 
         default:
             break
@@ -678,12 +694,9 @@ extension PeerManager: PeerDelegate {
             await handleGetAddr(from: peer)
         }
 
-        // Forward to delegate for other handling
-        let delegate = self.delegate
-        Task { [weak self] in
-            guard let self else { return }
-            await delegate?.peerManager(self, peer: peer, didReceiveMessage: message)
-        }
+        // Forward to delegate for other handling — inline, so messages keep
+        // their wire order and a busy consumer slows the peer down.
+        await delegate?.peerManager(self, peer: peer, didReceiveMessage: message)
     }
 
     public func peer(_ peer: Peer, didFailWithError error: Error) async {

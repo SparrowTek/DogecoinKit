@@ -1,5 +1,9 @@
 import Foundation
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
 
 /// A Dogecoin P2P protocol message
 public struct ProtocolMessage: Sendable {
@@ -91,7 +95,8 @@ public extension ProtocolMessage {
         case invalid(ParseError)
     }
 
-    static func parseDetailed(from data: Data) -> ParseOutcome {
+    static func parseDetailed(from buffer: Data) -> ParseOutcome {
+        let data = buffer.rebased
         guard data.count >= NetworkConstants.headerSize else {
             return .incomplete
         }

@@ -39,11 +39,10 @@ public struct AddrMessage: Sendable {
         entries.reserveCapacity(Int(count))
 
         for _ in 0..<count {
-            guard data.count >= offset + 30 else { return nil }
-            guard let timestampRaw: UInt32 = data.readInteger(at: offset) else { return nil }
+            guard let timestampRaw: UInt32 = data.readInteger(at: offset),
+                  let addressBytes = data.bytes(at: offset + 4, count: 26),
+                  let address = NetworkAddress.parse(from: addressBytes) else { return nil }
             let timestamp = UInt32(littleEndian: timestampRaw)
-            let addrStart = offset + 4
-            guard let address = NetworkAddress.parse(from: Data(data[addrStart..<addrStart + 26])) else { return nil }
 
             entries.append(Entry(timestamp: timestamp, address: address))
             offset += 30

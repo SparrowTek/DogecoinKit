@@ -22,18 +22,22 @@ public struct KeyPair: Sendable, Equatable, Hashable {
 
         var privateKey = [CChar](repeating: 0, count: Int(PRIVKEYWIFLEN))
         var address = [CChar](repeating: 0, count: Int(P2PKHLEN))
+        defer { privateKey.withUnsafeMutableBufferPointer { $0.update(repeating: 0) } }
 
         let result = generatePrivPubKeypair(&privateKey, &address, network.isTestnet)
 
         guard result == 1 else {
             throw DogecoinError.keyGenerationFailed
         }
-        
-        let privateKeyBytes = Data(privateKey.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
-        let privateKeyString = String(decoding: privateKeyBytes, as: UTF8.self)
-        
-        let addressBytes = Data(address.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
-        let addressString = String(decoding: addressBytes, as: UTF8.self)
+
+        let privateKeyString = String(decoding: privateKey.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        let addressString = String(decoding: address.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+
+        // generatePrivPubKeypair ignores a failed key generation and returns
+        // success anyway; only hand out a pair that provably belongs together.
+        guard verify(privateKeyWIF: privateKeyString, address: addressString, network: network) else {
+            throw DogecoinError.keyGenerationFailed
+        }
 
         return KeyPair(
             privateKeyWIF: privateKeyString,
@@ -49,6 +53,8 @@ public struct KeyPair: Sendable, Equatable, Hashable {
     ///   - network: The network to verify against
     /// - Returns: `true` if the key pair is valid and matches
     public static func verify(privateKeyWIF: String, address: String, network: DogecoinNetwork = .mainnet) -> Bool {
+        guard isValidPrivateKey(privateKeyWIF, network: network) else { return false }
+
         ECC.armCurrentThread()
         var privKey = Array(privateKeyWIF.utf8CString)
         var addr = Array(address.utf8CString)
@@ -69,6 +75,13 @@ public struct KeyPair: Sendable, Equatable, Hashable {
     /// - Throws: `DogecoinError.invalidPrivateKey` if the private key is invalid
     public static func publicKeyHex(from privateKeyWIF: String, network: DogecoinNetwork = .mainnet) async throws -> String {
         try await Dogecoin.ensureInitialized()
+
+        // libdogecoin derives the public key without checking the secret and
+        // aborts the process when it is out of range.
+        guard isValidPrivateKey(privateKeyWIF, network: network) else {
+            throw DogecoinError.invalidPrivateKey
+        }
+
         ECC.armCurrentThread()
 
         var privKey = Array(privateKeyWIF.utf8CString)
@@ -85,6 +98,44 @@ public struct KeyPair: Sendable, Equatable, Hashable {
 
         let bytes = Data(pubKeyHex.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) })
         return String(decoding: bytes, as: UTF8.self)
+    }
+}
+
+// MARK: - Private Key Validation
+
+extension KeyPair {
+    /// WIF prefixes (from Dogecoin chainparams)
+    private static let mainnetSecretKeyPrefix: UInt8 = 0x9E
+    private static let testnetSecretKeyPrefix: UInt8 = 0xF1
+
+    /// The network a WIF private key belongs to, or `nil` unless libdogecoin
+    /// can safely use it: valid Base58Check, a Dogecoin secret-key prefix, a
+    /// 32-byte key (optionally flagged compressed), and a scalar inside the
+    /// curve order.
+    ///
+    /// libdogecoin accepts any WIF that decodes and aborts the process on an
+    /// out-of-range key, so every entry point taking a WIF checks this first.
+    static func network(ofPrivateKey wif: String) -> DogecoinNetwork? {
+        guard var payload = Base58Check.decode(wif) else { return nil }
+        defer { payload.resetBytes(in: payload.startIndex..<payload.endIndex) }
+
+        let network: DogecoinNetwork
+        switch payload.first {
+        case mainnetSecretKeyPrefix: network = .mainnet
+        case testnetSecretKeyPrefix: network = .testnet
+        default: return nil
+        }
+
+        guard payload.count == 33 || (payload.count == 34 && payload.last == 0x01),
+              ECC.isValidPrivateKey(payload[1..<33]) else {
+            return nil
+        }
+        return network
+    }
+
+    /// Whether `wif` is a usable private key on `network`.
+    static func isValidPrivateKey(_ wif: String, network: DogecoinNetwork) -> Bool {
+        self.network(ofPrivateKey: wif) == network
     }
 }
 
