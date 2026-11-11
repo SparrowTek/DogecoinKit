@@ -5,6 +5,9 @@ import DogecoinKitShims
 // MARK: - BIP39 Mnemonic Validation
 
 /// Validates a mnemonic phrase using full BIP39 checksum validation via libdogecoin
+///
+/// Exact: the words must be lowercase and separated by single spaces, the
+/// form ``normalizedMnemonic(_:)`` produces.
 /// - Parameters:
 ///   - mnemonic: The mnemonic phrase to validate
 ///   - language: ISO 639-2 language code (default: "eng" for English)
@@ -21,50 +24,47 @@ public func verifyMnemonic(_ mnemonic: String, language: String = "eng") -> Bool
     return result == 0
 }
 
+/// A mnemonic phrase the way BIP39 writes it: lowercase words separated by
+/// single spaces.
+///
+/// A phrase typed with capitals, extra spaces, or line breaks is the same
+/// phrase; a wallet seed, though, is derived from the exact text. Normalizing
+/// first makes every spelling of a phrase open the same wallet.
+public func normalizedMnemonic(_ mnemonic: String) -> String {
+    mnemonicWords(mnemonic).joined(separator: " ")
+}
+
+private func mnemonicWords(_ mnemonic: String) -> [String] {
+    mnemonic.lowercased().split(whereSeparator: \.isWhitespace).map(String.init)
+}
+
 // MARK: - BIP39 Wordlist
 
 /// The number of words in the BIP39 English wordlist
 public let bip39WordCount = 2048
 
 private enum BIP39Wordlist {
-    static let english: [String] = loadWordlist()
-    static let englishIndex: [String: Int] = {
-        var index: [String: Int] = [:]
-        index.reserveCapacity(english.count)
-        for (offset, word) in english.enumerated() {
-            index[word] = offset
-        }
-        return index
-    }()
-
     /// libdogecoin's compiled-in list — the same one `verifyMnemonic` checks
     /// against — so no resource bundle is needed on any platform.
-    private static func loadWordlist() -> [String] {
-        let words = (0..<Int32(bip39WordCount)).compactMap { index in
-            dogecoinkit_bip39_english_word(index).map { String(cString: $0) }
-        }
-        return words.count == bip39WordCount ? words : []
+    static let english: [String] = (0..<Int32(bip39WordCount)).compactMap { index in
+        dogecoinkit_bip39_english_word(index).map { String(cString: $0) }
     }
+
+    static let englishIndex: [String: Int] = Dictionary(
+        english.enumerated().map { ($0.element, $0.offset) },
+        uniquingKeysWith: { first, _ in first }
+    )
 }
 
-/// Checks if a word is in the BIP39 wordlist (falls back to basic criteria if unavailable)
-/// For full validation, use verifyMnemonic() on the complete phrase
-/// - Parameter word: The word to validate
-/// - Returns: true if the word meets basic BIP39 criteria
+/// Checks if a word is in the BIP39 wordlist
+///
+/// For full validation, use ``verifyMnemonic(_:language:)`` or
+/// ``validateMnemonicDetailed(_:)`` on the complete phrase.
+/// - Parameter word: The word to validate; case and surrounding whitespace
+///   are ignored
+/// - Returns: true if the word is one of the 2048
 public func isValidBIP39Word(_ word: String) -> Bool {
-    let normalized = word.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !normalized.isEmpty else { return false }
-
-    if !BIP39Wordlist.englishIndex.isEmpty {
-        return BIP39Wordlist.englishIndex[normalized] != nil
-    }
-
-    // BIP39 words are 3-8 characters, lowercase letters only
-    guard normalized.count >= 3, normalized.count <= 8 else { return false }
-
-    // Must be all lowercase letters
-    let letters = CharacterSet.lowercaseLetters
-    return normalized.unicodeScalars.allSatisfy { letters.contains($0) }
+    BIP39Wordlist.englishIndex[word.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)] != nil
 }
 
 /// Returns the BIP39 English wordlist
@@ -79,37 +79,7 @@ public func bip39WordsMatching(prefix: String, limit: Int = 5) -> [String] {
     let normalized = prefix.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
     guard !normalized.isEmpty, limit > 0 else { return [] }
 
-    let words = BIP39Wordlist.english
-    guard !words.isEmpty else { return [] }
-
-    var matches: [String] = []
-    matches.reserveCapacity(min(limit, words.count))
-    for word in words where word.hasPrefix(normalized) {
-        matches.append(word)
-        if matches.count >= limit {
-            break
-        }
-    }
-    return matches
-}
-
-/// Returns the index of a BIP39 word in the wordlist
-/// - Returns: The word's index, or nil if not found
-public func bip39WordIndex(_ word: String) -> Int? {
-    let normalized = word.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !normalized.isEmpty else { return nil }
-
-    let index = BIP39Wordlist.englishIndex
-    guard !index.isEmpty else { return nil }
-    return index[normalized]
-}
-
-/// Returns the BIP39 word at a specific index
-/// - Returns: The word at the index, or nil if out of range
-public func bip39Word(at index: Int) -> String? {
-    let words = BIP39Wordlist.english
-    guard index >= 0, index < words.count else { return nil }
-    return words[index]
+    return Array(BIP39Wordlist.english.lazy.filter { $0.hasPrefix(normalized) }.prefix(limit))
 }
 
 // MARK: - Mnemonic Validation Result
@@ -134,6 +104,10 @@ public struct MnemonicValidationResult: Sendable {
     public var allWordsValid: Bool {
         invalidWordIndices.isEmpty
     }
+
+    fileprivate static func invalid(_ error: MnemonicValidationError, words: [Int] = []) -> MnemonicValidationResult {
+        MnemonicValidationResult(isValid: false, invalidWordIndices: words, error: error)
+    }
 }
 
 /// Errors that can occur during mnemonic validation
@@ -142,82 +116,36 @@ public enum MnemonicValidationError: Error, Sendable, Equatable {
     case invalidWordCount
     case invalidWords([Int])
     case invalidChecksum
-    /// The BIP39 wordlist could not be loaded. Kept for source
-    /// compatibility; the list is compiled in, so this no longer occurs.
-    case wordlistUnavailable
 }
 
 /// Validates a mnemonic phrase and returns detailed results
+///
+/// The phrase is judged as ``normalizedMnemonic(_:)`` writes it, so capitals,
+/// repeated spaces, and line breaks are not errors: a phrase that is valid
+/// here is one ``HDWallet/init(mnemonic:passphrase:network:)`` accepts.
 /// - Parameter mnemonic: The mnemonic phrase to validate
 /// - Returns: A detailed validation result
 public func validateMnemonicDetailed(_ mnemonic: String) -> MnemonicValidationResult {
-    let trimmed = mnemonic.trimmingCharacters(in: .whitespacesAndNewlines)
+    let words = mnemonicWords(mnemonic)
 
-    guard !trimmed.isEmpty else {
-        return MnemonicValidationResult(
-            isValid: false,
-            invalidWordIndices: [],
-            error: .emptyMnemonic
-        )
+    guard !words.isEmpty else {
+        return .invalid(.emptyMnemonic)
     }
 
-    let words = trimmed.split(separator: " ").map(String.init)
-    let validCounts = [12, 15, 18, 21, 24]
-
-    guard validCounts.contains(words.count) else {
-        return MnemonicValidationResult(
-            isValid: false,
-            invalidWordIndices: [],
-            error: .invalidWordCount
-        )
+    guard MnemonicStrength.allCases.contains(where: { $0.wordCount == words.count }) else {
+        return .invalid(.invalidWordCount)
     }
 
-    // If the wordlist is missing, we can only partially validate
-    // (libdogecoin's checksum check still works), but we cannot identify
-    // specific bad words, which would otherwise appear to the user as an
-    // indistinguishable "bad checksum." Surface this case distinctly.
-    let wordlistIndex = BIP39Wordlist.englishIndex
-    guard !wordlistIndex.isEmpty else {
-        return MnemonicValidationResult(
-            isValid: false,
-            invalidWordIndices: [],
-            error: .wordlistUnavailable
-        )
+    // Naming the words that are not in the list tells the user exactly what
+    // to retype; a checksum failure only says that something is wrong.
+    let invalidIndices = words.indices.filter { BIP39Wordlist.englishIndex[words[$0]] == nil }
+    guard invalidIndices.isEmpty else {
+        return .invalid(.invalidWords(invalidIndices), words: invalidIndices)
     }
 
-    // Identify any words that aren't in the BIP39 wordlist. This is a stronger
-    // signal than a checksum failure for the user — they can see exactly which
-    // word to retype.
-    var invalidIndices: [Int] = []
-    for (offset, word) in words.enumerated() {
-        let normalized = word.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        if wordlistIndex[normalized] == nil {
-            invalidIndices.append(offset)
-        }
+    guard verifyMnemonic(words.joined(separator: " ")) else {
+        return .invalid(.invalidChecksum)
     }
 
-    if !invalidIndices.isEmpty {
-        return MnemonicValidationResult(
-            isValid: false,
-            invalidWordIndices: invalidIndices,
-            error: .invalidWords(invalidIndices)
-        )
-    }
-
-    // All words are valid BIP39 words — remaining failure must be the checksum.
-    let isValid = verifyMnemonic(trimmed)
-
-    if !isValid {
-        return MnemonicValidationResult(
-            isValid: false,
-            invalidWordIndices: [],
-            error: .invalidChecksum
-        )
-    }
-
-    return MnemonicValidationResult(
-        isValid: true,
-        invalidWordIndices: [],
-        error: nil
-    )
+    return MnemonicValidationResult(isValid: true, invalidWordIndices: [], error: nil)
 }

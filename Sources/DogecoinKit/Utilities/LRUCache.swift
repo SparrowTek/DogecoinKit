@@ -9,7 +9,7 @@ import Foundation
 ///
 /// This type is not thread-safe on its own. It is intended to be owned
 /// by an actor which provides isolation.
-public final class LRUCache<Key: Hashable, Value> {
+final class LRUCache<Key: Hashable, Value> {
     private struct Entry {
         var key: Key
         var value: Value
@@ -28,7 +28,7 @@ public final class LRUCache<Key: Hashable, Value> {
 
     /// Create a new LRU cache with the specified capacity
     /// - Parameter capacity: Maximum number of items to store (at least 1)
-    public init(capacity: Int) {
+    init(capacity: Int) {
         self.capacity = max(1, capacity)
     }
 
@@ -37,7 +37,7 @@ public final class LRUCache<Key: Hashable, Value> {
     /// If the key exists, the item is moved to the most recently used position.
     /// - Parameter key: The key to look up
     /// - Returns: The value if found, nil otherwise
-    public func get(_ key: Key) -> Value? {
+    func get(_ key: Key) -> Value? {
         guard let index = slots[key] else { return nil }
         moveToNewest(index)
         return entries[index].value
@@ -51,7 +51,7 @@ public final class LRUCache<Key: Hashable, Value> {
     /// - Parameters:
     ///   - key: The key to store
     ///   - value: The value to store
-    public func set(_ key: Key, _ value: Value) {
+    func set(_ key: Key, _ value: Value) {
         if let index = slots[key] {
             entries[index].value = value
             moveToNewest(index)
@@ -82,7 +82,7 @@ public final class LRUCache<Key: Hashable, Value> {
     /// - Parameter key: The key to remove
     /// - Returns: The removed value if it existed, nil otherwise
     @discardableResult
-    public func remove(_ key: Key) -> Value? {
+    func remove(_ key: Key) -> Value? {
         guard let index = slots.removeValue(forKey: key) else { return nil }
         unlink(index)
         freeSlots.append(index)
@@ -90,7 +90,7 @@ public final class LRUCache<Key: Hashable, Value> {
     }
 
     /// Remove all items from the cache
-    public func clear() {
+    func clear() {
         entries.removeAll()
         slots.removeAll()
         freeSlots.removeAll()
@@ -101,22 +101,22 @@ public final class LRUCache<Key: Hashable, Value> {
     /// Check if a key exists in the cache without affecting LRU order
     /// - Parameter key: The key to check
     /// - Returns: true if the key exists
-    public func contains(_ key: Key) -> Bool {
+    func contains(_ key: Key) -> Bool {
         slots[key] != nil
     }
 
     /// Current number of items in the cache
-    public var count: Int {
+    var count: Int {
         slots.count
     }
 
     /// Whether the cache is empty
-    public var isEmpty: Bool {
+    var isEmpty: Bool {
         slots.isEmpty
     }
 
     /// The maximum capacity of the cache
-    public var maxCapacity: Int {
+    var maxCapacity: Int {
         capacity
     }
 

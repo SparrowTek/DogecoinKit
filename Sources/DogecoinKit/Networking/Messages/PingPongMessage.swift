@@ -37,11 +37,6 @@ public struct PongMessage: Sendable {
         self.nonce = nonce
     }
 
-    /// Create from a ping message
-    public init(ping: PingMessage) {
-        self.nonce = ping.nonce
-    }
-
     /// Serialize to Data
     public func serialize() -> Data {
         var data = Data()
@@ -56,20 +51,5 @@ public struct PongMessage: Sendable {
         guard let nonceRaw: UInt64 = data.readInteger(at: 0) else { return nil }
         let nonce = UInt64(littleEndian: nonceRaw)
         return PongMessage(nonce: nonce)
-    }
-}
-
-/// Verack message (acknowledgement of version)
-public struct VerackMessage: Sendable {
-    public init() {}
-
-    /// Serialize to Data (empty payload)
-    public func serialize() -> Data {
-        Data()
-    }
-
-    /// Parse from Data
-    public static func parse(from data: Data) -> VerackMessage? {
-        VerackMessage()
     }
 }

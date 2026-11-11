@@ -96,47 +96,65 @@ public extension ProtocolMessage {
     }
 
     static func parseDetailed(from buffer: Data) -> ParseOutcome {
-        let data = buffer.rebased
-        guard data.count >= NetworkConstants.headerSize else {
+        switch frame(in: buffer, at: 0) {
+        case .message(let message, let length):
+            return .message(message, Data(buffer.dropFirst(length)))
+        case .incomplete:
+            return .incomplete
+        case .invalid(let error):
+            return .invalid(error)
+        }
+    }
+
+    /// What stands at one position of a receive buffer
+    internal enum Frame: Sendable {
+        /// A whole message, and the number of bytes it occupies
+        case message(ProtocolMessage, length: Int)
+        case incomplete
+        case invalid(ParseError)
+    }
+
+    /// Reads the message that starts `offset` bytes into `buffer`.
+    ///
+    /// Only the message's own payload is copied. A connection that receives
+    /// many messages in one read steps through its buffer with this, rather
+    /// than copying everything that follows each message in turn.
+    internal static func frame(in buffer: Data, at offset: Int) -> Frame {
+        guard offset >= 0, buffer.count - offset >= NetworkConstants.headerSize else {
             return .incomplete
         }
 
-        guard let magicRaw: UInt32 = data.readInteger(at: 0) else { return .invalid(.invalidPayloadLength) }
-        let magic = UInt32(littleEndian: magicRaw)
+        guard let magicRaw: UInt32 = buffer.readInteger(at: offset),
+              let commandBytes = buffer.bytes(at: offset + 4, count: NetworkConstants.commandLength),
+              let lengthRaw: UInt32 = buffer.readInteger(at: offset + 16),
+              let checksum = buffer.bytes(at: offset + 20, count: 4) else {
+            return .invalid(.invalidPayloadLength)
+        }
 
-        let commandBytes = [UInt8](data[4..<16])
-        let commandResult = parseCommand(from: commandBytes)
-        if case .failure(let error) = commandResult {
+        let command: String
+        switch parseCommand(from: [UInt8](commandBytes)) {
+        case .success(let parsed):
+            command = parsed
+        case .failure(let error):
             return .invalid(error)
         }
 
-        guard let lengthRaw: UInt32 = data.readInteger(at: 16) else { return .invalid(.invalidPayloadLength) }
         let length = UInt32(littleEndian: lengthRaw)
-
         guard length <= NetworkConstants.maxPayloadSize else {
             return .invalid(.invalidPayloadLength)
         }
 
         let totalSize = NetworkConstants.headerSize + Int(length)
-        guard data.count >= totalSize else {
+        guard let payload = buffer.bytes(at: offset + NetworkConstants.headerSize, count: Int(length)) else {
             return .incomplete
         }
 
-        let checksum = Data(data[20..<24])
-        let payload = Data(data[NetworkConstants.headerSize..<totalSize])
-
-        let computedChecksum = computeChecksum(payload)
-        guard checksum == computedChecksum else {
+        guard checksum == computeChecksum(payload) else {
             return .invalid(.invalidChecksum)
         }
 
-        guard case .success(let command) = commandResult else {
-            return .invalid(.invalidCommand)
-        }
-        let message = ProtocolMessage(magic: magic, command: command, payload: payload)
-        let remaining = Data(data[totalSize...])
-
-        return .message(message, remaining)
+        let message = ProtocolMessage(magic: UInt32(littleEndian: magicRaw), command: command, payload: payload)
+        return .message(message, length: totalSize)
     }
 
     static func isValidCommand(_ command: String) -> Bool {
@@ -182,24 +200,16 @@ public extension ProtocolMessage {
         public static let pong = "pong"
         public static let inv = "inv"
         public static let getdata = "getdata"
-        public static let getblocks = "getblocks"
+        public static let notfound = "notfound"
         public static let getheaders = "getheaders"
         public static let headers = "headers"
-        public static let block = "block"
         public static let tx = "tx"
         public static let addr = "addr"
         public static let getaddr = "getaddr"
         public static let merkleblock = "merkleblock"
         public static let filterload = "filterload"
         public static let filteradd = "filteradd"
-        public static let filterclear = "filterclear"
         public static let reject = "reject"
-        public static let sendheaders = "sendheaders"
-        public static let feefilter = "feefilter"
-        public static let sendcmpct = "sendcmpct"
-        public static let cmpctblock = "cmpctblock"
-        public static let getblocktxn = "getblocktxn"
-        public static let blocktxn = "blocktxn"
     }
 }
 

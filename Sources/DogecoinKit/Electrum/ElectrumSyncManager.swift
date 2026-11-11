@@ -3,21 +3,48 @@ import Foundation
 import os.log
 #endif
 
+/// Delegate for Electrum sync events
+///
+/// Calls arrive one at a time, in the order things happened. None begins
+/// after ``ElectrumSyncManager/stop()`` has returned.
+public protocol ElectrumSyncDelegate: AnyObject, Sendable {
+    /// The manager is connected — for the first time, or again after a
+    /// drop, in which case every address it was watching is being watched
+    /// again. Whatever may have changed while it was not connected should
+    /// be fetched now.
+    func electrumSyncDidConnect(_ manager: ElectrumSyncManager) async
+
+    /// The chain's tip is at `height`: reported on connecting, and for
+    /// every block after.
+    func electrumSync(_ manager: ElectrumSyncManager, didReachHeight height: Int32) async
+
+    /// Something changed at `address` — a transaction arrived, confirmed,
+    /// or was dropped. Its balance, outputs, and history should be fetched
+    /// again.
+    ///
+    /// Also reported for an address whose history turns out to have changed
+    /// while the manager was reconnecting.
+    func electrumSync(_ manager: ElectrumSyncManager, didObserveActivityAt address: String) async
+}
+
+public extension ElectrumSyncDelegate {
+    func electrumSync(_ manager: ElectrumSyncManager, didReachHeight height: Int32) async {}
+}
+
 public actor ElectrumSyncManager {
 
     // MARK: - Public Properties
 
     public nonisolated let network: DogecoinNetwork
-    public weak var delegate: (any BlockchainSyncDelegate)?
+    public weak var delegate: (any ElectrumSyncDelegate)?
 
     /// Set the delegate
-    public func setDelegate(_ delegate: (any BlockchainSyncDelegate)?) {
+    public func setDelegate(_ delegate: (any ElectrumSyncDelegate)?) {
         self.delegate = delegate
     }
 
     public private(set) var state: ElectrumSyncState = .disconnected
     public private(set) var currentHeight: Int32 = 0
-    public private(set) var progress: Double = 0
     public private(set) var connectedServer: ElectrumServer?
 
     // MARK: - Private State
@@ -25,6 +52,11 @@ public actor ElectrumSyncManager {
     private var client: ElectrumClient?
     private var addressSubscriptions: Set<String> = []
     private var isRunning = false
+
+    /// The last status the server gave for each subscribed address: a
+    /// digest of its history, empty for an address without one. An address
+    /// whose status differs after a reconnect saw activity in between.
+    private var addressStatuses: [String: String] = [:]
 
     /// Bumped by `start()` and `stop()`. Connection work begun in an earlier
     /// session never installs its client or reports failure.
@@ -47,6 +79,9 @@ public actor ElectrumSyncManager {
     /// wallets with thousands of UTXOs, whose first check servers throttle.
     private let verifiedOutputs = LRUCache<Outpoint, RawTransaction.Output>(capacity: 8192)
 
+    /// When blocks were mined, by height
+    private let blockTimes = LRUCache<Int, Date>(capacity: 1024)
+
     /// Where the next connection attempt starts in `serverList`. It moves
     /// past a server whose connection was lost or that would not take the
     /// subscriptions back, so one that accepts connections but does not
@@ -54,25 +89,51 @@ public actor ElectrumSyncManager {
     private var nextServerIndex = 0
 
     private enum DelegateEvent: Sendable {
-        case progress(Double, height: Int32)
-        case completed
-        case failed(any Error)
-        case transaction(txid: String, confirmations: Int)
+        case connected
+        case height(Int32)
+        case activity(address: String)
     }
 
-    private lazy var delegateEvents = SerialEventQueue<DelegateEvent> { [weak self] event in
-        guard let self, let delegate = await self.delegate else { return }
-        switch event {
-        case .progress(let progress, let height):
-            await delegate.syncManager(self, progressUpdated: progress, height: height)
-        case .completed:
-            await delegate.syncManagerDidComplete(self)
-        case .failed(let error):
-            await delegate.syncManager(self, didEncounterError: error)
-        case .transaction(let txid, let confirmations):
-            await delegate.syncManager(self, didUpdateTransaction: txid, confirmations: confirmations)
+    private lazy var delegateEvents = SerialEventQueue<(event: DelegateEvent, session: Int)> { [weak self] item in
+        guard let self, let delegate = await self.delegate(during: item.session) else { return }
+        switch item.event {
+        case .connected:
+            await delegate.electrumSyncDidConnect(self)
+        case .height(let height):
+            await delegate.electrumSync(self, didReachHeight: height)
+        case .activity(let address):
+            await delegate.electrumSync(self, didObserveActivityAt: address)
         }
     }
+
+    /// Queues `event` for the delegate.
+    private func report(_ event: DelegateEvent) {
+        delegateEvents.yield((event, session))
+    }
+
+    /// The delegate, for as long as `session` lasts. What was seen before a
+    /// `stop()` is not reported once it has returned.
+    private func delegate(during session: Int) -> (any ElectrumSyncDelegate)? {
+        session == self.session ? delegate : nil
+    }
+
+    // MARK: - Server Notifications
+
+    /// What a server pushes, and the connection it came over
+    private enum Notification: Sendable {
+        case header(height: Int32, source: ObjectIdentifier)
+        case addressStatus(address: String, status: String, source: ObjectIdentifier)
+        case disconnected(source: ObjectIdentifier)
+    }
+
+    /// Carries notifications from the client to this actor in the order
+    /// they arrived. A task for each would let a later block's height be
+    /// overtaken by an earlier one's.
+    private nonisolated let notifications: AsyncStream<Notification>.Continuation
+
+    /// The connection whose notifications count, while it is being set up
+    /// and before it is installed
+    private var connectingSource: ObjectIdentifier?
 
     // MARK: - Immutable
 
@@ -86,8 +147,11 @@ public actor ElectrumSyncManager {
     /// Longest pause between reconnect attempts
     private let maximumReconnectDelay: Duration = .seconds(60)
 
-    /// Funding transactions fetched at once when verifying UTXOs
-    private static let maximumConcurrentTransactionFetches = 8
+    /// Most requests one call keeps outstanding at a time. A wallet has
+    /// dozens of addresses and may have thousands of outputs; asked for all
+    /// at once, the last request would spend its whole timeout waiting its
+    /// turn at the server.
+    private static let maximumConcurrentRequests = 8
 
     private let logger = Logger(subsystem: "DogecoinKit", category: "electrum")
 
@@ -113,10 +177,25 @@ public actor ElectrumSyncManager {
         self.serverList = serverList
         self.streamFactory = streamFactory
         self.requestTimeout = requestTimeout
+
+        let (stream, continuation) = AsyncStream.makeStream(of: Notification.self)
+        self.notifications = continuation
+        Task { [weak self] in
+            for await notification in stream {
+                await self?.handle(notification)
+            }
+        }
+    }
+
+    deinit {
+        notifications.finish()
     }
 
     // MARK: - Public Methods
 
+    /// Connects to the first server that works.
+    /// - Throws: Whatever kept the last server tried from working. The
+    ///   manager is then not running; `start()` may be called again.
     public func start() async throws {
         guard !isRunning else {
             logger.debug("Already running, skipping start")
@@ -136,7 +215,6 @@ public actor ElectrumSyncManager {
             guard session == self.session else { throw error }
             isRunning = false
             state = .error(error.localizedDescription)
-            delegateEvents.yield(.failed(error))
             throw error
         }
     }
@@ -151,84 +229,27 @@ public actor ElectrumSyncManager {
 
         let existingClient = client
         client = nil
+        connectingSource = nil
         connectedServer = nil
         state = .disconnected
         addressSubscriptions.removeAll()
+        addressStatuses.removeAll()
 
         Task {
             await existingClient?.disconnect()
         }
     }
 
-    public func refreshBalance(for addresses: [String]) async throws -> Int64 {
-        logger.debug("Refreshing balance for \(addresses.count, privacy: .public) addresses")
-
-        // Pre-compute script hashes
-        let scriptHashes = try addresses.map { address in
-            (address: address, scriptHash: try ElectrumScriptHash(address: address, network: network))
-        }
-
-        // Fetch balances in parallel
-        let results = try await withClient { client in
-            try await withThrowingTaskGroup(of: (address: String, balance: ElectrumBalance).self) { group in
-                for item in scriptHashes {
-                    group.addTask {
-                        let balance = try await client.getBalance(scriptHash: item.scriptHash.scriptHash)
-                        return (address: item.address, balance: balance)
-                    }
-                }
-
-                var balances: [(address: String, balance: ElectrumBalance)] = []
-                for try await result in group {
-                    balances.append(result)
-                }
-                return balances
-            }
-        }
-
-        var totalBalance: Int64 = 0
-        var addressesWithBalance = 0
-
-        for result in results {
-            let balanceSum = result.balance.total
-            if balanceSum > 0 {
-                addressesWithBalance += 1
-                // Address hash (privacy: .private) keeps user addresses out of
-                // unredacted device logs — only visible when the log client is
-                // signed with the appropriate entitlement.
-                logger.debug("Balance at \(result.address, privacy: .private): \(balanceSum, privacy: .public) koinu")
-            }
-            // Server-supplied values: saturate rather than trap on overflow.
-            let (sum, overflow) = totalBalance.addingReportingOverflow(balanceSum)
-            totalBalance = overflow ? (balanceSum < 0 ? .min : .max) : sum
-        }
-
-        logger.info("Balance refresh complete — \(addressesWithBalance, privacy: .public)/\(addresses.count, privacy: .public) addresses funded, total \(totalBalance, privacy: .public) koinu")
-        return totalBalance
-    }
-
     public func fetchTransactionHistory(for addresses: [String]) async throws -> [ElectrumHistoryItem] {
         logger.debug("Fetching transaction history for \(addresses.count, privacy: .public) addresses")
 
-        // Pre-compute script hashes
         let scriptHashes = try addresses.map { address in
-            try ElectrumScriptHash(address: address, network: network)
+            try ElectrumScriptHash(address: address, network: network).scriptHash
         }
 
-        // Fetch history in parallel
         let results = try await withClient { client in
-            try await withThrowingTaskGroup(of: [ElectrumHistoryItem].self) { group in
-                for scriptHash in scriptHashes {
-                    group.addTask {
-                        try await client.getHistory(scriptHash: scriptHash.scriptHash)
-                    }
-                }
-
-                var allItems: [[ElectrumHistoryItem]] = []
-                for try await items in group {
-                    allItems.append(items)
-                }
-                return allItems
+            try await Self.concurrently(scriptHashes) { scriptHash in
+                try await client.getHistory(scriptHash: scriptHash)
             }
         }
 
@@ -252,38 +273,42 @@ public actor ElectrumSyncManager {
         }
     }
 
+    /// The unspent outputs of `addresses`, each checked against the
+    /// transaction that created it.
+    ///
+    /// The check proves that an output is what its transaction says. It
+    /// cannot prove the transaction is in the chain: that is taken on the
+    /// server's word, as everything in this mode is.
+    /// - Throws: `ElectrumError.invalidResponse` for an output the server
+    ///   misreported, or a set of them worth more than can exist
     public func fetchUTXOs(for addresses: [String]) async throws -> [(address: String, utxo: ElectrumUTXO)] {
         logger.debug("Fetching UTXOs for \(addresses.count, privacy: .public) addresses")
 
-        // Pre-compute script hashes
         let scriptHashes = try addresses.map { address in
-            (address: address, scriptHash: try ElectrumScriptHash(address: address, network: network))
+            (address: address, scriptHash: try ElectrumScriptHash(address: address, network: network).scriptHash)
         }
 
-        // Fetch UTXOs in parallel
         let results = try await withClient { client in
-            try await withThrowingTaskGroup(of: (address: String, utxos: [ElectrumUTXO]).self) { group in
-                for item in scriptHashes {
-                    group.addTask {
-                        let utxos = try await client.listUnspent(scriptHash: item.scriptHash.scriptHash)
-                        return (address: item.address, utxos: utxos)
-                    }
-                }
-
-                var allResults: [(address: String, utxos: [ElectrumUTXO])] = []
-                for try await result in group {
-                    allResults.append(result)
-                }
-                return allResults
+            try await Self.concurrently(scriptHashes) { item in
+                (address: item.address, utxos: try await client.listUnspent(scriptHash: item.scriptHash))
             }
         }
 
         var allUTXOs: [(address: String, utxo: ElectrumUTXO)] = []
+        var total: UInt64 = 0
 
         for result in results {
             for utxo in result.utxos {
                 logger.debug("UTXO at \(result.address, privacy: .private) — \(utxo.value, privacy: .public) koinu, height=\(utxo.height, privacy: .public)")
                 allUTXOs.append((address: result.address, utxo: utxo))
+
+                // Each value is within range; their sum has to be as well,
+                // or it would overflow what the wallet adds up.
+                let (sum, overflow) = total.addingReportingOverflow(UInt64(clamping: utxo.value))
+                guard !overflow, sum <= DogecoinAmount.maxMoney.koinu else {
+                    throw ElectrumError.invalidResponse("The server reported outputs worth more than can exist")
+                }
+                total = sum
             }
         }
 
@@ -309,9 +334,54 @@ public actor ElectrumSyncManager {
         return rawHex
     }
 
-    /// Broadcasts once and never retries: if the connection drops before the
-    /// reply, the transaction may or may not have reached the server, and the
-    /// caller is better placed to decide what to do about that.
+    /// Whether the server knows a transaction, in a block or waiting for one.
+    ///
+    /// This settles an ``ElectrumError/broadcastOutcomeUnknown(txid:)``. A
+    /// transaction can take a few seconds to reach a server other than the
+    /// one it was sent to, so "no" right after a broadcast is not yet final.
+    /// - Returns: `false` only when the server says it has no such
+    ///   transaction
+    /// - Throws: If the server cannot be asked, or answers with anything
+    ///   else — being busy, say. That it failed to answer is not an answer.
+    public func isTransactionKnown(txid: String) async throws -> Bool {
+        do {
+            _ = try await getTransaction(txid: txid)
+            return true
+        } catch ElectrumError.requestFailed(_, let message) where Self.saysNoSuchTransaction(message) {
+            return false
+        }
+    }
+
+    /// Whether an error message is the node's "no such transaction".
+    ///
+    /// Electrum servers hand on what the Dogecoin node behind them said,
+    /// each in a wrapping of its own, so the node's wording is all there is
+    /// to go by: "No such mempool or blockchain transaction", or "No such
+    /// mempool transaction" from a node without a transaction index.
+    private static func saysNoSuchTransaction(_ message: String) -> Bool {
+        message.range(of: "No such mempool", options: .caseInsensitive) != nil
+    }
+
+    /// When the block at `height` was mined, by its own header.
+    public func blockTime(atHeight height: Int) async throws -> Date {
+        if let known = blockTimes.get(height) {
+            return known
+        }
+
+        let headerHex = try await withClient { client in
+            try await client.getBlockHeader(height: height)
+        }
+        // A merge-mined block's proof may follow its 80 bytes.
+        guard let header = Data(hexString: headerHex).flatMap({ BlockHeader.parse(from: $0.prefix(BlockHeader.size)) }) else {
+            throw ElectrumError.invalidResponse("Not a block header")
+        }
+
+        let time = Date(timeIntervalSince1970: TimeInterval(header.timestamp))
+        blockTimes.set(height, time)
+        return time
+    }
+
+    /// Broadcasts once and never retries.
     ///
     /// Cancelling the calling task does not abandon a broadcast under way.
     /// By then the transaction is with the server, and giving up could only
@@ -319,22 +389,40 @@ public actor ElectrumSyncManager {
     /// - Returns: The transaction's id, computed from the transaction
     ///   itself. A server decides whether to accept a transaction, not
     ///   what it is called.
+    /// - Throws: `ElectrumError.requestFailed` when the server refuses the
+    ///   transaction, and ``ElectrumError/broadcastOutcomeUnknown(txid:)``
+    ///   when the connection is lost before it answers — the transaction
+    ///   may then have been accepted. Any other error means it was never
+    ///   sent.
     public func broadcastTransaction(_ rawHex: String) async throws -> String {
-        let client = try await connectedClient()
-        let reported = try await Task {
-            try await client.broadcastTransaction(rawHex: rawHex)
-        }.value
-
-        guard let raw = Data(hexString: rawHex) else {
-            return reported
+        guard let transaction = RawTransaction(hex: rawHex) else {
+            throw ElectrumError.invalidResponse("Not a transaction")
         }
-        let txid = Data(MerkleTree.doubleSHA256(raw).reversed()).hexString
+        let txid = Data(transaction.txid.reversed()).hexString
+
+        let client = try await connectedClient()
+        let reported: String
+        do {
+            reported = try await Task {
+                try await client.broadcastTransaction(rawHex: rawHex)
+            }.value
+        } catch let error as ElectrumError where error.endedConnection {
+            logger.error("Connection lost while broadcasting \(txid, privacy: .public)")
+            throw ElectrumError.broadcastOutcomeUnknown(txid: txid)
+        }
+
         if reported.lowercased() != txid {
             logger.error("Server reported txid \(reported, privacy: .public) for transaction \(txid, privacy: .public)")
         }
         return txid
     }
 
+    /// Watches `addresses`. The delegate hears of activity at each from
+    /// then on — also of what happened while the manager was reconnecting.
+    ///
+    /// Subscribe before fetching an address's state: what changes between
+    /// the two is then reported, where the other way round it would be
+    /// missed.
     public func subscribeToAddresses(_ addresses: [String]) async throws {
         try await withClient { client in
             // Filter to only addresses not already subscribed
@@ -344,12 +432,6 @@ public actor ElectrumSyncManager {
             self.logger.debug("Subscribing to \(newAddresses.count, privacy: .public) new addresses")
             try await self.subscribe(newAddresses, on: client)
             self.logger.info("Subscribed to \(newAddresses.count, privacy: .public) addresses")
-        }
-    }
-
-    public func estimateFee(blocks: Int = 6) async throws -> Double {
-        try await withClient { client in
-            try await client.estimateFee(blocks: blocks)
         }
     }
 
@@ -366,8 +448,33 @@ public actor ElectrumSyncManager {
         } catch let error as ElectrumError where isRunning && error.endedConnection {
             logger.info("Connection lost mid-request; reconnecting and retrying once")
             // The client's own notice of the drop may not have arrived yet.
-            clientDidDisconnect(client)
+            clientDidDisconnect(ObjectIdentifier(client))
             return try await operation(try await connectedClient())
+        }
+    }
+
+    /// Runs `operation` for every item, a few at a time.
+    /// - Returns: The results, in no particular order
+    private static func concurrently<Item: Sendable, Output: Sendable>(
+        _ items: [Item],
+        _ operation: @escaping @Sendable (Item) async throws -> Output
+    ) async throws -> [Output] {
+        try await withThrowingTaskGroup(of: Output.self) { group in
+            var remaining = items.makeIterator()
+            for _ in 0..<maximumConcurrentRequests {
+                guard let item = remaining.next() else { break }
+                group.addTask { try await operation(item) }
+            }
+
+            var outputs: [Output] = []
+            outputs.reserveCapacity(items.count)
+            while let output = try await group.next() {
+                outputs.append(output)
+                if let item = remaining.next() {
+                    group.addTask { try await operation(item) }
+                }
+            }
+            return outputs
         }
     }
 
@@ -447,16 +554,21 @@ public actor ElectrumSyncManager {
             throw CancellationError()
         }
 
+        // Only now is the drop repaired. Ending the loop any earlier would
+        // leave a connection that refused the subscriptions with nothing
+        // to try the next server.
+        endReconnectLoop()
+
         // Lets the app catch up on anything it missed while disconnected.
-        delegateEvents.yield(.progress(progress, height: currentHeight))
-        delegateEvents.yield(.completed)
+        report(.height(currentHeight))
+        report(.connected)
     }
 
-    private func clientDidDisconnect(_ disconnected: ElectrumClient) {
-        guard isRunning, client === disconnected else { return }
+    private func clientDidDisconnect(_ source: ObjectIdentifier) {
+        guard isRunning, let client, ObjectIdentifier(client) == source else { return }
 
         logger.info("Lost connection to \(self.connectedServer?.host ?? "server", privacy: .public); reconnecting")
-        client = nil
+        self.client = nil
         connectedServer = nil
         state = .connecting
         tryNextServerFirst()
@@ -483,6 +595,15 @@ public actor ElectrumSyncManager {
                 delay = min(delay * 2, maximumDelay)
             }
         }
+    }
+
+    /// Ends the reconnect loop, if one is running. A loop is only good for
+    /// the drop it was started for: kept past a successful connection, it
+    /// would meet the next drop asleep, deep in its backoff.
+    private func endReconnectLoop() {
+        reconnectLoop?.cancel()
+        reconnectLoop = nil
+        reconnectLoopGeneration += 1
     }
 
     /// One pass of the reconnect loop.
@@ -543,17 +664,19 @@ public actor ElectrumSyncManager {
             logger.debug("Trying server \(offset + 1, privacy: .public)/\(self.serverList.count, privacy: .public): \(server.host, privacy: .public):\(server.port, privacy: .public)")
 
             let candidate = ElectrumClient(server: server, streamFactory: streamFactory, requestTimeout: requestTimeout)
+            let source = ObjectIdentifier(candidate)
             do {
                 try await connectWithTimeout(candidate)
+                try await verifyChain(of: candidate)
 
                 logger.info("Connected to \(server.host, privacy: .public), subscribing to headers")
-                let header = try await candidate.subscribeHeaders { [weak self] header in
-                    Task { await self?.handleHeaderUpdate(height: Int32(clamping: header.height)) }
+                connectingSource = source
+                let header = try await candidate.subscribeHeaders { [notifications] header in
+                    notifications.yield(.header(height: Int32(clamping: header.height), source: source))
                 }
 
-                await candidate.setDisconnectHandler { [weak self, weak candidate] in
-                    guard let candidate else { return }
-                    Task { await self?.clientDidDisconnect(candidate) }
+                await candidate.setDisconnectHandler { [notifications] in
+                    notifications.yield(.disconnected(source: source))
                 }
                 let isLive = await candidate.isConnected
 
@@ -568,19 +691,23 @@ public actor ElectrumSyncManager {
                 }
 
                 client = candidate
+                connectingSource = nil
                 connectedServer = server
                 nextServerIndex = index
-                currentHeight = Int32(clamping: header.height)
-                progress = 1.0
+                // A block announced while this was being set up is already
+                // counted.
+                currentHeight = max(currentHeight, Int32(clamping: header.height))
                 state = .connected
 
                 logger.info("Sync ready at \(server.host, privacy: .public) — current block height \(self.currentHeight, privacy: .public)")
                 return candidate
             } catch is CancellationError {
+                clearConnecting(source)
                 await candidate.disconnect()
                 throw CancellationError()
             } catch {
                 logger.error("Server \(server.host, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+                clearConnecting(source)
                 await candidate.disconnect()
                 lastError = error
             }
@@ -590,27 +717,84 @@ public actor ElectrumSyncManager {
         throw lastError ?? ElectrumError.noServersAvailable
     }
 
+    private func clearConnecting(_ source: ObjectIdentifier) {
+        if connectingSource == source {
+            connectingSource = nil
+        }
+    }
+
+    /// Refuses a server that says it indexes another chain — a Litecoin or
+    /// Bitcoin server reached by mistake answers every query, with nothing.
+    ///
+    /// A server that does not say is taken at its word: the query is one
+    /// servers may leave out.
+    private func verifyChain(of client: ElectrumClient) async throws {
+        let features: ElectrumServerFeatures
+        do {
+            features = try await client.serverFeatures()
+        } catch let error as ElectrumError where error.endedConnection {
+            throw error
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return
+        }
+
+        guard features.genesisHash.lowercased() == NetworkConstants.genesisHash(for: network) else {
+            throw ElectrumError.invalidResponse("The server is on another chain")
+        }
+    }
+
+    /// Subscribes `addresses` on `client` and records what state each is
+    /// in. An address already known in another state has seen activity
+    /// since: that is reported.
     private func subscribe(_ addresses: [String], on client: ElectrumClient) async throws {
         let scriptHashes = try addresses.map { address in
-            (address: address, scriptHash: try ElectrumScriptHash(address: address, network: network))
+            (address: address, scriptHash: try ElectrumScriptHash(address: address, network: network).scriptHash)
+        }
+        let source = ObjectIdentifier(client)
+
+        let statuses = try await Self.concurrently(scriptHashes) { [notifications] item in
+            // The handler lives as long as the client.
+            let status = try await client.subscribeScriptHash(item.scriptHash) { [notifications] status in
+                notifications.yield(.addressStatus(address: item.address, status: status, source: source))
+            }
+            return (address: item.address, status: status ?? "")
         }
 
-        try await withThrowingTaskGroup(of: String.self) { group in
-            for item in scriptHashes {
-                // Weak all the way down: the handler lives as long as the client.
-                group.addTask { [weak self] in
-                    _ = try await client.subscribeScriptHash(item.scriptHash.scriptHash) { [weak self] _ in
-                        Task { await self?.addressActivity(item.address) }
-                    }
-                    return item.address
-                }
+        for (address, status) in statuses {
+            addressSubscriptions.insert(address)
+            if let known = addressStatuses[address], known != status {
+                report(.activity(address: address))
+            }
+            addressStatuses[address] = status
+        }
+    }
+
+    // MARK: - Notifications
+
+    private func handle(_ notification: Notification) {
+        switch notification {
+        case .header(let height, let source):
+            guard isRunning, isLive(source) || connectingSource == source else { return }
+            currentHeight = height
+            // Reported once the connection it came over is the one in use.
+            if isLive(source) {
+                report(.height(height))
             }
 
-            // Collect subscribed addresses
-            for try await address in group {
-                addressSubscriptions.insert(address)
-            }
+        case .addressStatus(let address, let status, let source):
+            guard isRunning, isLive(source) else { return }
+            addressStatuses[address] = status
+            report(.activity(address: address))
+
+        case .disconnected(let source):
+            clientDidDisconnect(source)
         }
+    }
+
+    private func isLive(_ source: ObjectIdentifier) -> Bool {
+        client.map(ObjectIdentifier.init) == source
     }
 
     // MARK: - UTXO Verification
@@ -685,7 +869,7 @@ public actor ElectrumSyncManager {
 
             try await withThrowingTaskGroup(of: (txid: String, outputs: [RawTransaction.Output]).self) { group in
                 var remaining = cached.missingTxids.makeIterator()
-                for _ in 0..<Self.maximumConcurrentTransactionFetches {
+                for _ in 0..<Self.maximumConcurrentRequests {
                     guard let txid = remaining.next() else { break }
                     group.addTask { (txid, try await Self.verifiedOutputs(of: txid, from: client)) }
                 }
@@ -751,21 +935,6 @@ public actor ElectrumSyncManager {
         }
         return transaction.outputs
     }
-
-    /// Notify delegate of address activity
-    private func addressActivity(_ address: String) async {
-        guard let history = try? await fetchTransactionHistory(for: [address]),
-              let latest = history.first else {
-            return
-        }
-        delegateEvents.yield(.transaction(txid: latest.txHash, confirmations: latest.height > 0 ? 1 : 0))
-    }
-
-    private func handleHeaderUpdate(height: Int32) {
-        currentHeight = height
-        progress = 1.0
-        delegateEvents.yield(.progress(progress, height: height))
-    }
 }
 
 // MARK: - Sync State
@@ -774,32 +943,9 @@ public enum ElectrumSyncState: Sendable {
     case disconnected
     case connecting
     case connected
-    case syncing
     case error(String)
 
     public var isConnected: Bool {
-        switch self {
-        case .connected, .syncing:
-            return true
-        default:
-            return false
-        }
-    }
-}
-
-// MARK: - BlockchainSyncManager Conformance
-
-extension ElectrumSyncManager: BlockchainSyncManager {
-    public var syncState: SyncState {
-        switch state {
-        case .disconnected:
-            return .idle
-        case .connecting, .syncing:
-            return .syncing
-        case .connected:
-            return .completed
-        case .error:
-            return .failed
-        }
+        if case .connected = self { true } else { false }
     }
 }

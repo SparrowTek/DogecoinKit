@@ -99,5 +99,5 @@ connected device or emulator with every library it needs, and runs it:
 SWIFT=/path/to/swift-6.4.1-RELEASE/usr/bin/swift Scripts/test-android.sh arm64-v8a
 ```
 
-Set `DOGECOINKIT_LIVE_P2P=1` and `ELECTRUM_INTEGRATION_TESTS=1` to include the
+Set `DOGECOINKIT_LIVE_P2P=1` and `DOGECOINKIT_LIVE_ELECTRUM=1` to include the
 tests that sync headers from live peers and query live Electrum servers.

@@ -65,6 +65,26 @@ public enum Address {
         }
     }
 
+    /// The address an output script pays: the inverse of
+    /// ``scriptPubKey(for:)``.
+    /// - Parameters:
+    ///   - script: An output script
+    ///   - network: The network to write the address for
+    /// - Returns: The address, or `nil` for a script no address can name —
+    ///   anything but the exact P2PKH and P2SH forms
+    public static func fromScriptPubKey(_ script: Data, network: DogecoinNetwork = .mainnet) -> String? {
+        let script = [UInt8](script)
+        switch script.count {
+        case 25 where script.starts(with: [0x76, 0xa9, 0x14]) && script.suffix(2) == [0x88, 0xac]:
+            return p2pkhAddress(hash160: Data(script[3..<23]), network: network)
+        case 23 where script.starts(with: [0xa9, 0x14]) && script.last == 0x87:
+            let version = network == .mainnet ? mainnetP2SHVersion : testnetP2SHVersion
+            return Base58Check.encode(Data([version]) + script[2..<22])
+        default:
+            return nil
+        }
+    }
+
     /// Check if an address is a mainnet address
     /// - Parameter address: The address to check
     /// - Returns: `true` if the address is a mainnet address
@@ -130,8 +150,6 @@ public enum Address {
     /// - Throws: `DogecoinError.invalidPublicKey` if the hex is not a point
     ///   on secp256k1
     public static func fromPublicKey(_ publicKeyHex: String, network: DogecoinNetwork = .mainnet) async throws -> String {
-        try await Dogecoin.ensureInitialized()
-
         // Public keys often come from transactions anyone can craft; never
         // let an invalid one reach libdogecoin, which aborts on it.
         guard let publicKey = Data(hexString: publicKeyHex), ECC.isValidPublicKey(publicKey) else {
@@ -164,10 +182,10 @@ public enum Address {
     ///     25-byte P2PKH script that ``toPubkeyHash(_:)`` returns
     ///   - network: The network
     /// - Returns: The P2PKH address
-    /// - Throws: `DogecoinError.invalidPublicKey` if the hex is neither form
-    public static func fromPubkeyHash(_ pubkeyHash: String, network: DogecoinNetwork = .mainnet) async throws -> String {
+    /// - Throws: `DogecoinError.invalidAddress` if the hex is neither form
+    public static func fromPubkeyHash(_ pubkeyHash: String, network: DogecoinNetwork = .mainnet) throws -> String {
         guard let bytes = Data(hexString: pubkeyHash) else {
-            throw DogecoinError.invalidPublicKey
+            throw DogecoinError.invalidAddress(pubkeyHash)
         }
 
         switch bytes.count {
@@ -176,7 +194,7 @@ public enum Address {
         case 25 where bytes.starts(with: [0x76, 0xa9, 0x14]) && bytes.suffix(2).elementsEqual([0x88, 0xac]):
             return p2pkhAddress(hash160: bytes.subdata(in: 3..<23), network: network)
         default:
-            throw DogecoinError.invalidPublicKey
+            throw DogecoinError.invalidAddress(pubkeyHash)
         }
     }
 }
@@ -191,40 +209,30 @@ public struct DogecoinAddress: Sendable, Equatable, Hashable {
     /// The network this address belongs to
     public let network: DogecoinNetwork
 
+    /// The script kind the address encodes
+    public let kind: AddressKind
+
+    /// The output script that pays to the address
+    public let scriptPubKey: Data
+
     /// Create a validated address
     /// - Parameters:
     ///   - address: The address string
     ///   - network: Expected network (optional, will be detected if nil)
-    /// - Throws: `DogecoinError.invalidAddress` if the address is invalid
+    /// - Throws: `DogecoinError.invalidAddress` if the address is invalid or
+    ///   belongs to another network than the one expected
     public init(_ address: String, network: DogecoinNetwork? = nil) throws {
-        guard Address.isValid(address) else {
+        guard let kind = Address.kind(address),
+              let detectedNetwork = Address.detectNetwork(address),
+              let scriptPubKey = Address.scriptPubKey(for: address),
+              network == nil || network == detectedNetwork else {
             throw DogecoinError.invalidAddress(address)
         }
 
         self.value = address
-
-        if let network = network {
-            // Verify the network matches
-            let detectedNetwork = Address.detectNetwork(address)
-            guard detectedNetwork == network else {
-                throw DogecoinError.invalidAddress(address)
-            }
-            self.network = network
-        } else {
-            // Detect the network
-            guard let detectedNetwork = Address.detectNetwork(address) else {
-                throw DogecoinError.invalidAddress(address)
-            }
-            self.network = detectedNetwork
-        }
-    }
-
-    /// The P2PKH output script (`76a914<hash160>88ac`) as hex; throws
-    /// `DogecoinError.invalidAddress` for a P2SH address
-    public var pubkeyHash: String {
-        get throws {
-            try Address.toPubkeyHash(value)
-        }
+        self.network = detectedNetwork
+        self.kind = kind
+        self.scriptPubKey = scriptPubKey
     }
 }
 

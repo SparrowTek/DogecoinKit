@@ -2,32 +2,37 @@ import Foundation
 
 /// A decoded transaction, in legacy or BIP 144 witness serialization.
 ///
-/// Used to check what libdogecoin actually serialized before anything is
-/// signed, to read what a funding transaction really pays, and to decode the
-/// parent coinbase of merge-mined blocks — whose chain may use segregated
-/// witness even though Dogecoin does not.
-struct RawTransaction: Sendable, Equatable {
-    struct Input: Sendable, Equatable {
-        /// Previous transaction id in internal (little-endian) byte order
-        let previousTxid: Data
-        let previousIndex: UInt32
-        let script: Data
-        let sequence: UInt32
+/// The library uses it to check what libdogecoin actually serialized before
+/// anything is signed, to read what a funding transaction really pays, and
+/// to decode the parent coinbase of merge-mined blocks — whose chain may use
+/// segregated witness even though Dogecoin does not. A wallet uses it to
+/// read the transactions a server or a peer sends: nothing in them is
+/// trusted, and decoding one can only fail, never trap.
+public struct RawTransaction: Sendable, Equatable {
+    public struct Input: Sendable, Equatable {
+        /// The id of the transaction whose output is spent, in internal
+        /// byte order: reversed, it is the id as it is usually written
+        public let previousTxid: Data
+        public let previousIndex: UInt32
+        public let script: Data
+        public let sequence: UInt32
         /// Witness stack items; empty unless the transaction carries witness data
-        var witness: [Data] = []
+        public internal(set) var witness: [Data] = []
     }
 
-    struct Output: Sendable, Equatable {
-        let value: UInt64
-        let script: Data
+    public struct Output: Sendable, Equatable {
+        /// In koinu. Decoding does not bound it: a transaction that is not
+        /// known to be in a block can claim any amount.
+        public let value: UInt64
+        public let script: Data
     }
 
-    let version: Int32
-    let inputs: [Input]
-    let outputs: [Output]
-    let lockTime: UInt32
+    public let version: Int32
+    public let inputs: [Input]
+    public let outputs: [Output]
+    public let lockTime: UInt32
 
-    init?(hex: String) {
+    public init?(hex: String) {
         guard let data = Data(hexString: hex) else { return nil }
         self.init(data: data)
     }
@@ -36,13 +41,22 @@ struct RawTransaction: Sendable, Equatable {
     /// witness data allowed. Every count and length is bounded by the
     /// remaining bytes, so malformed input fails the decode instead of
     /// trapping or over-allocating, and trailing bytes are rejected.
-    init?(data: Data) {
-        var offset = 0
+    public init?(data: Data) {
+        guard let (transaction, end) = Self.decode(in: data, at: 0), end == data.count else { return nil }
+        self = transaction
+    }
+
+    /// Decodes the transaction that starts `offset` bytes into `data`, which
+    /// may hold more after it — as an AuxPoW proof does after its coinbase.
+    /// - Returns: The transaction and the offset just past it
+    static func decode(in data: Data, at start: Int) -> (transaction: RawTransaction, end: Int)? {
+        guard start >= 0 else { return nil }
+        var offset = start
 
         guard let version: Int32 = data.readInteger(at: offset) else { return nil }
         offset += 4
 
-        guard var inputs = Self.readInputs(from: data, at: &offset) else { return nil }
+        guard var inputs = readInputs(from: data, at: &offset) else { return nil }
         var outputs: [Output] = []
         var flags: UInt8 = 0
 
@@ -53,20 +67,20 @@ struct RawTransaction: Sendable, Equatable {
             offset += 1
 
             if flags != 0 {
-                guard let witnessInputs = Self.readInputs(from: data, at: &offset),
-                      let witnessOutputs = Self.readOutputs(from: data, at: &offset) else { return nil }
+                guard let witnessInputs = readInputs(from: data, at: &offset),
+                      let witnessOutputs = readOutputs(from: data, at: &offset) else { return nil }
                 inputs = witnessInputs
                 outputs = witnessOutputs
             }
         } else {
-            guard let legacyOutputs = Self.readOutputs(from: data, at: &offset) else { return nil }
+            guard let legacyOutputs = readOutputs(from: data, at: &offset) else { return nil }
             outputs = legacyOutputs
         }
 
         if flags & 1 == 1 {
             flags ^= 1
             for index in inputs.indices {
-                guard let witness = Self.readWitness(from: data, at: &offset) else { return nil }
+                guard let witness = readWitness(from: data, at: &offset) else { return nil }
                 inputs[index].witness = witness
             }
         }
@@ -77,16 +91,24 @@ struct RawTransaction: Sendable, Equatable {
         guard let lockTime: UInt32 = data.readInteger(at: offset) else { return nil }
         offset += 4
 
-        guard offset == data.count else { return nil }
+        let transaction = RawTransaction(
+            version: Int32(littleEndian: version),
+            inputs: inputs,
+            outputs: outputs,
+            lockTime: UInt32(littleEndian: lockTime)
+        )
+        return (transaction, offset)
+    }
 
-        self.version = Int32(littleEndian: version)
+    private init(version: Int32, inputs: [Input], outputs: [Output], lockTime: UInt32) {
+        self.version = version
         self.inputs = inputs
         self.outputs = outputs
-        self.lockTime = UInt32(littleEndian: lockTime)
+        self.lockTime = lockTime
     }
 
     /// Whether any input carries witness data. Dogecoin transactions never do.
-    var hasWitness: Bool {
+    public var hasWitness: Bool {
         inputs.contains { !$0.witness.isEmpty }
     }
 
@@ -117,7 +139,8 @@ struct RawTransaction: Sendable, Equatable {
 
     /// The transaction id in internal byte order: double SHA-256 of the
     /// serialization without witness data, as Core's `GetHash` computes it.
-    var txid: Data {
+    /// Reversed, it is the id as it is usually written.
+    public var txid: Data {
         MerkleTree.doubleSHA256(strippedData)
     }
 

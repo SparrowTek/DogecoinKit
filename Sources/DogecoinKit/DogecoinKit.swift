@@ -1,5 +1,6 @@
 import Foundation
 import clibdogecoin
+import DogecoinKitShims
 
 /// Arms libdogecoin's ECC state for the current thread.
 ///
@@ -15,21 +16,21 @@ import clibdogecoin
 enum ECC {
     private static let armedKey = "com.sparrowtek.DogecoinKit.eccArmed"
 
-    static func armCurrentThread() {
+    /// Gives the current thread its secp256k1 context, unless it has one.
+    /// - Throws: `DogecoinError.initializationFailed` if the context cannot
+    ///   be created or seeded. Nothing that needs it may be called then:
+    ///   libdogecoin would abort the process.
+    static func armCurrentThread() throws(DogecoinError) {
         let threadDictionary = Thread.current.threadDictionary
         guard threadDictionary[armedKey] == nil else { return }
-        dogecoin_ecc_start()
-        threadDictionary[armedKey] = true
-    }
 
-    /// Destroys the current thread's context and forgets that it was armed,
-    /// so a later `armCurrentThread()` on this thread creates a fresh one
-    /// rather than trusting a flag that points at a destroyed context.
-    static func disarmCurrentThread() {
-        let threadDictionary = Thread.current.threadDictionary
-        guard threadDictionary[armedKey] != nil else { return }
-        dogecoin_ecc_stop()
-        threadDictionary.removeObject(forKey: armedKey)
+        guard dogecoinkit_ecc_start() else {
+            // A context that was created but could not be seeded must not
+            // stay behind for the next attempt to replace and leak.
+            dogecoin_ecc_stop()
+            throw .initializationFailed
+        }
+        threadDictionary[armedKey] = true
     }
 
     // libdogecoin asserts — aborting the process — when handed a key that
@@ -39,8 +40,7 @@ enum ECC {
     /// Whether `publicKey` is a point on secp256k1, in compressed (33-byte)
     /// or uncompressed (65-byte) form.
     static func isValidPublicKey(_ publicKey: Data) -> Bool {
-        guard publicKey.count == 33 || publicKey.count == 65 else { return false }
-        armCurrentThread()
+        guard publicKey.count == 33 || publicKey.count == 65, (try? armCurrentThread()) != nil else { return false }
 
         var key = dogecoin_pubkey()
         key.compressed = publicKey.count == 33 ? 1 : 0
@@ -51,8 +51,7 @@ enum ECC {
     /// Whether `privateKey` is a usable secp256k1 secret: 32 bytes encoding
     /// a scalar between 1 and the curve order.
     static func isValidPrivateKey(_ privateKey: Data) -> Bool {
-        guard privateKey.count == 32 else { return false }
-        armCurrentThread()
+        guard privateKey.count == 32, (try? armCurrentThread()) != nil else { return false }
 
         var key = dogecoin_key()
         defer { dogecoin_privkey_cleanse(&key) }
@@ -62,56 +61,18 @@ enum ECC {
 }
 
 /// Main entry point for the Dogecoin library.
-/// Call `initialize()` before using any cryptographic functions.
 public enum Dogecoin {
 
-    private actor InitState {
-        var isInitialized = false
-
-        func initialize() {
-            guard !isInitialized else { return }
-            ECC.armCurrentThread()
-            isInitialized = true
-        }
-
-        func cleanup() {
-            guard isInitialized else { return }
-            // Contexts are per thread, so only the one this actor happens to
-            // run on can be torn down here. Other pool threads keep theirs —
-            // they are re-armed on demand and never left half-destroyed.
-            ECC.disarmCurrentThread()
-            isInitialized = false
-        }
-
-        var initialized: Bool { isInitialized }
-    }
-
-    private static let state = InitState()
-
-    /// Initialize the Dogecoin ECC context.
-    /// This must be called before using any cryptographic functions.
-    /// Safe to call multiple times - subsequent calls are no-ops.
-    public static func initialize() async {
-        await state.initialize()
-    }
-
-    /// Clean up the Dogecoin ECC context.
-    /// Call this when completely done with cryptographic operations.
-    /// After calling this, you must call `initialize()` again before using crypto functions.
-    public static func cleanup() async {
-        await state.cleanup()
-    }
-
-    /// Check if the library is initialized
-    public static var initialized: Bool {
-        get async { await state.initialized }
-    }
-
-    /// Ensure the library is initialized, throwing if not
-    internal static func ensureInitialized() async throws {
-        guard await state.initialized else {
-            throw DogecoinError.initializationFailed
-        }
+    /// Checks that the library's cryptography can start.
+    ///
+    /// Calling this is optional. Every operation prepares the thread it runs
+    /// on, so nothing has to be initialized first; calling it at launch only
+    /// surfaces a failure early. Operations that cannot prepare their thread
+    /// throw ``DogecoinError/initializationFailed``.
+    /// - Returns: Whether the secp256k1 context could be created
+    @discardableResult
+    public static func initialize() async -> Bool {
+        (try? ECC.armCurrentThread()) != nil
     }
 }
 

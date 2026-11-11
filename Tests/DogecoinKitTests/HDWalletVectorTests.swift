@@ -5,12 +5,9 @@ import clibdogecoin
 
 @Suite("HD Wallet Vectors")
 struct HDWalletVectorTests {
-    init() async {
-        await Dogecoin.initialize()
-    }
 
     @Test("Mnemonic seed with passphrase matches known vector")
-    func testSeedWithPassphraseVector() throws {
+    func seedWithPassphraseVector() throws {
         let mnemonic = "chief prevent advice search broccoli dish pride grow evidence bicycle cushion lady"
         let passphrase = "TREZOR"
         let expectedHex = "31113f96716b7d5b8d58a49c5e1f6d6300ff307b35eef3cecfdb97869e514ad330f0a7dcec4ed2feeebf8d2267ebfefeb149df84642ca091befd25ea15d36076"
@@ -30,7 +27,7 @@ struct HDWalletVectorTests {
     }
 
     @Test("HD wallet derived from mnemonic matches known vectors")
-    func testHDWalletVectors() async throws {
+    func hdWalletVectors() async throws {
         let mnemonic = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote"
 
         let testnetWallet = try await HDWallet(mnemonic: mnemonic, passphrase: "", network: .testnet)
@@ -45,7 +42,7 @@ struct HDWalletVectorTests {
     }
 
     @Test("Derived private keys match known vectors")
-    func testDerivedPrivateKeyVectors() async throws {
+    func derivedPrivateKeyVectors() async throws {
         let mnemonic = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote"
         let wallet = try await HDWallet(mnemonic: mnemonic, passphrase: "", network: .mainnet)
 

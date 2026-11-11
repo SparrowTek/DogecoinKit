@@ -11,9 +11,6 @@ import Testing
 /// than a rejected send.
 @Suite("P2SH Send Support")
 struct P2SHSendTests {
-    init() async {
-        await Dogecoin.initialize()
-    }
 
     /// Mainnet P2SH address for hash160(sha256("avocadoge-test")) — generated
     /// independently; its script hash in hex is fixed and known.
@@ -22,7 +19,7 @@ struct P2SHSendTests {
 
     @Test("Transaction to a mainnet P2SH address contains the P2SH output script")
     func p2shOutputIsBuilt() async throws {
-        let builder = try await TransactionBuilder()
+        let builder = TransactionBuilder()
         try await builder.addInput(txid: String(repeating: "ab", count: 32), vout: 0)
         try await builder.addOutput(address: mainnetP2SH, amount: DogecoinAmount(doge: 5))
 
@@ -36,12 +33,12 @@ struct P2SHSendTests {
 
     @Test("Adding an output for an address from the wrong alphabet fails loudly")
     func invalidOutputAddressThrows() async throws {
-        let builder = try await TransactionBuilder()
+        let builder = TransactionBuilder()
         try await builder.addInput(txid: String(repeating: "cd", count: 32), vout: 0)
 
         // Not valid base58check — with the honest return value this must
         // throw instead of silently building a transaction with no recipient.
-        await #expect(throws: DogecoinError.self) {
+        await #expect(throws: DogecoinError.addOutputFailed) {
             try await builder.addOutput(address: "notAnAddress0000", amount: DogecoinAmount(doge: 1))
         }
     }

@@ -21,13 +21,10 @@ private final class FreshThreadExecutor: TaskExecutor {
 @Suite("Transaction Builder Correctness")
 struct TransactionBuilderTests {
 
-    private let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+    private let mnemonic = testPhrase
     private let recipient = "DD8sGWjLS7KodzdhWFA63G2Ryn1Ku1qjQ5"
     private let p2shRecipient = "A9rmPAxPNGTojaWevb571EYNmCiRLpXzcM"
 
-    init() async {
-        await Dogecoin.initialize()
-    }
 
     private struct Keys {
         let address0: String
@@ -141,6 +138,105 @@ struct TransactionBuilderTests {
         ])
     }
 
+    // MARK: - Fees in the signed result
+
+    @Test("A fee below what nodes relay is raised in the signed transaction")
+    func signedTransactionPaysTheRaisedFee() async throws {
+        let keys = try await keys()
+        let signed = try await createTransaction(
+            inputs: [UTXO(txid: String(repeating: "12", count: 32), vout: 0, address: keys.address0, amount: DogecoinAmount(koinu: 1_000_000_000))],
+            outputs: [(address: recipient, amount: DogecoinAmount(koinu: 250_000_000))],
+            signingKeysByAddress: [keys.address0: keys.key0],
+            changeAddress: keys.change0,
+            fee: .zero
+        )
+
+        // One input, two outputs: 226 bytes at 0.001 DOGE per 1000.
+        #expect(signed.fee == DogecoinAmount(koinu: 22_600))
+
+        let decoded = try #require(RawTransaction(hex: signed.rawHex))
+        #expect(decoded.outputs == [
+            RawTransaction.Output(value: 250_000_000, script: try #require(Address.scriptPubKey(for: recipient))),
+            RawTransaction.Output(value: 1_000_000_000 - 250_000_000 - 22_600, script: try #require(Address.scriptPubKey(for: keys.change0)))
+        ])
+    }
+
+    @Test("Change below the soft dust limit is left out of the signed transaction")
+    func signedTransactionFoldsDustChange() async throws {
+        let keys = try await keys()
+        let signed = try await createTransaction(
+            inputs: [UTXO(txid: String(repeating: "13", count: 32), vout: 0, address: keys.address0, amount: DogecoinAmount(koinu: 300_000_000))],
+            outputs: [(address: recipient, amount: DogecoinAmount(koinu: 299_500_000))],
+            signingKeysByAddress: [keys.address0: keys.key0],
+            changeAddress: keys.change0,
+            fee: DogecoinAmount(koinu: 226_000)
+        )
+
+        #expect(signed.fee == DogecoinAmount(koinu: 500_000))
+
+        let decoded = try #require(RawTransaction(hex: signed.rawHex))
+        #expect(decoded.outputs == [
+            RawTransaction.Output(value: 299_500_000, script: try #require(Address.scriptPubKey(for: recipient)))
+        ])
+    }
+
+    @Test("A planned spend signs to no more bytes than its fee was estimated for")
+    func signedSizeStaysWithinTheEstimate() async throws {
+        let keys = try await keys()
+        let coins = [
+            UTXO(txid: String(repeating: "14", count: 32), vout: 0, address: keys.address0, amount: DogecoinAmount(koinu: 400_000_000), confirmations: 3),
+            UTXO(txid: String(repeating: "15", count: 32), vout: 1, address: keys.address1, amount: DogecoinAmount(koinu: 350_000_000), confirmations: 3),
+            UTXO(txid: String(repeating: "16", count: 32), vout: 2, address: keys.address0, amount: DogecoinAmount(koinu: 200_000_000), confirmations: 3)
+        ]
+        let payments = [DogecoinAmount(koinu: 800_000_000), DogecoinAmount(koinu: 100_000_000)]
+
+        let plan = try SpendPlan(paying: payments, from: coins)
+        let signed = try await createTransaction(
+            inputs: plan.inputs,
+            outputs: [(address: recipient, amount: payments[0]), (address: p2shRecipient, amount: payments[1])],
+            signingKeysByAddress: [keys.address0: keys.key0, keys.address1: keys.key1],
+            changeAddress: keys.change0,
+            fee: plan.fee
+        )
+
+        #expect(plan.inputs.count == 3)
+        #expect(signed.fee == plan.fee)
+
+        let decoded = try #require(RawTransaction(hex: signed.rawHex))
+        #expect(decoded.outputs.count == 3)
+        #expect(decoded.outputs.last?.value == plan.change.koinu)
+
+        // The fee rate actually paid is at least the one planned for.
+        let size = signed.rawHex.utf8.count / 2
+        #expect(size <= FeeEstimation.estimateTransactionSize(inputCount: 3, outputCount: 3))
+        #expect(plan.fee >= FeeEstimation.calculateFee(sizeBytes: size, feePerKB: FeeEstimation.standardFeePerKB))
+    }
+
+    @Test("A testnet transaction is signed with testnet keys and pays testnet scripts")
+    func testnetSigning() async throws {
+        let wallet = try await HDWallet(mnemonic: mnemonic, network: .testnet)
+        let source = try await wallet.deriveAddress(account: 0, index: 0)
+        let destination = try await wallet.deriveAddress(account: 0, index: 1)
+        let key = try await wallet.derivePrivateKey(account: 0, index: 0)
+        #expect(Address.detectNetwork(source) == .testnet)
+
+        let signed = try await createTransaction(
+            inputs: [UTXO(txid: String(repeating: "17", count: 32), vout: 0, address: source, amount: DogecoinAmount(koinu: 500_000_000))],
+            outputs: [(address: destination, amount: DogecoinAmount(koinu: 100_000_000))],
+            signingKeysByAddress: [source: key],
+            changeAddress: source,
+            fee: DogecoinAmount(koinu: 226_000)
+        )
+
+        let decoded = try #require(RawTransaction(hex: signed.rawHex))
+        #expect(decoded.inputs.count == 1)
+        #expect(decoded.inputs.first?.script.isEmpty == false)
+        #expect(decoded.outputs == [
+            RawTransaction.Output(value: 100_000_000, script: try #require(Address.scriptPubKey(for: destination))),
+            RawTransaction.Output(value: 500_000_000 - 100_000_000 - 226_000, script: try #require(Address.scriptPubKey(for: source)))
+        ])
+    }
+
     @available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *)
     @Test("Builder steps survive resuming on a different thread after every await")
     func builderSurvivesThreadHops() async throws {
@@ -149,11 +245,10 @@ struct TransactionBuilderTests {
         // Before the fix, libdogecoin's thread-local transaction table made
         // the second step fail (addInputFailed) as soon as the actor hopped.
         let rawHex = try await withTaskExecutorPreference(FreshThreadExecutor()) {
-            let builder = try await TransactionBuilder()
+            let builder = TransactionBuilder()
             try await builder.addInput(txid: String(repeating: "11", count: 32), vout: 0)
             try await builder.addOutput(address: recipient, amount: DogecoinAmount(koinu: 250_000_000))
             _ = try await builder.finalize(
-                destinationAddress: recipient,
                 fee: DogecoinAmount(koinu: 22_600_000),
                 totalAmount: DogecoinAmount(koinu: 1_000_000_000),
                 changeAddress: keys.change0
@@ -198,7 +293,7 @@ struct TransactionBuilderTests {
     @Test("A signing key that does not own the input is rejected before signing")
     func mismatchedSigningKeyRejected() async throws {
         let keys = try await keys()
-        await #expect(throws: DogecoinError.self) {
+        await #expect(throws: DogecoinError.transactionValidationFailed("Signing key does not match address \(keys.address0)")) {
             _ = try await createTransaction(
                 inputs: [UTXO(txid: String(repeating: "66", count: 32), vout: 0, address: keys.address0, amount: DogecoinAmount(koinu: 500_000_000))],
                 outputs: [(address: recipient, amount: DogecoinAmount(koinu: 100_000_000))],
@@ -213,7 +308,7 @@ struct TransactionBuilderTests {
     func duplicateInputRejected() async throws {
         let keys = try await keys()
         let utxo = UTXO(txid: String(repeating: "77", count: 32), vout: 1, address: keys.address0, amount: DogecoinAmount(koinu: 500_000_000))
-        #expect(throws: DogecoinError.self) {
+        #expect(throws: DogecoinError.transactionValidationFailed("Transaction spends the same output twice")) {
             _ = try planTransaction(
                 inputs: [utxo, utxo],
                 outputs: [(address: recipient, amount: DogecoinAmount(koinu: 100_000_000))],
@@ -227,7 +322,7 @@ struct TransactionBuilderTests {
     func foreignInputScriptRejected() async throws {
         let keys = try await keys()
         let foreignScript = try #require(Address.scriptPubKey(for: recipient)).hexString
-        await #expect(throws: DogecoinError.self) {
+        await #expect(throws: DogecoinError.transactionValidationFailed("Input 0 script does not pay to \(keys.address0)")) {
             _ = try await createTransaction(
                 inputs: [UTXO(txid: String(repeating: "88", count: 32), vout: 0, address: keys.address0, amount: DogecoinAmount(koinu: 500_000_000), scriptPubKey: foreignScript)],
                 outputs: [(address: recipient, amount: DogecoinAmount(koinu: 100_000_000))],
@@ -253,18 +348,18 @@ struct TransactionBuilderTests {
 
     @Test("Builder rejects malformed outpoints and amounts")
     func builderValidatesInputs() async throws {
-        let builder = try await TransactionBuilder()
+        let builder = TransactionBuilder()
 
-        await #expect(throws: DogecoinError.self) {
+        await #expect(throws: DogecoinError.addInputFailed) {
             try await builder.addInput(txid: "+1" + String(repeating: "0", count: 62), vout: 0)
         }
-        await #expect(throws: DogecoinError.self) {
+        await #expect(throws: DogecoinError.addInputFailed) {
             try await builder.addInput(txid: String(repeating: "ab", count: 32), vout: -1)
         }
-        await #expect(throws: DogecoinError.self) {
+        await #expect(throws: DogecoinError.addOutputFailed) {
             try await builder.addOutput(address: recipient, amount: .zero)
         }
-        await #expect(throws: DogecoinError.self) {
+        await #expect(throws: DogecoinError.addOutputFailed) {
             try await builder.addOutput(address: recipient, amount: DogecoinAmount(koinu: DogecoinAmount.maxMoney.koinu + 1))
         }
 
@@ -272,20 +367,19 @@ struct TransactionBuilderTests {
         let testnetAddress = try await HDWallet(mnemonic: mnemonic, network: .testnet).deriveAddress()
         #expect(Address.isTestnet(testnetAddress))
         try await builder.addOutput(address: recipient, amount: DogecoinAmount(koinu: 1_000_000))
-        await #expect(throws: DogecoinError.self) {
+        await #expect(throws: DogecoinError.transactionValidationFailed("Outputs must all belong to the same network")) {
             try await builder.addOutput(address: testnetAddress, amount: DogecoinAmount(koinu: 1_000_000))
         }
     }
 
     @Test("Finalize refuses to drop change on the floor")
     func finalizeRequiresChangeAddressForChange() async throws {
-        let builder = try await TransactionBuilder()
+        let builder = TransactionBuilder()
         try await builder.addInput(txid: String(repeating: "ab", count: 32), vout: 0)
         try await builder.addOutput(address: recipient, amount: DogecoinAmount(koinu: 100_000_000))
 
-        await #expect(throws: DogecoinError.self) {
+        await #expect(throws: DogecoinError.finalizationFailed) {
             _ = try await builder.finalize(
-                destinationAddress: recipient,
                 fee: DogecoinAmount(koinu: 10_000_000),
                 totalAmount: DogecoinAmount(koinu: 500_000_000),
                 changeAddress: nil
@@ -295,24 +389,57 @@ struct TransactionBuilderTests {
 
     @Test("Finalized builders reject further edits")
     func finalizedBuilderIsSealed() async throws {
-        let builder = try await TransactionBuilder()
+        let builder = TransactionBuilder()
         try await builder.addInput(txid: String(repeating: "ab", count: 32), vout: 0)
         try await builder.addOutput(address: recipient, amount: DogecoinAmount(koinu: 100_000_000))
         _ = try await builder.finalize(
-            destinationAddress: recipient,
             fee: DogecoinAmount(koinu: 10_000_000),
             totalAmount: DogecoinAmount(koinu: 110_000_000)
         )
 
-        await #expect(throws: DogecoinError.self) {
+        await #expect(throws: DogecoinError.transactionValidationFailed("Transaction already finalized")) {
             try await builder.addInput(txid: String(repeating: "cd", count: 32), vout: 1)
         }
+        await #expect(throws: DogecoinError.transactionValidationFailed("Transaction already finalized")) {
+            try await builder.addOutput(address: recipient, amount: DogecoinAmount(koinu: 100_000_000))
+        }
+        await #expect(throws: DogecoinError.transactionValidationFailed("Transaction already finalized")) {
+            _ = try await builder.finalize(fee: DogecoinAmount(koinu: 10_000_000), totalAmount: DogecoinAmount(koinu: 110_000_000))
+        }
+    }
+
+    @Test("A builder with no inputs yet says so instead of failing to serialize")
+    func rawTransactionNeedsInputs() async throws {
+        let builder = TransactionBuilder()
+        try await builder.addOutput(address: recipient, amount: DogecoinAmount(koinu: 100_000_000))
+
+        await #expect(throws: DogecoinError.transactionValidationFailed("Transaction has no inputs")) {
+            _ = try await builder.getRawTransaction()
+        }
+        await #expect(throws: DogecoinError.finalizationFailed) {
+            _ = try await builder.finalize(fee: DogecoinAmount(koinu: 10_000_000), totalAmount: DogecoinAmount(koinu: 110_000_000))
+        }
+    }
+
+    @Test("A signed transaction is made only from a whole transaction, and names it by its hash")
+    func signedTransactionRequiresATransaction() throws {
+        let golden = "01000000014444444444444444444444444444444444444444444444444444444444444444020000006a473044022076dfab0f703fde010207a0d769a9ec3be30742ac327c2cd4be195a6988f1c773022076bfd8725e6ac627ff049add7c8f8284918d0afbd57500d9a522e99f073354b1012102cc6b0dc33aabcf3a23643e5e2919a80c50fb3dd2129ce409bbc5f0d4643d05e0ffffffff010076b010000000001976a91457b5ed84d604e95a2c79f37cebc54efbbcfa52fc88ac00000000"
+
+        let signed = try #require(SignedTransaction(rawHex: golden, fee: DogecoinAmount(koinu: 20_000_000)))
+        let raw = try #require(Data(hexString: golden))
+        #expect(signed.txid == Data(MerkleTree.doubleSHA256(raw).reversed()).hexString)
+        #expect(signed.txid.count == 64)
+
+        #expect(SignedTransaction(rawHex: "") == nil)
+        #expect(SignedTransaction(rawHex: "not hex") == nil)
+        #expect(SignedTransaction(rawHex: String(golden.dropLast(2))) == nil)
+        #expect(SignedTransaction(rawHex: golden + "00") == nil)
     }
 
     @Test("Signing before finalize is refused, since nothing would return the change")
     func signingRequiresFinalize() async throws {
         let keys = try await keys()
-        let builder = try await TransactionBuilder()
+        let builder = TransactionBuilder()
         try await builder.addInput(txid: String(repeating: "ab", count: 32), vout: 0)
         try await builder.addOutput(address: recipient, amount: DogecoinAmount(koinu: 100_000_000))
 
@@ -327,11 +454,10 @@ struct TransactionBuilderTests {
     @Test("An input cannot be signed twice")
     func doubleSigningIsRefused() async throws {
         let keys = try await keys()
-        let builder = try await TransactionBuilder()
+        let builder = TransactionBuilder()
         try await builder.addInput(txid: String(repeating: "ab", count: 32), vout: 0)
         try await builder.addOutput(address: recipient, amount: DogecoinAmount(koinu: 100_000_000))
         _ = try await builder.finalize(
-            destinationAddress: recipient,
             fee: DogecoinAmount(koinu: 10_000_000),
             totalAmount: DogecoinAmount(koinu: 110_000_000)
         )
@@ -350,11 +476,10 @@ struct TransactionBuilderTests {
 
     @Test("Signing with an unusable key fails before libdogecoin sees it")
     func unusableSigningKey() async throws {
-        let builder = try await TransactionBuilder()
+        let builder = TransactionBuilder()
         try await builder.addInput(txid: String(repeating: "ab", count: 32), vout: 0)
         try await builder.addOutput(address: recipient, amount: DogecoinAmount(koinu: 100_000_000))
         _ = try await builder.finalize(
-            destinationAddress: recipient,
             fee: DogecoinAmount(koinu: 10_000_000),
             totalAmount: DogecoinAmount(koinu: 110_000_000)
         )
@@ -402,11 +527,20 @@ struct TransactionBuilderTests {
         }
     }
 
-    @Test("HDWallet rejects a capitalized phrase instead of deriving a different wallet")
-    func walletRejectsCapitalizedPhrase() async throws {
-        await #expect(throws: DogecoinError.invalidMnemonic) {
-            _ = try await HDWallet(mnemonic: "Abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", network: .mainnet)
-        }
+    @Test("However a phrase is typed, it opens the one wallet its words describe", arguments: [
+        "Abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        "ABANDON ABANDON ABANDON ABANDON ABANDON ABANDON ABANDON ABANDON ABANDON ABANDON ABANDON ABOUT",
+        "  abandon abandon  abandon abandon abandon abandon abandon abandon abandon abandon abandon about ",
+        "abandon abandon abandon abandon\nabandon abandon abandon abandon\nabandon abandon abandon\tabout\n"
+    ])
+    func walletNormalizesThePhrase(typed: String) async throws {
+        // BIP39 derives a seed from any text at all, so the same words in
+        // another spelling would otherwise open a different, empty wallet.
+        let canonical = try await HDWallet(mnemonic: mnemonic, network: .mainnet)
+        let wallet = try await HDWallet(mnemonic: typed, network: .mainnet)
+
+        #expect(wallet.masterKey == canonical.masterKey)
+        #expect(wallet.mnemonic == mnemonic)
     }
 
     @Test("Restoring an already-accepted phrase does not re-validate it")
@@ -419,10 +553,10 @@ struct TransactionBuilderTests {
     @Test("deriveAddresses rejects negative counts and index overflow")
     func deriveAddressesBounds() async throws {
         let wallet = try await HDWallet(mnemonic: mnemonic, network: .mainnet)
-        await #expect(throws: DogecoinError.self) {
+        await #expect(throws: DogecoinError.derivationFailed) {
             _ = try await wallet.deriveAddresses(count: -1)
         }
-        await #expect(throws: DogecoinError.self) {
+        await #expect(throws: DogecoinError.derivationFailed) {
             _ = try await wallet.deriveAddresses(count: 2, startIndex: UInt32.max)
         }
         let addresses = try await wallet.deriveAddresses(count: 0)

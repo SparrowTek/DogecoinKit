@@ -152,21 +152,10 @@ struct UntrustedInputHardeningTests {
         #expect(MerkleBlockMessage.parse(from: data) == nil)
     }
 
-    // MARK: - BlockMessage (reachable via unsolicited `block` message)
+    // MARK: - AuxPoW proofs (reachable via `headers` and `merkleblock`)
 
-    @Test("Block message with hostile transaction count does not crash")
-    func blockMessageHostileTxCount() {
-        var data = Data()
-        var version = Int32(2).littleEndian
-        data.append(Data(bytes: &version, count: 4))
-        data.append(Data(repeating: 0, count: 76))
-        data.append(maxVarInt) // hostile tx count
-
-        #expect(BlockMessage.parse(from: data) == nil)
-    }
-
-    @Test("Block message with hostile auxpow script length does not crash")
-    func blockMessageHostileAuxPowScript() {
+    @Test("A proof whose coinbase claims a hostile script length does not crash")
+    func auxPowHostileCoinbaseScript() {
         var data = auxPowHeaderBytes
 
         // Coinbase tx with hostile input script length
@@ -175,11 +164,32 @@ struct UntrustedInputHardeningTests {
         data.append(Data(repeating: 0, count: 36)) // prevout
         data.append(maxVarInt)                     // hostile script length
 
-        #expect(BlockMessage.parse(from: data) == nil)
+        #expect(AuxPoW.parse(from: data, at: BlockHeader.size) == nil)
+        #expect(AuxPoW.endOffset(in: data, at: BlockHeader.size) == nil)
+        #expect(MerkleBlockMessage.parse(from: data) == nil)
     }
 
-    @Test("Transaction parser rejects hostile witness item lengths")
-    func transactionParserHostileWitness() {
+    @Test("A proof whose merkle branch claims more hashes than there are bytes does not crash")
+    func auxPowHostileBranchCount() {
+        var data = auxPowHeaderBytes
+
+        // A minimal coinbase, then the parent block hash.
+        data.append(Data([1, 0, 0, 0]))            // version
+        data.append(varInt(1))                     // input count
+        data.append(Data(repeating: 0, count: 36)) // prevout
+        data.append(varInt(0))                     // empty script
+        data.append(Data([0xff, 0xff, 0xff, 0xff])) // sequence
+        data.append(varInt(0))                     // output count
+        data.append(Data([0, 0, 0, 0]))            // lock time
+        data.append(Data(repeating: 0xEE, count: 32))
+        data.append(maxVarInt)                     // hostile branch length
+
+        #expect(AuxPoW.parse(from: data, at: BlockHeader.size) == nil)
+        #expect(AuxPoW.endOffset(in: data, at: BlockHeader.size) == nil)
+    }
+
+    @Test("The transaction decoder rejects hostile witness item lengths")
+    func transactionDecoderHostileWitness() {
         var data = Data()
         data.append(Data([0, 0, 0, 1])) // version
         data.append(Data([0x00, 0x01])) // segwit marker + flag
@@ -191,8 +201,10 @@ struct UntrustedInputHardeningTests {
         data.append(varInt(1))          // witness stack count
         data.append(maxVarInt)          // hostile item length
 
-        var offset = 0
-        #expect(TransactionParser.parseTransaction(from: data, offset: &offset) == nil)
+        #expect(RawTransaction(data: data) == nil)
+        #expect(RawTransaction.decode(in: data, at: 0) == nil)
+        #expect(RawTransaction.decode(in: data, at: -1) == nil)
+        #expect(RawTransaction.decode(in: data, at: data.count + 1) == nil)
     }
 
     // MARK: - SPV bloom matching
@@ -265,7 +277,7 @@ struct UntrustedInputHardeningTests {
             bits: 0x1e0fffff,
             nonce: 0
         )
-        #expect(throws: AuxPoW.ValidationError.self) {
+        #expect(throws: AuxPoW.ValidationError.invalidChainMerkleProof) {
             try auxpow.validate(for: header)
         }
     }

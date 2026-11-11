@@ -256,11 +256,24 @@ public struct AuxPoW: Sendable, Equatable {
 
     /// Parse a transaction and return (txData, endOffset)
     private static func parseTransaction(in data: Data, from offset: Int) -> (Data, Int)? {
-        let bytes = data.rebased
-        guard offset >= 0,
-              let end = TransactionParser.skipTransaction(in: bytes, from: offset),
-              let transaction = bytes.bytes(at: offset, count: end - offset) else { return nil }
+        guard let (_, end) = RawTransaction.decode(in: data, at: offset),
+              let transaction = data.bytes(at: offset, count: end - offset) else { return nil }
         return (transaction, end)
+    }
+
+    /// The offset just past the proof that starts at `offset`, for readers
+    /// that only need what follows it — a merkle block's tree, say, whose
+    /// header is already proven. Nothing is copied but the coinbase.
+    static func endOffset(in data: Data, at offset: Int) -> Int? {
+        guard let (_, coinbaseEnd) = RawTransaction.decode(in: data, at: offset) else { return nil }
+        // Parent block hash, then two branches, each followed by its index.
+        var position = coinbaseEnd + 32
+        for _ in 0..<2 {
+            guard let (count, countSize) = data.readBoundedCount(at: position, minItemSize: 32) else { return nil }
+            position += countSize + count * 32 + 4
+        }
+        position += BlockHeader.size
+        return position <= data.count ? position : nil
     }
 
     /// Parse merkle branch from data.

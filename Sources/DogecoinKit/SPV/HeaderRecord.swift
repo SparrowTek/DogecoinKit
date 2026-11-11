@@ -81,11 +81,15 @@ extension HeaderRecord: FetchableRecord, PersistableRecord {
 
 extension HeaderRecord {
     /// Create from StoredHeader
+    ///
+    /// The chain work is stored without the zero bytes that pad it to 32:
+    /// a mainnet total fits in ten or so, and the padding was a tenth of
+    /// the whole database.
     public init(storedHeader: StoredHeader, isInBestChain: Bool = true) {
         self.hash = storedHeader.header.hash
         self.prevBlockHash = storedHeader.header.prevBlock
         self.height = storedHeader.height
-        self.chainWork = storedHeader.chainWork
+        self.chainWork = Self.trimmed(storedHeader.chainWork)
         self.version = storedHeader.header.version
         self.merkleRoot = storedHeader.header.merkleRoot
         self.timestamp = storedHeader.header.timestamp
@@ -104,6 +108,17 @@ extension HeaderRecord {
             bits: bits,
             nonce: nonce
         )
-        return StoredHeader(header: header, height: height, chainWork: chainWork)
+        return StoredHeader(header: header, height: height, chainWork: Self.padded(chainWork))
+    }
+
+    /// A little-endian number without its high-order zero bytes.
+    static func trimmed(_ littleEndian: Data) -> Data {
+        guard let lastNonZero = littleEndian.lastIndex(where: { $0 != 0 }) else { return Data() }
+        return Data(littleEndian[littleEndian.startIndex...lastNonZero])
+    }
+
+    /// A little-endian number at its full 32 bytes.
+    static func padded(_ littleEndian: Data) -> Data {
+        littleEndian.count >= 32 ? Data(littleEndian.prefix(32)) : littleEndian + Data(count: 32 - littleEndian.count)
     }
 }

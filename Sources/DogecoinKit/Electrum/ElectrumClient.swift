@@ -408,12 +408,14 @@ public actor ElectrumClient {
         return try await sendRequest(.blockchainHeadersSubscribe)
     }
 
+    /// The 80-byte header of the block at `height`, as hex
     public func getBlockHeader(height: Int) async throws -> String {
         try await sendRequest(.blockchainBlockHeader, params: [.int(height)])
     }
 
-    public func estimateFee(blocks: Int = 6) async throws -> Double {
-        try await sendRequest(.blockchainEstimateFee, params: [.int(blocks)])
+    /// The chain the server indexes, as it reports it
+    func serverFeatures() async throws -> ElectrumServerFeatures {
+        try await sendRequest(.serverFeatures)
     }
 
     // MARK: - Address Methods

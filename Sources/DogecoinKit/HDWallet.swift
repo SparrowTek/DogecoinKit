@@ -7,8 +7,9 @@ public final class HDWallet: Sendable {
     /// The HD master private key (serialized)
     public let masterKey: String
 
-    /// The mnemonic phrase used to generate this wallet (if available)
-    public let mnemonic: String?
+    /// The mnemonic phrase this wallet derives from, as
+    /// ``normalizedMnemonic(_:)`` writes it
+    public let mnemonic: String
 
     /// The network this wallet belongs to
     public let network: DogecoinNetwork
@@ -18,27 +19,29 @@ public final class HDWallet: Sendable {
     /// The phrase must pass full BIP39 validation — known words and a
     /// matching checksum. BIP39 seeds can be derived from *any* string, so a
     /// mistyped word would otherwise silently open a different, empty wallet.
+    /// For the same reason the phrase is normalized first: capitals, extra
+    /// spaces, and line breaks never change which wallet it opens.
     /// - Parameters:
     ///   - mnemonic: The BIP39 mnemonic phrase (12-24 words)
     ///   - passphrase: Optional BIP39 passphrase (default: empty)
     ///   - network: The network to use
     /// - Throws: `DogecoinError.invalidMnemonic` if the mnemonic is invalid
     public convenience init(mnemonic: String, passphrase: String = "", network: DogecoinNetwork = .mainnet) async throws {
-        guard verifyMnemonic(mnemonic) else {
+        let phrase = normalizedMnemonic(mnemonic)
+        guard verifyMnemonic(phrase) else {
             throw DogecoinError.invalidMnemonic
         }
-        try await self.init(acceptedMnemonic: mnemonic, passphrase: passphrase, network: network)
+        try await self.init(acceptedMnemonic: phrase, passphrase: passphrase, network: network)
     }
 
     /// Derives the wallet for a mnemonic that was accepted earlier, without
-    /// re-running BIP39 validation.
+    /// re-running BIP39 validation or normalizing it.
     ///
     /// Restoring from secure storage goes through here: the phrase was
-    /// validated when it was imported, and a wallet that already holds funds
-    /// must stay reachable even if validation rules change later.
+    /// validated when it was stored, and a wallet that already holds funds
+    /// must stay reachable — from exactly the text it was created with —
+    /// even if validation rules change later.
     init(acceptedMnemonic mnemonic: String, passphrase: String, network: DogecoinNetwork) async throws {
-        try await Dogecoin.ensureInitialized()
-
         var seed = [UInt8](repeating: 0, count: Int(MAX_SEED_SIZE))
         defer { zeroize(&seed) }
 
@@ -54,7 +57,7 @@ public final class HDWallet: Sendable {
             throw DogecoinError.invalidMnemonic
         }
 
-        ECC.armCurrentThread()
+        try ECC.armCurrentThread()
 
         var masterKeyBuffer = [CChar](repeating: 0, count: Int(HDKEYLEN))
         defer { zeroize(&masterKeyBuffer) }
@@ -94,39 +97,6 @@ public final class HDWallet: Sendable {
         return try await HDWallet(mnemonic: mnemonic, passphrase: passphrase, network: network)
     }
 
-    /// Generate a new HD master key without mnemonic
-    /// - Parameter network: The network to use
-    /// - Returns: A new HDWallet
-    /// - Throws: `DogecoinError.keyGenerationFailed` if generation fails
-    public static func generateMasterKey(network: DogecoinNetwork = .mainnet) async throws -> HDWallet {
-        try await Dogecoin.ensureInitialized()
-        ECC.armCurrentThread()
-
-        var masterKeyBuffer = [CChar](repeating: 0, count: Int(HDKEYLEN))
-        var addressBuffer = [CChar](repeating: 0, count: Int(P2PKHLEN))
-        defer { zeroize(&masterKeyBuffer) }
-
-        let result = generateHDMasterPubKeypair(&masterKeyBuffer, &addressBuffer, network.isTestnet)
-
-        guard result == 1 else {
-            throw DogecoinError.keyGenerationFailed
-        }
-
-        let masterKey = Self.stringFromCStringBuffer(masterKeyBuffer)
-        guard !masterKey.isEmpty else {
-            throw DogecoinError.keyGenerationFailed
-        }
-
-        return HDWallet(masterKey: masterKey, mnemonic: nil, network: network)
-    }
-
-    /// Internal initializer
-    private init(masterKey: String, mnemonic: String?, network: DogecoinNetwork) {
-        self.masterKey = masterKey
-        self.mnemonic = mnemonic
-        self.network = network
-    }
-
     /// Derive an address at the given BIP44 path
     /// - Parameters:
     ///   - account: The account index (hardened)
@@ -147,9 +117,8 @@ public final class HDWallet: Sendable {
     /// - Throws: `DogecoinError.derivationFailed` if the path is malformed or
     ///   derivation fails
     public func deriveAddress(path: String) async throws -> String {
-        try await Dogecoin.ensureInitialized()
         try Self.validate(path: path)
-        ECC.armCurrentThread()
+        try ECC.armCurrentThread()
 
         var masterKeyBuffer = Self.paddedCString(masterKey, length: Int(HDKEYLEN))
         var pathBuffer = Self.paddedCString(path, length: Int(KEYPATHMAXLEN))
@@ -221,9 +190,8 @@ public final class HDWallet: Sendable {
     /// - Throws: `DogecoinError.derivationFailed` if the path is malformed or
     ///   derivation fails
     public func derivePrivateKey(path: String) async throws -> String {
-        try await Dogecoin.ensureInitialized()
         try Self.validate(path: path)
-        ECC.armCurrentThread()
+        try ECC.armCurrentThread()
 
         var masterKeyBuffer = Self.paddedCString(masterKey, length: Int(HDKEYLEN))
         var pathBuffer = Self.paddedCString(path, length: Int(KEYPATHMAXLEN))
@@ -295,8 +263,6 @@ public enum MnemonicStrength: Int, Sendable, CaseIterable {
 /// - Returns: The mnemonic phrase as a string
 /// - Throws: `DogecoinError.keyGenerationFailed` if generation fails
 public func generateMnemonic(strength: MnemonicStrength = .words12) async throws -> String {
-    try await Dogecoin.ensureInitialized()
-
     var mnemonic = [CChar](repeating: 0, count: Int(MAX_MNEMONIC_SIZE))
     var strengthBuffer = Array("\(strength.rawValue)".utf8CString)
     while strengthBuffer.count < 4 { strengthBuffer.append(0) }
@@ -385,11 +351,4 @@ private func zeroize(_ buffer: inout [UInt8]) {
 
 private func zeroize(_ buffer: inout [CChar]) {
     buffer.withUnsafeMutableBufferPointer { $0.update(repeating: 0) }
-}
-
-/// Validate a BIP39 mnemonic phrase using full BIP39 checksum validation
-/// - Parameter mnemonic: The mnemonic phrase to validate
-/// - Returns: `true` if the mnemonic is valid with correct checksum
-public func validateMnemonic(_ mnemonic: String) -> Bool {
-    verifyMnemonic(mnemonic)
 }

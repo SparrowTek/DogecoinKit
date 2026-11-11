@@ -6,10 +6,6 @@ import Testing
 @Suite("Real Chain Validation")
 struct RealChainValidationTests {
 
-    init() async {
-        await Dogecoin.initialize()
-    }
-
     private func realEntries() throws -> [HeadersMessage.Entry] {
         let entries = RealChainFixtures.parsedEntries()
         try #require(entries.count == 3, "fixture headers failed to parse")
@@ -55,11 +51,12 @@ struct RealChainValidationTests {
             )
         )
 
-        #expect {
+        let error = #expect(throws: AuxPoW.ValidationError.self) {
             try forged.validate(for: entry.header)
-        } throws: { error in
-            guard case AuxPoW.ValidationError.invalidParentProofOfWork = error else { return false }
-            return true
+        }
+        guard case .invalidParentProofOfWork = error else {
+            Issue.record("Expected invalidParentProofOfWork, got \(String(describing: error))")
+            return
         }
     }
 
@@ -282,7 +279,7 @@ struct RealChainValidationTests {
     @Test("Headers forking below the last passed checkpoint are rejected")
     func forkBelowCheckpointRejected() async throws {
         let chain = try await chainAtFixtureTip()
-        let genesis = try #require(await chain.getHeader(height: 0))
+        let genesis = try #require(try await chain.getHeader(height: 0))
 
         // Block 1's real header builds on genesis — a fork millions of blocks
         // below the 5.4M checkpoint the fixture chain has passed.
@@ -295,11 +292,12 @@ struct RealChainValidationTests {
             nonce: 1_417_875_456
         )
 
-        await #expect {
+        let error = await #expect(throws: HeaderChain.ValidationError.self) {
             try await chain.addHeaderValidated(block1)
-        } throws: { error in
-            guard case HeaderChain.ValidationError.forkBelowCheckpoint = error else { return false }
-            return true
+        }
+        guard case .forkBelowCheckpoint(height: 1) = error else {
+            Issue.record("Expected forkBelowCheckpoint, got \(String(describing: error))")
+            return
         }
     }
 }

@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.1
 
 import PackageDescription
 
@@ -16,7 +16,10 @@ let package = Package(
     ],
     dependencies: [
 //        .package(path: "../libdogecoin"),
-        .package(url: "https://github.com/radmakr/libdogecoin", branch: "0.1.5-dev-swiftpm"),
+        // The tip of branch `0.1.5-dev-swiftpm` that this package is tested
+        // against. A branch would let the C library change underneath a
+        // consumer without anything here changing.
+        .package(url: "https://github.com/radmakr/libdogecoin", revision: "3350908af0f9a492a54fed8f6e0fa3a5ace72ffb"),
         // 7.10 is the first GRDB release that builds for Android.
         .package(url: "https://github.com/groue/GRDB.swift", from: "7.10.0"),
         .package(url: "https://github.com/apple/swift-crypto", "3.0.0"..<"6.0.0"),

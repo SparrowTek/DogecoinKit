@@ -366,12 +366,6 @@ public actor Peer {
         send(message)
     }
 
-    /// Send a filterclear message to disable bloom filtering
-    public func sendFilterClear() {
-        let message = ProtocolMessage(network: network, command: ProtocolMessage.Command.filterclear, payload: FilterClearMessage().serialize())
-        send(message)
-    }
-
     /// Request peer addresses
     public func sendGetAddr() {
         let message = ProtocolMessage(network: network, command: ProtocolMessage.Command.getaddr, payload: Data())
@@ -429,10 +423,17 @@ public actor Peer {
 
         let expectedMagic = NetworkConstants.magic(for: network)
 
+        // One read often carries many messages. Step through them in place
+        // and drop them from the buffer together at the end, instead of
+        // copying the rest of the buffer once per message.
+        var handled = 0
+
+        // A handler may close this connection, which empties the buffer:
+        // from then on neither it nor `handled` means anything here.
         while source === stream {
-            switch ProtocolMessage.parseDetailed(from: receiveBuffer) {
-            case .message(let message, let remaining):
-                receiveBuffer = remaining
+            switch ProtocolMessage.frame(in: receiveBuffer, at: handled) {
+            case .message(let message, let length):
+                handled += length
 
                 guard message.magic == expectedMagic else {
                     await handleProtocolError(.invalidMagic(expected: expectedMagic, got: message.magic))
@@ -442,6 +443,7 @@ public actor Peer {
                 await handleMessage(message)
 
             case .incomplete:
+                receiveBuffer.removeFirst(handled)
                 return
 
             case .invalid(let error):
@@ -471,7 +473,7 @@ public actor Peer {
             handlePingMessage(message.payload)
 
         case ProtocolMessage.Command.pong:
-            handlePongMessage(message.payload)
+            await handlePongMessage(message)
 
         default:
             await delegate?.peer(self, didReceiveMessage: message)
@@ -529,10 +531,14 @@ public actor Peer {
         sendPong(nonce: ping.nonce)
     }
 
-    private func handlePongMessage(_ payload: Data) {
-        guard let pong = PongMessage.parse(from: payload),
-              let pendingNonce = pendingPingNonce,
-              pong.nonce == pendingNonce else {
+    private func handlePongMessage(_ message: ProtocolMessage) async {
+        guard let pong = PongMessage.parse(from: message.payload) else { return }
+
+        // Not the answer to this peer's own keepalive: someone else sent a
+        // ping through `send(_:)` to learn when the peer had got that far
+        // through its messages. Pass the answer on.
+        guard let pendingNonce = pendingPingNonce, pong.nonce == pendingNonce else {
+            await delegate?.peer(self, didReceiveMessage: message)
             return
         }
 
@@ -553,14 +559,6 @@ public actor Peer {
 extension Peer: Equatable {
     public static func == (lhs: Peer, rhs: Peer) -> Bool {
         lhs.id == rhs.id
-    }
-}
-
-// MARK: - Hashable
-
-extension Peer: Hashable {
-    nonisolated public func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
     }
 }
 

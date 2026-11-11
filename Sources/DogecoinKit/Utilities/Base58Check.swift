@@ -46,13 +46,18 @@ enum Base58Check {
     ///   - maximumLength: Longest input accepted — it bounds the decoding work
     ///     on hostile input
     /// - Returns: The payload, or `nil` if the text is not Base58, is too
-    ///   long, or fails its checksum
+    ///   long, or fails its checksum. A payload may be a private key; the
+    ///   working copies made here are zeroed, the returned one is the
+    ///   caller's to zero.
     static func decode(_ string: String, maximumLength: Int = 64) -> Data? {
         let characters = Array(string.utf8)
         guard !characters.isEmpty, characters.count <= maximumLength else { return nil }
 
-        // Base-256 digits, least significant first.
+        // Base-256 digits, least significant first. Never longer than the
+        // text, so the array is not reallocated and one wipe clears it.
         var bytes: [UInt8] = []
+        bytes.reserveCapacity(characters.count)
+        defer { bytes.withUnsafeMutableBufferPointer { $0.update(repeating: 0) } }
         for character in characters {
             guard character < 128 else { return nil }
             let digit = digitValues[Int(character)]
@@ -71,7 +76,8 @@ enum Base58Check {
         }
 
         let leadingZeros = characters.prefix { $0 == alphabet[0] }.count
-        let decoded = Data(repeating: 0, count: leadingZeros) + Data(bytes.reversed())
+        var decoded = Data(repeating: 0, count: leadingZeros) + Data(bytes.reversed())
+        defer { decoded.resetBytes(in: decoded.startIndex..<decoded.endIndex) }
         guard decoded.count > 4 else { return nil }
 
         let payload = Data(decoded.dropLast(4))

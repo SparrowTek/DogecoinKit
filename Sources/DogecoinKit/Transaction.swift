@@ -40,10 +40,7 @@ public actor TransactionBuilder {
     private var sealedHex: String?
 
     /// Create a new transaction builder
-    /// - Throws: `DogecoinError.initializationFailed` if `Dogecoin.initialize()` has not run
-    public init() async throws {
-        try await Dogecoin.ensureInitialized()
-    }
+    public init() {}
 
     /// Add an input (UTXO) to the transaction
     /// - Parameters:
@@ -83,44 +80,25 @@ public actor TransactionBuilder {
         outputs.append(Output(address: address, amount: amount))
     }
 
-    /// Add an output to the transaction using a string amount
-    /// - Parameters:
-    ///   - address: The recipient address
-    ///   - amountString: The amount as a string (e.g., "1.5")
-    /// - Throws: `DogecoinError.addOutputFailed` if the address or amount is invalid
-    public func addOutput(address: String, amountString: String) throws {
-        guard let amount = try? DogecoinAmount(dogeString: amountString) else {
-            throw DogecoinError.addOutputFailed
-        }
-        try addOutput(address: address, amount: amount)
-    }
-
     /// Finalize the transaction with change address and fee
     ///
     /// Whatever `totalAmount` leaves over after the outputs and `fee` goes to
     /// `changeAddress`. Once finalized, inputs and outputs can no longer change.
     /// - Parameters:
-    ///   - destinationAddress: An address that is only checked for validity; it
-    ///     need not be one of the outputs
     ///   - fee: The transaction fee
     ///   - totalAmount: The total value of the inputs being spent
     ///   - changeAddress: The address to receive change; required when there is change
     /// - Returns: The unsigned raw transaction hex
-    /// - Throws: `DogecoinError.finalizationFailed` if the amounts do not
-    ///   balance, `DogecoinError.invalidAddress` for an invalid
-    ///   `destinationAddress`, or `DogecoinError.internalError` if the
-    ///   builder was already finalized
+    /// - Throws: `DogecoinError.finalizationFailed` if there are no inputs
+    ///   or outputs or the amounts do not balance, or
+    ///   `DogecoinError.transactionValidationFailed` if the builder was
+    ///   already finalized
     public func finalize(
-        destinationAddress: String,
         fee: DogecoinAmount,
         totalAmount: DogecoinAmount,
         changeAddress: String? = nil
     ) throws -> String {
         try ensureMutable()
-
-        guard Address.isValid(destinationAddress) else {
-            throw DogecoinError.invalidAddress(destinationAddress)
-        }
 
         guard !inputs.isEmpty,
               let network = outputs.first.flatMap({ Address.detectNetwork($0.address) }),
@@ -151,10 +129,10 @@ public actor TransactionBuilder {
     ///   not finalized or an input is already signed,
     ///   `DogecoinError.invalidPrivateKey` for an unusable key, and
     ///   `DogecoinError.transactionSigningFailed` if signing fails
-    public func sign(privateKeyWIF: String) throws {
+    func sign(privateKeyWIF: String) throws {
         var signed = try finalizedTransaction()
         for index in inputs.indices {
-            signed = try Self.sign(input: index, of: signed, privateKeyWIF: privateKeyWIF, scriptPubKey: nil)
+            signed = try Self.sign(input: index, of: signed, privateKeyWIF: privateKeyWIF)
         }
         sealedHex = signed
     }
@@ -172,27 +150,7 @@ public actor TransactionBuilder {
             throw DogecoinError.transactionSigningFailed
         }
 
-        sealedHex = try Self.sign(input: index, of: try finalizedTransaction(), privateKeyWIF: privateKeyWIF, scriptPubKey: nil)
-    }
-
-    /// Sign every input against an explicit previous-output script
-    /// - Parameters:
-    ///   - scriptPubKey: The script pubkey hex of the outputs being spent
-    ///   - privateKeyWIF: The private key in WIF format
-    /// - Throws: `DogecoinError.transactionValidationFailed` if the builder is
-    ///   not finalized or an input is already signed,
-    ///   `DogecoinError.invalidPrivateKey` for an unusable key, and
-    ///   `DogecoinError.transactionSigningFailed` if signing fails
-    public func sign(scriptPubKey: String, privateKeyWIF: String) throws {
-        guard let script = Data(hexString: scriptPubKey), !script.isEmpty else {
-            throw DogecoinError.transactionSigningFailed
-        }
-
-        var signed = try finalizedTransaction()
-        for index in inputs.indices {
-            signed = try Self.sign(input: index, of: signed, privateKeyWIF: privateKeyWIF, scriptPubKey: scriptPubKey)
-        }
-        sealedHex = signed
+        sealedHex = try Self.sign(input: index, of: try finalizedTransaction(), privateKeyWIF: privateKeyWIF)
     }
 
     /// Get the raw transaction hex
@@ -200,10 +158,15 @@ public actor TransactionBuilder {
     /// Returns the finalized (and possibly signed) transaction, or a fresh
     /// serialization of the current inputs and outputs if not yet finalized.
     /// - Returns: The raw transaction as hex string
-    /// - Throws: `DogecoinError.transactionCreationFailed` if serialization fails
+    /// - Throws: `DogecoinError.transactionValidationFailed` if there are no
+    ///   inputs yet — a transaction without any cannot be written down — or
+    ///   `DogecoinError.transactionCreationFailed` if serialization fails
     public func getRawTransaction() throws -> String {
         if let sealedHex {
             return sealedHex
+        }
+        guard !inputs.isEmpty else {
+            throw DogecoinError.transactionValidationFailed("Transaction has no inputs")
         }
         return try Self.serialize(inputs: inputs, outputs: outputs)
     }
@@ -212,7 +175,7 @@ public actor TransactionBuilder {
 
     private func ensureMutable() throws {
         guard sealedHex == nil else {
-            throw DogecoinError.internalError("Transaction already finalized")
+            throw DogecoinError.transactionValidationFailed("Transaction already finalized")
         }
     }
 
@@ -291,9 +254,15 @@ public actor TransactionBuilder {
         return try body(index)
     }
 
-    /// Signs one input of a serialized transaction and returns the new hex,
-    /// after confirming libdogecoin changed nothing but that input's script.
-    private static func sign(input index: Int, of rawHex: String, privateKeyWIF: String, scriptPubKey: String?) throws -> String {
+    /// Hex characters signing adds to an input at most — a script-length
+    /// byte that grows by none, a 73-byte signature push, and a 34-byte
+    /// public-key push — plus the terminating NUL.
+    private static let signedInputGrowth = 2 * (1 + 73 + 1 + 33) + 1
+
+    /// Signs one input of a serialized transaction — as P2PKH for the key's
+    /// own (compressed) address — and returns the new hex, after confirming
+    /// libdogecoin changed nothing but that input's script.
+    private static func sign(input index: Int, of rawHex: String, privateKeyWIF: String) throws -> String {
         guard let inputIndex = Int32(exactly: index),
               let unsigned = RawTransaction(hex: rawHex),
               unsigned.inputs.indices.contains(index) else {
@@ -310,16 +279,12 @@ public actor TransactionBuilder {
             throw DogecoinError.invalidPrivateKey
         }
 
-        ECC.armCurrentThread()
-        let script = try scriptPubKey ?? p2pkhScript(forPrivateKeyWIF: privateKeyWIF)
+        try ECC.armCurrentThread()
+        let script = try p2pkhScript(forPrivateKeyWIF: privateKeyWIF)
 
-        // First call reports the buffer size the signed transaction needs.
-        var size = 0
-        guard sign_raw_transaction_ex(inputIndex, rawHex, nil, &size, script, sighashAll, privateKeyWIF) == 1,
-              size > 0 else {
-            throw DogecoinError.transactionSigningFailed
-        }
-
+        // One call: the buffer is sized for the longest signature there is,
+        // so libdogecoin never has to be asked first how much it will write.
+        var size = rawHex.utf8.count + signedInputGrowth
         var buffer = [CChar](repeating: 0, count: size)
         guard sign_raw_transaction_ex(inputIndex, rawHex, &buffer, &size, script, sighashAll, privateKeyWIF) == 1 else {
             throw DogecoinError.transactionSigningFailed
@@ -423,18 +388,16 @@ public struct SignedTransaction: Sendable, Equatable, Hashable {
     /// The effective fee used when building the transaction, if known
     public let fee: DogecoinAmount?
 
-    /// The transaction ID (computed from the raw hex)
-    public var txid: String {
-        // Transaction ID is the double SHA256 of the raw tx, reversed
-        guard let data = Data(hexString: rawHex) else { return rawHex }
-        let hash = MerkleTree.doubleSHA256(data)
-        return Data(hash.reversed()).hexString
-    }
+    /// The transaction ID, in the byte order block explorers show
+    public let txid: String
 
     /// Create from raw hex
-    public init(rawHex: String, fee: DogecoinAmount? = nil) {
+    /// - Returns: `nil` unless `rawHex` is one whole serialized transaction
+    public init?(rawHex: String, fee: DogecoinAmount? = nil) {
+        guard let transaction = RawTransaction(hex: rawHex) else { return nil }
         self.rawHex = rawHex
         self.fee = fee
+        self.txid = Data(transaction.txid.reversed()).hexString
     }
 }
 
@@ -448,36 +411,6 @@ struct TransactionPlan: Sendable, Equatable {
 }
 
 // MARK: - Convenience Functions
-
-/// Create and sign a simple transaction
-/// - Parameters:
-///   - inputs: The UTXOs to spend
-///   - outputs: The recipient addresses and amounts
-///   - privateKey: The private key to sign with
-///   - changeAddress: The address for change
-///   - fee: The transaction fee
-/// - Returns: The signed transaction
-/// - Throws: `DogecoinError` if any step fails
-public func createTransaction(
-    inputs: [UTXO],
-    outputs: [(address: String, amount: DogecoinAmount)],
-    privateKey: String,
-    changeAddress: String? = nil,
-    fee: DogecoinAmount
-) async throws -> SignedTransaction {
-    let uniqueAddresses = Set(inputs.map { $0.address })
-    guard uniqueAddresses.count <= 1 else {
-        throw DogecoinError.transactionValidationFailed("Multiple input addresses require per-input signing keys")
-    }
-
-    return try await createTransaction(
-        inputs: inputs,
-        outputs: outputs,
-        signingKeysByAddress: [inputs.first?.address ?? "": privateKey],
-        changeAddress: changeAddress,
-        fee: fee
-    )
-}
 
 /// Create and sign a transaction with per-input signing keys
 ///
@@ -507,15 +440,13 @@ public func createTransaction(
         changeAddress: changeAddress
     )
 
+    // One key check per address, however many inputs it funds.
+    var verifiedAddresses: Set<String> = []
     let signingKeys = try inputs.enumerated().map { index, input in
-        try signingKey(for: input, at: index, in: signingKeysByAddress)
+        try signingKey(for: input, at: index, in: signingKeysByAddress, verified: &verifiedAddresses)
     }
 
-    guard let firstOutput = outputs.first else {
-        throw DogecoinError.transactionCreationFailed
-    }
-
-    let builder = try await TransactionBuilder()
+    let builder = TransactionBuilder()
 
     for input in inputs {
         try await builder.addInput(txid: input.txid, vout: input.vout)
@@ -530,7 +461,6 @@ public func createTransaction(
     }
 
     _ = try await builder.finalize(
-        destinationAddress: firstOutput.address,
         fee: plan.fee,
         totalAmount: totalInput,
         changeAddress: plan.changeAddress
@@ -545,14 +475,22 @@ public func createTransaction(
         }
     }
 
-    let rawHex = try await builder.getRawTransaction()
-    let signed = SignedTransaction(rawHex: rawHex, fee: plan.fee)
+    guard let signed = SignedTransaction(rawHex: try await builder.getRawTransaction(), fee: plan.fee) else {
+        throw DogecoinError.transactionSigningFailed
+    }
     signLogger.info("Signed tx \(signed.txid, privacy: .public) — \(inputs.count, privacy: .public) in, \(outputs.count, privacy: .public) out, fee \(plan.fee.koinu, privacy: .public) koinu")
     return signed
 }
 
 /// Resolves and checks the key that will sign `input`.
-private func signingKey(for input: UTXO, at index: Int, in keysByAddress: [String: String]) throws -> String {
+/// - Parameter verified: Addresses whose key has already been shown to
+///   control them; added to here
+private func signingKey(
+    for input: UTXO,
+    at index: Int,
+    in keysByAddress: [String: String],
+    verified: inout Set<String>
+) throws -> String {
     guard let privateKey = keysByAddress[input.address] else {
         signLogger.error("Missing signing key for input \(index, privacy: .public) address=\(input.address, privacy: .private)")
         throw DogecoinError.transactionValidationFailed("Missing signing key for address \(input.address)")
@@ -571,10 +509,12 @@ private func signingKey(for input: UTXO, at index: Int, in keysByAddress: [Strin
         throw DogecoinError.transactionValidationFailed("Input \(index) script does not pay to \(input.address)")
     }
 
-    guard KeyPair.verify(privateKeyWIF: privateKey, address: input.address, network: network) else {
+    guard verified.contains(input.address)
+            || KeyPair.verify(privateKeyWIF: privateKey, address: input.address, network: network) else {
         signLogger.error("Signing key does not match input \(index, privacy: .public)")
         throw DogecoinError.transactionValidationFailed("Signing key does not match address \(input.address)")
     }
+    verified.insert(input.address)
 
     return privateKey
 }
@@ -609,50 +549,64 @@ func planTransaction(
         throw DogecoinError.transactionValidationFailed("Output amount exceeds the network maximum")
     }
 
+    // Nodes neither relay nor mine a transaction with an output this small.
+    for output in outputs where output.amount < FeeEstimation.hardDustLimit {
+        throw DogecoinError.transactionValidationFailed("Output amount is below the network's dust limit")
+    }
+
     let addresses = inputs.map(\.address) + outputs.map(\.address) + [changeAddress].compactMap { $0 }
     guard Set(addresses.compactMap { Address.detectNetwork($0) }).count <= 1 else {
         throw DogecoinError.transactionValidationFailed("Inputs, outputs, and change must be on the same network")
     }
 
-    var feeToUse = fee
-    if feeToUse < FeeEstimation.minimumFee {
-        feeToUse = FeeEstimation.minimumFee
-    }
-
     guard let totalInput = checkedSum(inputs.map(\.amount)),
-          let required = checkedSum(outputs.map(\.amount) + [feeToUse]) else {
+          let totalOutput = checkedSum(outputs.map(\.amount)) else {
         throw DogecoinError.transactionValidationFailed("Transaction amounts overflow")
     }
 
-    guard totalInput >= required else {
-        throw DogecoinError.transactionValidationFailed("Inputs do not cover outputs and fee")
-    }
-
-    var change = totalInput - required
-
-    if change.koinu > 0 && change < FeeEstimation.dustThreshold {
-        feeToUse += change
-        change = .zero
-    }
-
-    let shouldIncludeChange = change.koinu > 0
-    let outputCount = outputs.count + (shouldIncludeChange ? 1 : 0)
-    let estimatedSize = FeeEstimation.estimateTransactionSize(
-        inputCount: inputs.count,
-        outputCount: outputCount
-    )
-
-    guard estimatedSize <= FeeEstimation.maxStandardTxSize else {
+    guard FeeEstimation.estimateTransactionSize(inputCount: inputs.count, outputCount: outputs.count) <= FeeEstimation.maxStandardTxSize else {
         throw DogecoinError.transactionValidationFailed("Transaction exceeds standard size limit")
     }
 
-    // Without a change address, change returns to the first input's
-    // address (there is always one: empty inputs were rejected above).
+    /// The fee to pay with `outputCount` outputs: the one asked for, or the
+    /// least nodes relay for a transaction of that size if that is more.
+    func feeToPay(outputCount: Int) -> DogecoinAmount {
+        let size = FeeEstimation.estimateTransactionSize(inputCount: inputs.count, outputCount: outputCount)
+        return max(fee, FeeEstimation.minimumRelayFee(sizeBytes: size, outputs: outputs.map(\.amount)))
+    }
+
+    // With a change output, when what the inputs leave over is worth one.
+    let feeWithChange = feeToPay(outputCount: outputs.count + 1)
+    if let spent = checkedSum([totalOutput, feeWithChange, FeeEstimation.softDustLimit]), totalInput >= spent {
+        // No room for the output: fail rather than let the change fall
+        // through to the fee below.
+        guard FeeEstimation.estimateTransactionSize(inputCount: inputs.count, outputCount: outputs.count + 1) <= FeeEstimation.maxStandardTxSize else {
+            throw DogecoinError.transactionValidationFailed("Transaction exceeds standard size limit")
+        }
+
+        // Without a change address, change returns to the first input's
+        // address (there is always one: empty inputs were rejected above).
+        return TransactionPlan(
+            fee: feeWithChange,
+            change: totalInput - totalOutput - feeWithChange,
+            changeAddress: changeAddress ?? inputs.first?.address,
+            outputCount: outputs.count + 1
+        )
+    }
+
+    // Without one: what the inputs leave over — less than the soft dust
+    // limit beyond the fee, or the branch above would have taken it — is
+    // the fee.
+    guard let required = checkedSum([totalOutput, feeToPay(outputCount: outputs.count)]),
+          totalInput >= required else {
+        throw DogecoinError.transactionValidationFailed("Inputs do not cover outputs and fee")
+    }
+
     return TransactionPlan(
-        fee: feeToUse,
-        change: change,
-        changeAddress: shouldIncludeChange ? changeAddress ?? inputs.first?.address : nil,
-        outputCount: outputCount
+        fee: totalInput - totalOutput,
+        change: .zero,
+        changeAddress: nil,
+        outputCount: outputs.count
     )
 }
 

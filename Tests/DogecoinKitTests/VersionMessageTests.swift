@@ -4,7 +4,7 @@ import Testing
 @Suite("Version Message Parsing")
 struct VersionMessageTests {
     @Test("Parse version message with extended user agent")
-    func testParseWithExtendedUserAgent() {
+    func parseWithExtendedUserAgent() {
         let userAgent = String(repeating: "a", count: 253)
         let addrRecv = NetworkAddress.ipv4("127.0.0.1", port: 22556, services: 1)
         let addrFrom = NetworkAddress.ipv4("10.0.0.2", port: 22556, services: 9)

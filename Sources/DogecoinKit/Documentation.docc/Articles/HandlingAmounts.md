@@ -31,20 +31,16 @@ Koinu is to Dogecoin what satoshi is to Bitcoin.
 import DogecoinKit
 
 // From a Double
-let amount1 = DogecoinAmount(doge: 100.5)
-
-// Using static method
-let amount2 = DogecoinAmount.doge(100)
+let amount = DogecoinAmount(doge: 100.5)
 ```
+
+The value is rounded to the nearest koinu. Negative and non-finite values become zero. A `Double` holds an amount exactly to the koinu only up to about 90 million DOGE, so where every koinu matters create the amount from koinu or from a string.
 
 ### From Koinu Value
 
 ```swift
 // From koinu (integer)
-let amount1 = DogecoinAmount(koinu: 150_000_000)  // 1.5 DOGE
-
-// Using static method
-let amount2 = DogecoinAmount.koinu(50_000_000)   // 0.5 DOGE
+let amount = DogecoinAmount(koinu: 150_000_000)  // 1.5 DOGE
 ```
 
 ### From String
@@ -54,16 +50,15 @@ let amount2 = DogecoinAmount.koinu(50_000_000)   // 0.5 DOGE
 let amount = try DogecoinAmount(dogeString: "123.456")
 ```
 
-### Literal Syntax
-
-``DogecoinAmount`` supports literal syntax for convenience:
+The string must be plain ASCII digits, optionally followed by `.` and one to eight decimal places, such as `"100"` or `"0.5"`. Surrounding whitespace is ignored. A sign, a grouping separator, a decimal comma, an exponent, or a ninth decimal place throws ``DogecoinError/amountConversionFailed``, so bring text typed in the user's locale into this form first:
 
 ```swift
-// Integer literal (whole DOGE)
-let wholeDoge: DogecoinAmount = 100  // 100 DOGE
-
-// Float literal
-let fractionalDoge: DogecoinAmount = 1.5  // 1.5 DOGE
+do {
+    let amount = try DogecoinAmount(dogeString: userInput)
+    print("Sending \(amount)")
+} catch DogecoinError.amountConversionFailed {
+    showError("Enter an amount such as 12.5")
+}
 ```
 
 ## Reading Values
@@ -92,17 +87,14 @@ print(amount.koinu)  // 150000000
 ```swift
 let amount = DogecoinAmount(doge: 1234.56789)
 
-// Default: 8 decimal places
+// Always 8 decimal places, computed without floating point
 print(amount.dogeString)  // "1234.56789000"
-
-// Custom decimal places
-print(amount.formatted(decimals: 2))  // "1234.57"
-print(amount.formatted(decimals: 0))  // "1235"
-print(amount.formatted(decimals: 4))  // "1234.5679"
 
 // As description (includes "DOGE" suffix)
 print(amount.description)  // "1234.56789000 DOGE"
 ```
+
+To show fewer decimal places or the user's digit grouping, see <doc:HandlingAmounts#Displaying-Amounts>.
 
 ## Arithmetic Operations
 
@@ -139,7 +131,7 @@ wallet -= spend
 print(wallet.doge)  // 70.0
 ```
 
-> Warning: Subtraction saturates at zero. Subtracting a larger amount from a smaller one returns ``DogecoinAmount/zero`` instead of trapping, so a shortfall can go unnoticed. Always validate before subtraction. Addition and multiplication saturate at `UInt64.max` the same way.
+> Warning: Subtraction saturates at zero. Subtracting a larger amount from a smaller one returns ``DogecoinAmount/zero`` instead of trapping, so a shortfall can go unnoticed. Always validate before subtraction. Addition and multiplication saturate at `UInt64.max` the same way, and dividing by zero gives zero.
 
 ### Multiplication
 
@@ -191,21 +183,15 @@ if amount == .zero {
 ### Calculating Transaction Fee
 
 ```swift
-func calculateFee(inputCount: Int, outputCount: Int) -> DogecoinAmount {
-    // Estimate transaction size
-    let estimatedSize = inputCount * 148 + outputCount * 34 + 10
+// A transaction with 2 inputs and 2 outputs is at most 374 bytes
+let size = FeeEstimation.estimateTransactionSize(inputCount: 2, outputCount: 2)
 
-    // Standard fee rate: 1 DOGE per KB
-    let feePerByte = DogecoinAmount(koinu: 100_000)  // 0.001 DOGE per byte
-
-    return feePerByte * UInt64(estimatedSize)
-}
-
-let fee = calculateFee(inputCount: 2, outputCount: 2)
-print("Estimated fee: \(fee)")  // "Estimated fee: 0.37400000 DOGE"
+// At the standard rate: 0.01 DOGE per 1,000 bytes
+let fee = FeeEstimation.calculateFee(sizeBytes: size, feePerKB: FeeEstimation.standardFeePerKB)
+print("Estimated fee: \(fee)")  // "Estimated fee: 0.00374000 DOGE"
 ```
 
-``FeeEstimation`` provides this calculation, with priority levels and the 0.01 DOGE minimum fee applied.
+``FeeEstimation/estimateFee(inputCount:outputCount:priority:)`` does both steps in one call. <doc:SendingTransactions> covers the fee rates and the dust rules.
 
 ### Calculating Change
 
@@ -219,6 +205,8 @@ func calculateChange(
     return totalInput - sendAmount - fee
 }
 ```
+
+``SpendPlan`` works the inputs, the fee, and the change out together.
 
 ### Validating Sufficient Balance
 
@@ -234,7 +222,7 @@ func canAffordTransaction(
 
 let balance = DogecoinAmount(doge: 100)
 let sending = DogecoinAmount(doge: 50)
-let fee = DogecoinAmount(doge: 1)
+let fee = FeeEstimation.typicalFee
 
 if canAffordTransaction(balance: balance, sendAmount: sending, fee: fee) {
     print("Transaction is affordable")
@@ -262,20 +250,30 @@ print("Total: \(total)")  // "Total: 100.00000000 DOGE"
 
 ## Displaying Amounts
 
+``DogecoinAmount/dogeString`` always shows eight decimal places. For anything else, format the exact value as a `Decimal` rather than the `Double` in ``DogecoinAmount/doge``, which can be off by a few koinu for very large amounts.
+
 ### User-Friendly Formatting
 
 ```swift
 extension DogecoinAmount {
+    /// The exact amount in DOGE
+    var decimalValue: Decimal {
+        Decimal(koinu) / Decimal(Self.koinuPerDoge)
+    }
+
     /// Format for display with appropriate precision
     func displayString(showSymbol: Bool = true) -> String {
-        let formatted: String
-        if doge >= 1000 {
-            formatted = self.formatted(decimals: 2)
-        } else if doge >= 1 {
-            formatted = self.formatted(decimals: 4)
-        } else {
-            formatted = self.formatted(decimals: 8)
+        let decimals = switch doge {
+        case 1000...: 2
+        case 1...: 4
+        default: 8
         }
+        let formatted = decimalValue.formatted(
+            .number
+                .precision(.fractionLength(decimals))
+                .grouping(.never)
+                .locale(Locale(identifier: "en_US_POSIX"))
+        )
         return showSymbol ? "Ð\(formatted)" : formatted
     }
 }
@@ -294,19 +292,19 @@ print(small.displayString())  // "Ð0.00001234"
 
 ```swift
 extension DogecoinAmount {
+    /// Uses `decimalValue` from the extension above
     func localizedString(locale: Locale = .current) -> String {
-        let formatter = NumberFormatter()
-        formatter.locale = locale
-        formatter.numberStyle = .decimal
-        formatter.minimumFractionDigits = 2
-        formatter.maximumFractionDigits = 8
-
-        return formatter.string(from: NSNumber(value: doge)) ?? dogeString
+        decimalValue.formatted(
+            .number
+                .precision(.fractionLength(2...8))
+                .locale(locale)
+        )
     }
 }
 
 let amount = DogecoinAmount(doge: 1234567.89)
-print(amount.localizedString())  // "1,234,567.89" (US) or "1.234.567,89" (DE)
+print(amount.localizedString(locale: Locale(identifier: "en_US")))  // "1,234,567.89"
+print(amount.localizedString(locale: Locale(identifier: "de_DE")))  // "1.234.567,89"
 ```
 
 ## Serialization
@@ -324,7 +322,7 @@ struct Transaction: Codable {
 let tx = Transaction(
     id: "abc123",
     amount: DogecoinAmount(doge: 100),
-    fee: DogecoinAmount(doge: 1)
+    fee: DogecoinAmount(koinu: 226_000)
 )
 let json = try JSONEncoder().encode(tx)
 
@@ -335,28 +333,10 @@ print(decoded.amount.doge)  // 100.0
 
 > Note: ``DogecoinAmount`` serializes as its koinu value (UInt64) for precision.
 
-## Utility Functions
-
-### Convert Koinu to String
-
-```swift
-let koinu: UInt64 = 150_000_000
-let string = koinuToDogeString(koinu)
-print(string)  // "1.50000000"
-```
-
-### Convert String to Koinu
-
-```swift
-let string = "1.5"
-let koinu = try dogeStringToKoinu(string)
-print(koinu)  // 150000000
-```
-
 ## Best Practices
 
 1. **Always use DogecoinAmount** — Never store amounts as Double or String
-2. **Validate inputs** — Check for negative amounts or overflow
+2. **Validate inputs** — Check for negative amounts or overflow, and against ``DogecoinAmount/maxMoney``, the most any transaction output may carry
 3. **Use koinu for storage** — Store amounts as UInt64 in databases
 4. **Format for display** — Use appropriate decimal places based on amount size
 5. **Check before subtraction** — Ensure the result won't be negative
@@ -364,6 +344,6 @@ print(koinu)  // 150000000
 ## See Also
 
 - ``DogecoinAmount``
-- ``koinuToDogeString(_:)``
-- ``dogeStringToKoinu(_:)``
+- ``FeeEstimation``
+- ``SpendPlan``
 - <doc:SendingTransactions>

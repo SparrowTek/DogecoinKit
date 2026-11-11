@@ -10,7 +10,7 @@
 #   SWIFT           The `swift` to build with. Default: swift on PATH. A Swift
 #                   SDK for Android of the same version must be installed.
 #   ANDROID_SERIAL  The device adb talks to, when more than one is connected.
-#   DOGECOINKIT_LIVE_P2P=1, ELECTRUM_INTEGRATION_TESTS=1
+#   DOGECOINKIT_LIVE_P2P=1, DOGECOINKIT_LIVE_ELECTRUM=1
 #                   Also run the live-network tests, from the device.
 
 set -euo pipefail
@@ -61,9 +61,11 @@ adb shell "rm -rf $device_dir && mkdir -p $device_dir/tmp"
 adb push "$staging/." "$device_dir" >/dev/null
 
 environment="LD_LIBRARY_PATH=. HOME=$device_dir/tmp TMPDIR=$device_dir/tmp"
-for name in DOGECOINKIT_LIVE_P2P ELECTRUM_INTEGRATION_TESTS; do
+for name in DOGECOINKIT_LIVE_P2P DOGECOINKIT_LIVE_ELECTRUM; do
     if [[ -n "${!name:-}" ]]; then
         environment+=" $name=${!name}"
     fi
 done
-adb shell "cd $device_dir && $environment ./DogecoinKitTests-test-runner --testing-library swift-testing"
+# One test at a time: emulators are often given a single core, and the suites
+# that script peers and servers time out when hundreds of tests share it.
+adb shell "cd $device_dir && $environment ./DogecoinKitTests-test-runner --testing-library swift-testing --no-parallel"

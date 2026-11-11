@@ -5,7 +5,7 @@ import Testing
 @Suite("SPV Transaction Verification Tests")
 struct SPVTransactionVerificationTests {
     @Test("Bloom filter contains inserted element")
-    func testBloomFilterInsert() {
+    func bloomFilterInsert() {
         var filter = BloomFilter(elementCount: 1, falsePositiveRate: 0.0001, tweak: 1, flags: 0)
         let element = Data([0x01, 0x02, 0x03, 0x04])
         filter.insert(element)
@@ -13,7 +13,7 @@ struct SPVTransactionVerificationTests {
     }
 
     @Test("Merkle block matches single transaction")
-    func testMerkleBlockSingleTransaction() throws {
+    func merkleBlockSingleTransaction() throws {
         let txid = Data(repeating: 0x11, count: 32)
         let header = BlockHeader(
             version: 1,
@@ -37,7 +37,7 @@ struct SPVTransactionVerificationTests {
     }
 
     @Test("Merkle block matches two transactions")
-    func testMerkleBlockTwoTransactions() throws {
+    func merkleBlockTwoTransactions() throws {
         let txid1 = Data(repeating: 0x01, count: 32)
         let txid2 = Data(repeating: 0x02, count: 32)
         let root = MerkleTree.hashPair(txid1, txid2)

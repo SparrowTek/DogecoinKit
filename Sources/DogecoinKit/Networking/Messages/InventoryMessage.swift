@@ -10,14 +10,6 @@ public enum InventoryType: UInt32, Sendable, CaseIterable {
     case block = 2
     /// Filtered block (Merkle block)
     case filteredBlock = 3
-    /// Compact block
-    case compactBlock = 4
-    /// Witness transaction (segwit)
-    case witnessTransaction = 0x40000001
-    /// Witness block (segwit)
-    case witnessBlock = 0x40000002
-    /// Witness filtered block (segwit)
-    case witnessFilteredBlock = 0x40000003
 }
 
 /// Inventory vector
@@ -53,6 +45,8 @@ public struct InventoryVector: Sendable, Equatable, Hashable {
     public static func parse(from data: Data) -> InventoryVector? {
         guard let typeRaw: UInt32 = data.readInteger(at: 0),
               let hash = data.bytes(at: 4, count: 32) else { return nil }
+        // Kinds this client never asks for (compact blocks, witness data)
+        // read as `.error` and are ignored.
         let type = InventoryType(rawValue: UInt32(littleEndian: typeRaw)) ?? .error
 
         return InventoryVector(type: type, hash: hash)
@@ -143,7 +137,7 @@ public struct GetDataMessage: Sendable {
     }
 }
 
-/// Not found message
+/// Not found message: what a peer was asked for with `getdata` and does not have
 public struct NotFoundMessage: Sendable {
     /// List of inventory vectors not found
     public let inventory: [InventoryVector]

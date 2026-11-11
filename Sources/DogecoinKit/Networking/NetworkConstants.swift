@@ -25,8 +25,11 @@ public enum NetworkConstants {
     /// blocks nor headers, so it does not claim `NODE_NETWORK`.
     public static let services: UInt64 = 0
 
-    /// Maximum message payload size (32 MB)
-    public static let maxPayloadSize: UInt32 = 32 * 1024 * 1024
+    /// Maximum message payload size: 4 MB, Dogecoin Core's
+    /// `MAX_PROTOCOL_MESSAGE_LENGTH`. Nodes drop a peer that sends them
+    /// more, so none can count on a larger message being read — a full
+    /// `headers` message, proofs and all, is under half of it.
+    public static let maxPayloadSize: UInt32 = 4_000_000
 
     /// Command name length in message header
     public static let commandLength = 12
@@ -59,6 +62,18 @@ public enum NetworkConstants {
     public static let testnetSeeds = [
         "testnetseed.jrn.me.uk"
     ]
+
+    /// The hash of each network's first block, as block explorers show it
+    public static let mainnetGenesisHash = "1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691"
+    public static let testnetGenesisHash = "bb0a78264637406b6360aad926284d544d7049f45189db5664f3c4d07350559e"
+
+    /// Get the genesis block hash for network
+    public static func genesisHash(for network: DogecoinNetwork) -> String {
+        switch network {
+        case .mainnet: return mainnetGenesisHash
+        case .testnet: return testnetGenesisHash
+        }
+    }
 
     /// Get magic bytes for network
     public static func magic(for network: DogecoinNetwork) -> UInt32 {

@@ -29,26 +29,27 @@ public struct BloomFilter: Sendable {
     }
 
     public mutating func insert(_ element: Data) {
-        guard !data.isEmpty else { return }
-        for i in 0..<hashFunctions {
-            let seed = i &* 0xfba4c795 &+ tweak
-            let hash = murmurHash(seed: seed, data: element)
-            let bitIndex = Int(hash % UInt32(data.count * 8))
+        for bitIndex in bitIndexes(of: element) {
             setBit(bitIndex)
         }
     }
 
     public func contains(_ element: Data) -> Bool {
         guard !data.isEmpty else { return false }
-        for i in 0..<hashFunctions {
-            let seed = i &* 0xfba4c795 &+ tweak
-            let hash = murmurHash(seed: seed, data: element)
-            let bitIndex = Int(hash % UInt32(data.count * 8))
-            if !isBitSet(bitIndex) {
-                return false
-            }
+        return bitIndexes(of: element).allSatisfy(isBitSet)
+    }
+
+    /// The bit each hash function assigns to `element`. Empty for an empty
+    /// filter, which holds nothing.
+    private func bitIndexes(of element: Data) -> [Int] {
+        guard !data.isEmpty else { return [] }
+
+        // One copy of the element serves every hash function.
+        let bytes = [UInt8](element)
+        let bitCount = UInt32(data.count * 8)
+        return (0..<hashFunctions).map { function in
+            Int(Self.murmurHash(seed: function &* 0xfba4c795 &+ tweak, bytes: bytes) % bitCount)
         }
-        return true
     }
 
     public func loadMessage() -> FilterLoadMessage {
@@ -67,12 +68,11 @@ public struct BloomFilter: Sendable {
         return (data[byteIndex] & bit) != 0
     }
 
-    private func murmurHash(seed: UInt32, data: Data) -> UInt32 {
+    private static func murmurHash(seed: UInt32, bytes: [UInt8]) -> UInt32 {
         let c1: UInt32 = 0xcc9e2d51
         let c2: UInt32 = 0x1b873593
 
         var hash = seed
-        let bytes = [UInt8](data)
         let blockCount = bytes.count / 4
 
         for i in 0..<blockCount {
@@ -157,14 +157,6 @@ public struct FilterAddMessage: Sendable {
         data.append(VarInt(UInt64(element.count)).serialize())
         data.append(element)
         return data
-    }
-}
-
-public struct FilterClearMessage: Sendable {
-    public init() {}
-
-    public func serialize() -> Data {
-        Data()
     }
 }
 

@@ -20,9 +20,6 @@ The simplest way to create a new wallet:
 import DogecoinKit
 
 func createWallet() async throws {
-    // Ensure the library is initialized
-    await Dogecoin.initialize()
-
     // Create a wallet with a 12-word mnemonic
     let wallet = try await HDWallet.create(
         strength: .words12,
@@ -30,9 +27,7 @@ func createWallet() async throws {
     )
 
     // Access the recovery phrase
-    if let mnemonic = wallet.mnemonic {
-        print("Recovery phrase: \(mnemonic)")
-    }
+    print("Recovery phrase: \(wallet.mnemonic)")
 }
 ```
 
@@ -65,7 +60,7 @@ let wallet24 = try await HDWallet.create(strength: .words24)
 | `.words21` | 21 | 224 bits | Very High |
 | `.words24` | 24 | 256 bits | Maximum |
 
-> Tip: 12 words provides excellent security for most use cases. 24 words is recommended for high-value wallets.
+> Tip: 12 words is the default. More words mean more entropy, and more for the user to write down.
 
 ### Adding a Passphrase
 
@@ -114,37 +109,42 @@ let wallet = try await HDWallet(
 
 ### Validating Mnemonics
 
-Before attempting restoration, validate the mnemonic:
+Before attempting restoration, validate the mnemonic, so you can tell the user what is wrong with it:
 
 ```swift
 let userInput = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
 
-if validateMnemonic(userInput) {
+switch validateMnemonicDetailed(userInput).error {
+case nil:
     // Mnemonic is valid - proceed with restoration
     let wallet = try await HDWallet(mnemonic: userInput, network: .mainnet)
-} else {
-    // Invalid mnemonic - show error to user
-    print("Invalid recovery phrase")
+case .emptyMnemonic:
+    print("Enter your recovery phrase")
+case .invalidWordCount:
+    print("A recovery phrase has 12, 15, 18, 21, or 24 words")
+case .invalidWords(let positions):
+    // Zero-based positions of the words that aren't in the word list
+    print("Check word \(positions.map { String($0 + 1) }.joined(separator: ", "))")
+case .invalidChecksum:
+    print("Every word is valid, but together they aren't a recovery phrase")
 }
 ```
 
-The validation checks:
+The validation checks, in this order:
 - Correct word count (12, 15, 18, 21, or 24 words)
 - Words are from the BIP39 English word list
 - Checksum is valid
 
 > Note: ``HDWallet/init(mnemonic:passphrase:network:)`` runs the same validation itself and throws ``DogecoinError/invalidMnemonic`` for an unknown word or a bad checksum. BIP39 can turn any string into a seed, so without this check a single mistyped word would silently restore a different, empty wallet.
 
-Validation is exact: words must be lowercase and separated by single spaces, with nothing before or after, so normalize typed or pasted input first:
+Typed and pasted phrases rarely arrive in canonical form. Both ``validateMnemonicDetailed(_:)`` and ``HDWallet/init(mnemonic:passphrase:network:)`` judge a phrase as ``normalizedMnemonic(_:)`` writes it, in lowercase words separated by single spaces, so capitals, repeated spaces, and line breaks are not errors and never change which wallet a phrase opens. ``HDWallet/mnemonic`` holds the normalized phrase.
+
+``verifyMnemonic(_:language:)`` is the exact check underneath: it accepts only the normalized form, so normalize first when you call it yourself:
 
 ```swift
-let phrase = userInput
-    .lowercased()
-    .split(whereSeparator: \.isWhitespace)
-    .joined(separator: " ")
+let phrase = normalizedMnemonic(userInput)
+let isValid = verifyMnemonic(phrase)
 ```
-
-To tell the user which word is wrong, pass the normalized phrase to ``validateMnemonicDetailed(_:)``.
 
 ## Generating Mnemonics Directly
 
@@ -210,6 +210,19 @@ let address = try await wallet.deriveAddress(path: "m/44'/3'/0'/0/0")
 let customAddress = try await wallet.deriveAddress(path: "m/44'/3'/1'/0/5")
 ```
 
+A path is `m` followed by one or more `/index` components, each below 2³¹ and optionally marked hardened with `'`, `h`, `H`, or `p`. Anything else throws ``DogecoinError/derivationFailed``.
+
+### Private Keys
+
+Signing a transaction takes the private key of each address being spent from. ``HDWallet/derivePrivateKey(account:index:change:)`` and ``HDWallet/derivePrivateKey(path:)`` return it in Wallet Import Format (WIF), for the same paths the address methods take:
+
+```swift
+// The key that controls the first receiving address
+let privateKeyWIF = try await wallet.derivePrivateKey(account: 0, index: 0)
+```
+
+Derive keys when you are about to sign and let them go afterwards. <doc:SendingTransactions> shows where they are used.
+
 ## Multiple Accounts
 
 HD wallets support multiple accounts for organizing funds:
@@ -236,9 +249,10 @@ Never store mnemonics in plain text. On Apple platforms, use ``SecureKeyStorage`
 ```swift
 let storage = SecureKeyStorage(serviceName: "com.yourapp.wallet")
 
-// Create a wallet and store its recovery phrase in one step
-let (wallet, keychainID) = try await storage.createAndStoreWallet(
-    strength: .words12,
+// Create a wallet and store its recovery phrase
+let wallet = try await HDWallet.create(strength: .words12, network: .mainnet)
+let keychainID = try await storage.storeWalletCredentials(
+    mnemonic: wallet.mnemonic,
     network: .mainnet
 )
 
@@ -260,6 +274,10 @@ let words = credentials.mnemonic.split(separator: " ")
 try await storage.deleteWalletCredentials(id: keychainID)
 ```
 
+``SecureKeyStorage/storeWalletCredentials(mnemonic:passphrase:network:)`` stores only a phrase that passes ``verifyMnemonic(_:language:)`` and throws ``DogecoinError/invalidMnemonic`` for any other, because ``SecureKeyStorage/restoreWallet(keychainID:)`` derives the wallet from the stored text without checking it again. The ``HDWallet/mnemonic`` of a wallet you created or restored from a phrase is in that form, and ``SecureKeyStorage/importAndStoreWallet(mnemonic:passphrase:network:)`` normalizes what it is given before storing it. A wallet created with a passphrase needs the same passphrase stored with it.
+
+To learn whether credentials are still there without reading the phrase, call ``SecureKeyStorage/walletCredentialsExist(id:)``. It throws ``DogecoinError/keychainRetrievalFailed(_:)`` when the Keychain can't answer, such as while the device is locked. That is not the same as the credentials being gone, so don't treat it as "no wallet".
+
 ### Security Recommendations
 
 1. **Never log mnemonics** — Avoid printing or logging recovery phrases
@@ -280,9 +298,8 @@ do {
     // Unknown word, wrong word count, or bad checksum
     showError("Please check your recovery phrase and try again.")
 } catch DogecoinError.initializationFailed {
-    // Library not initialized yet
-    await Dogecoin.initialize()
-    // Retry...
+    // The secp256k1 context the library needs could not be created
+    showError("This device could not start the wallet's cryptography.")
 } catch {
     // Other error
     showError("An error occurred: \(error.localizedDescription)")
@@ -296,6 +313,8 @@ do {
 - ``HDWallet``
 - ``MnemonicStrength``
 - ``generateMnemonic(strength:)``
-- ``validateMnemonic(_:)``
+- ``validateMnemonicDetailed(_:)``
+- ``normalizedMnemonic(_:)``
+- ``SecureKeyStorage``
 - <doc:GettingStarted>
 - <doc:WorkingWithAddresses>

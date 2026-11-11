@@ -45,8 +45,4 @@ public struct ElectrumServerList: Sendable {
             return testnetServers
         }
     }
-
-    public static func randomServer(for network: DogecoinNetwork) -> ElectrumServer? {
-        servers(for: network).randomElement()
-    }
 }

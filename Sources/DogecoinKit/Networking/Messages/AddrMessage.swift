@@ -17,7 +17,7 @@ public struct AddrMessage: Sendable {
         self.entries = entries
     }
 
-    public func serialize() -> Data {
+    func serialize() -> Data {
         var data = Data()
         data.append(VarInt(UInt64(entries.count)).serialize())
 

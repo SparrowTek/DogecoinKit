@@ -5,13 +5,13 @@ import os.log
 #endif
 
 /// Errors from header database operations
-public enum HeaderDatabaseError: Error, Sendable {
+public enum HeaderDatabaseError: Error, Sendable, Equatable {
     case databaseNotOpen
-    case migrationFailed(Error)
-    case queryFailed(Error)
-    case insertFailed(Error)
     /// A pre-built header cache failed verification and was not installed
     case invalidCache(String)
+    /// Another connection extended or replaced the best chain since this
+    /// one last looked. Nothing was written.
+    case chainChanged
 }
 
 extension HeaderDatabaseError: LocalizedError {
@@ -19,14 +19,10 @@ extension HeaderDatabaseError: LocalizedError {
         switch self {
         case .databaseNotOpen:
             return "The header database is not open"
-        case .migrationFailed(let error):
-            return "Header database migration failed: \(error.localizedDescription)"
-        case .queryFailed(let error):
-            return "Header database query failed: \(error.localizedDescription)"
-        case .insertFailed(let error):
-            return "Header database insert failed: \(error.localizedDescription)"
         case .invalidCache(let reason):
             return "The header cache is not usable: \(reason)"
+        case .chainChanged:
+            return "The header database was changed by another connection"
         }
     }
 }
@@ -53,6 +49,10 @@ public final class HeaderDatabase: Sendable {
             try db.execute(sql: "PRAGMA synchronous = NORMAL")
             // 64MB cache
             try db.execute(sql: "PRAGMA cache_size = -64000")
+            // A sync writes a batch of headers every second or two. Without
+            // a limit the write-ahead log keeps whatever size its largest
+            // burst reached, for as long as the file is open.
+            try db.execute(sql: "PRAGMA journal_size_limit = 67108864")
         }
 
         self.dbQueue = try DatabaseQueue(path: path, configuration: config)
@@ -84,7 +84,7 @@ public final class HeaderDatabase: Sendable {
     }
 
     /// Initialize with an in-memory database (for testing)
-    public init() throws {
+    init() throws {
         self.dbQueue = try DatabaseQueue()
         try migrate()
     }
@@ -134,6 +134,14 @@ public final class HeaderDatabase: Sendable {
             try db.execute(sql: "DROP INDEX IF EXISTS idx_headers_merkle_root")
         }
 
+        // Every query that names a height also asks for the best chain, and
+        // `idx_headers_best_chain_height` answers those on its own. The
+        // index on height alone — another 76 MB of a full mainnet chain —
+        // served nothing else.
+        migrator.registerMigration("v3_drop_height_index") { db in
+            try db.execute(sql: "DROP INDEX IF EXISTS headers_on_height")
+        }
+
         try migrator.migrate(dbQueue)
     }
 
@@ -149,24 +157,21 @@ public final class HeaderDatabase: Sendable {
     /// Get header by height (from best chain)
     public func getHeader(height: Int32) throws -> HeaderRecord? {
         try dbQueue.read { db in
-            try HeaderRecord
-                .filter(HeaderRecord.Columns.height == height)
-                .filter(HeaderRecord.Columns.isInBestChain == true)
-                .fetchOne(db)
+            try Self.bestChainHeader(at: height, db)
         }
     }
 
     /// Get the chain tip (highest header in best chain)
     public func getTip() throws -> HeaderRecord? {
         try dbQueue.read { db in
-            try HeaderRecord
-                .filter(HeaderRecord.Columns.isInBestChain == true)
-                .order(HeaderRecord.Columns.height.desc)
-                .fetchOne(db)
+            try Self.tip(db)
         }
     }
 
-    /// Get total header count
+    /// Counts every stored header, side branches included.
+    ///
+    /// This reads the whole table. The best chain's length is its tip's
+    /// height plus one, which ``getTip()`` gives at once.
     public func getHeaderCount() throws -> Int {
         try dbQueue.read { db in
             try HeaderRecord.fetchCount(db)
@@ -176,12 +181,7 @@ public final class HeaderDatabase: Sendable {
     /// Get headers in best chain within height range
     public func getHeaders(fromHeight: Int32, toHeight: Int32) throws -> [HeaderRecord] {
         try dbQueue.read { db in
-            try HeaderRecord
-                .filter(HeaderRecord.Columns.isInBestChain == true)
-                .filter(HeaderRecord.Columns.height >= fromHeight)
-                .filter(HeaderRecord.Columns.height <= toHeight)
-                .order(HeaderRecord.Columns.height)
-                .fetchAll(db)
+            try HeaderRecord.fetchAll(db, sql: Query.bestChainRange, arguments: [fromHeight, toHeight])
         }
     }
 
@@ -192,19 +192,32 @@ public final class HeaderDatabase: Sendable {
         }
     }
 
+    /// The statements that find blocks by height. Each names the best
+    /// chain, so each is answered by `idx_headers_best_chain_height` — the
+    /// only index on height there is. One that did not would read all six
+    /// million rows.
+    enum Query {
+        static let tip = "SELECT * FROM headers WHERE isInBestChain = 1 ORDER BY height DESC LIMIT 1"
+        static let bestChainAtHeight = "SELECT * FROM headers WHERE isInBestChain = 1 AND height = ?"
+        static let bestChainRange = "SELECT * FROM headers WHERE isInBestChain = 1 AND height >= ? AND height <= ? ORDER BY height"
+        static let unflagAbove = "UPDATE headers SET isInBestChain = 0 WHERE isInBestChain = 1 AND height > ?"
+        static let unflagOthersAtHeight = "UPDATE headers SET isInBestChain = 0 WHERE isInBestChain = 1 AND height = ? AND hash <> ?"
+    }
+
+    private static func tip(_ db: Database) throws -> HeaderRecord? {
+        try HeaderRecord.fetchOne(db, sql: Query.tip)
+    }
+
+    private static func bestChainHeader(at height: Int32, _ db: Database) throws -> HeaderRecord? {
+        try HeaderRecord.fetchOne(db, sql: Query.bestChainAtHeight, arguments: [height])
+    }
+
     // MARK: - Write Operations
 
     /// Insert a single header
     public func insertHeader(_ record: HeaderRecord) throws {
         try dbQueue.write { db in
             try record.insert(db)
-        }
-    }
-
-    /// Insert or update a single header
-    public func upsertHeader(_ record: HeaderRecord) throws {
-        try dbQueue.write { db in
-            try record.save(db)
         }
     }
 
@@ -217,67 +230,43 @@ public final class HeaderDatabase: Sendable {
         }
     }
 
-    /// Insert headers in batches with progress callback
-    public func insertHeadersBatched(
-        _ records: [HeaderRecord],
-        batchSize: Int = 10000,
-        progress: ((Int, Int) -> Void)? = nil
-    ) throws {
-        let total = records.count
-        var inserted = 0
-
-        for batch in records.chunks(ofCount: max(1, batchSize)) {
-            try dbQueue.write { db in
-                for record in batch {
-                    try record.insert(db)
-                }
+    /// Appends `records` to the best chain in one transaction — provided
+    /// the chain still ends where the caller believes it does.
+    ///
+    /// Two connections to one file each keep their own idea of the tip. The
+    /// check runs inside the write transaction, so the one that is out of
+    /// date finds out here instead of flagging a second block at a height
+    /// the other has already filled.
+    /// - Parameters:
+    ///   - records: Headers extending the best chain, in order
+    ///   - expectedTip: The hash of the tip they build on
+    /// - Throws: ``HeaderDatabaseError/chainChanged`` when the stored tip is
+    ///   another block; nothing is written then
+    func appendToBestChain(_ records: [HeaderRecord], after expectedTip: Data) throws {
+        guard !records.isEmpty else { return }
+        try dbQueue.write { db in
+            guard try Self.tip(db)?.hash == expectedTip else {
+                throw HeaderDatabaseError.chainChanged
             }
-            inserted += batch.count
-            progress?(inserted, total)
-        }
-    }
-
-    /// Update header's best chain status
-    public func updateBestChainStatus(hash: Data, isInBestChain: Bool) throws {
-        try dbQueue.write { db in
-            try db.execute(
-                sql: "UPDATE headers SET isInBestChain = ? WHERE hash = ?",
-                arguments: [isInBestChain, hash]
-            )
-        }
-    }
-
-    /// Mark range of heights as best chain
-    public func markBestChain(fromHeight: Int32, toHeight: Int32, hashes: [Data]) throws {
-        try dbQueue.write { db in
-            // Clear old best chain markers in range
-            try db.execute(
-                sql: """
-                    UPDATE headers
-                    SET isInBestChain = 0
-                    WHERE height >= ? AND height <= ?
-                    """,
-                arguments: [fromHeight, toHeight]
-            )
-
-            // Set new best chain markers
-            for hash in hashes {
-                try db.execute(
-                    sql: "UPDATE headers SET isInBestChain = 1 WHERE hash = ?",
-                    arguments: [hash]
-                )
+            for record in records {
+                try record.insert(db)
             }
         }
     }
 
     /// Makes `hashes` the best chain above `height`, atomically: a crash
     /// part-way can never leave the database with no best-chain tip.
-    public func replaceBestChain(above height: Int32, with hashes: [Data]) throws {
+    /// - Parameter expectedTip: The tip being replaced, when the caller's
+    ///   view of it must still hold; a different stored tip then throws
+    ///   ``HeaderDatabaseError/chainChanged`` and changes nothing
+    func replaceBestChain(above height: Int32, with hashes: [Data], expectedTip: Data? = nil) throws {
         try dbQueue.write { db in
-            try db.execute(
-                sql: "UPDATE headers SET isInBestChain = 0 WHERE height > ?",
-                arguments: [height]
-            )
+            if let expectedTip {
+                guard try Self.tip(db)?.hash == expectedTip else {
+                    throw HeaderDatabaseError.chainChanged
+                }
+            }
+            try db.execute(sql: Query.unflagAbove, arguments: [height])
             for hash in hashes {
                 try db.execute(
                     sql: "UPDATE headers SET isInBestChain = 1 WHERE hash = ?",
@@ -287,13 +276,48 @@ public final class HeaderDatabase: Sendable {
         }
     }
 
-    /// Clear all best chain markers (used during reorganization)
-    public func clearBestChainMarkers(aboveHeight: Int32) throws {
+    /// Follows parent links down from the tip and makes the best-chain
+    /// flags agree with them.
+    ///
+    /// The flags are what answers "which block is at this height". A file
+    /// written by an interrupted or older build can carry a flag on a block
+    /// the tip does not descend from, or miss one on a block it does —
+    /// and a sync onto that would request and verify against the wrong
+    /// block.
+    ///
+    /// The walk ends early where a block's parent is not stored — a
+    /// database need not reach back to the genesis block — and what lies
+    /// beyond is left as it is.
+    /// - Parameter depth: How many blocks below the tip to check
+    /// - Returns: The number of flags corrected
+    @discardableResult
+    func repairBestChain(depth: Int) throws -> Int {
         try dbQueue.write { db in
-            try db.execute(
-                sql: "UPDATE headers SET isInBestChain = 0 WHERE height > ?",
-                arguments: [aboveHeight]
-            )
+            guard var cursor = try Self.tip(db) else { return 0 }
+
+            /// Leaves `record` as the only best-chain block at its height.
+            func flagOnly(_ record: HeaderRecord) throws -> Int {
+                try db.execute(sql: Query.unflagOthersAtHeight, arguments: [record.height, record.hash])
+                var changes = db.changesCount
+                if !record.isInBestChain {
+                    try db.execute(sql: "UPDATE headers SET isInBestChain = 1 WHERE hash = ?", arguments: [record.hash])
+                    changes += 1
+                }
+                return changes
+            }
+
+            var repaired = try flagOnly(cursor)
+            var remaining = depth
+            while remaining > 0, cursor.height > 0 {
+                guard let parent = try HeaderRecord.fetchOne(db, key: cursor.prevBlockHash),
+                      parent.height == cursor.height - 1 else {
+                    break
+                }
+                repaired += try flagOnly(parent)
+                cursor = parent
+                remaining -= 1
+            }
+            return repaired
         }
     }
 
@@ -305,20 +329,14 @@ public final class HeaderDatabase: Sendable {
             var locator: [Data] = []
             var step: Int32 = 1
 
-            guard let tip = try HeaderRecord
-                .filter(HeaderRecord.Columns.isInBestChain == true)
-                .order(HeaderRecord.Columns.height.desc)
-                .fetchOne(db) else {
+            guard let tip = try Self.tip(db) else {
                 return []
             }
 
             var height = tip.height
 
             while height >= 0 {
-                if let record = try HeaderRecord
-                    .filter(HeaderRecord.Columns.height == height)
-                    .filter(HeaderRecord.Columns.isInBestChain == true)
-                    .fetchOne(db) {
+                if let record = try Self.bestChainHeader(at: height, db) {
                     locator.append(record.hash)
                 }
 
@@ -330,12 +348,8 @@ public final class HeaderDatabase: Sendable {
             }
 
             // Always include genesis
-            if let genesis = try HeaderRecord
-                .filter(HeaderRecord.Columns.height == 0)
-                .fetchOne(db) {
-                if locator.last != genesis.hash {
-                    locator.append(genesis.hash)
-                }
+            if let genesis = try Self.bestChainHeader(at: 0, db), locator.last != genesis.hash {
+                locator.append(genesis.hash)
             }
 
             return locator
@@ -351,35 +365,17 @@ public final class HeaderDatabase: Sendable {
         }
     }
 
-    /// Access database for raw queries (use sparingly)
-    public func read<T>(_ block: (Database) throws -> T) throws -> T {
-        try dbQueue.read(block)
-    }
-
-    /// Access database for raw writes (use sparingly)
-    public func write<T>(_ block: (Database) throws -> T) throws -> T {
-        try dbQueue.write(block)
+    /// How SQLite would run `sql`: one line per step of its plan
+    func queryPlan(for sql: String) throws -> [String] {
+        try dbQueue.read { db in
+            try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql).compactMap { $0["detail"] as String? }
+        }
     }
 
     /// Execute raw SQL without a transaction wrapper (needed for VACUUM)
     public func executeWithoutTransaction(_ sql: String) throws {
         try dbQueue.writeWithoutTransaction { db in
             try db.execute(sql: sql)
-        }
-    }
-
-    /// Get the underlying database queue (for observation)
-    public var databaseQueue: DatabaseQueue {
-        dbQueue
-    }
-}
-
-// MARK: - Array Chunking Helper
-
-private extension Array {
-    func chunks(ofCount count: Int) -> [[Element]] {
-        stride(from: 0, to: self.count, by: count).map {
-            Array(self[$0..<Swift.min($0 + count, self.count)])
         }
     }
 }

@@ -29,7 +29,6 @@ public enum ElectrumParam: Encodable, Sendable {
     case string(String)
     case int(Int)
     case bool(Bool)
-    case array([ElectrumParam])
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.singleValueContainer()
@@ -40,36 +39,25 @@ public enum ElectrumParam: Encodable, Sendable {
             try container.encode(value)
         case .bool(let value):
             try container.encode(value)
-        case .array(let value):
-            try container.encode(value)
         }
     }
 }
 
 // MARK: - JSON-RPC Response
 
+/// What a reply carries. The id that pairs it with its request is read
+/// before this is decoded, by the envelope that routes replies.
 public struct ElectrumResponse<T: Decodable>: Decodable, Sendable where T: Sendable {
-    public let jsonrpc: String
-    public let id: Int?
     public let result: T?
     public let error: ElectrumRPCError?
 
     private enum CodingKeys: String, CodingKey {
-        case jsonrpc
-        case id
         case result
         case error
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        jsonrpc = (try? container.decodeIfPresent(String.self, forKey: .jsonrpc)) ?? "2.0"
-        // We always send numeric ids; tolerate servers that echo them as strings.
-        if let numeric = try? container.decodeIfPresent(Int.self, forKey: .id) {
-            id = numeric
-        } else {
-            id = (try? container.decodeIfPresent(String.self, forKey: .id)).flatMap { Int($0) }
-        }
         result = try container.decodeIfPresent(T.self, forKey: .result)
         error = try container.decodeIfPresent(ElectrumRPCError.self, forKey: .error)
     }
@@ -88,11 +76,9 @@ public struct ElectrumNull: Decodable, Sendable {
 // MARK: - Electrum Data Types
 
 public struct ElectrumScriptHash: Sendable {
-    public let address: String
     public let scriptHash: String
 
     public init(address: String, network: DogecoinNetwork) throws {
-        self.address = address
         // Convert address to scriptPubKey, then SHA256, then reverse bytes
         self.scriptHash = try Self.computeScriptHash(for: address, network: network)
     }
@@ -140,17 +126,13 @@ public struct ElectrumBalance: Decodable, Sendable {
 
 public struct ElectrumHistoryItem: Decodable, Sendable {
     public let txHash: String
+    /// The height of the block that holds the transaction; zero or less
+    /// while it is unconfirmed
     public let height: Int
-    public let fee: Int?
 
     private enum CodingKeys: String, CodingKey {
         case txHash = "tx_hash"
         case height
-        case fee
-    }
-
-    public var isConfirmed: Bool {
-        height > 0
     }
 }
 
@@ -169,10 +151,6 @@ public struct ElectrumUTXO: Decodable, Sendable {
 
     public var outpoint: String {
         "\(txHash):\(txPos)"
-    }
-
-    public var isConfirmed: Bool {
-        height > 0
     }
 
     /// Rejects outputs no honest server reports — negative values or indexes,
@@ -200,27 +178,11 @@ public struct ElectrumUTXO: Decodable, Sendable {
     }
 }
 
-public struct ElectrumTransaction: Sendable {
-    public let txid: String
-    public let rawHex: String
-    public let blockHeight: Int?
-    public let blockHash: String?
-    public let timestamp: Date?
-    public let fee: Int64?
-
-    public var isConfirmed: Bool {
-        guard let height = blockHeight else { return false }
-        return height > 0
-    }
-}
-
 public struct ElectrumHeader: Decodable, Sendable {
     public let height: Int
-    public let hex: String
 
     private enum CodingKeys: String, CodingKey {
         case height
-        case hex
     }
 
     /// Heights outside `Int32` are rejected here so they can never trap a
@@ -232,23 +194,18 @@ public struct ElectrumHeader: Decodable, Sendable {
             throw DecodingError.dataCorruptedError(forKey: .height, in: container, debugDescription: "Block height out of range")
         }
         self.height = height
-        self.hex = try container.decode(String.self, forKey: .hex)
     }
 }
 
-public struct ElectrumServerInfo: Decodable, Sendable {
-    public let genesisHash: String
-    public let serverVersion: String
-    public let protocolMin: String
-    public let protocolMax: String
-    public let hashFunction: String
+/// What a server says about itself — of which only the chain it serves
+/// matters here.
+struct ElectrumServerFeatures: Decodable, Sendable {
+    /// The hash of the first block of the chain the server indexes, in
+    /// display byte order
+    let genesisHash: String
 
     private enum CodingKeys: String, CodingKey {
         case genesisHash = "genesis_hash"
-        case serverVersion = "server_version"
-        case protocolMin = "protocol_min"
-        case protocolMax = "protocol_max"
-        case hashFunction = "hash_function"
     }
 }
 
@@ -257,25 +214,20 @@ public struct ElectrumServerInfo: Decodable, Sendable {
 public enum ElectrumMethod: String, Sendable {
     // Server methods
     case serverVersion = "server.version"
-    case serverBanner = "server.banner"
     case serverFeatures = "server.features"
     case serverPing = "server.ping"
 
     // Blockchain methods
     case blockchainHeadersSubscribe = "blockchain.headers.subscribe"
     case blockchainBlockHeader = "blockchain.block.header"
-    case blockchainEstimateFee = "blockchain.estimatefee"
-    case blockchainRelayFee = "blockchain.relayfee"
 
     // Script hash methods (address queries)
     case blockchainScripthashGetBalance = "blockchain.scripthash.get_balance"
     case blockchainScripthashGetHistory = "blockchain.scripthash.get_history"
-    case blockchainScripthashGetMempool = "blockchain.scripthash.get_mempool"
     case blockchainScripthashListUnspent = "blockchain.scripthash.listunspent"
     case blockchainScripthashSubscribe = "blockchain.scripthash.subscribe"
 
     // Transaction methods
     case blockchainTransactionGet = "blockchain.transaction.get"
-    case blockchainTransactionGetMerkle = "blockchain.transaction.get_merkle"
     case blockchainTransactionBroadcast = "blockchain.transaction.broadcast"
 }

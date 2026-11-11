@@ -43,7 +43,7 @@ struct HeaderDatabaseTests {
     // MARK: - Basic Operations
 
     @Test("Insert and retrieve header by hash")
-    func testInsertAndRetrieveByHash() throws {
+    func insertAndRetrieveByHash() throws {
         let db = try HeaderDatabase()
         let record = makeTestRecord(height: 0)
 
@@ -56,7 +56,7 @@ struct HeaderDatabaseTests {
     }
 
     @Test("Retrieve header by height")
-    func testRetrieveByHeight() throws {
+    func retrieveByHeight() throws {
         let db = try HeaderDatabase()
         let genesis = makeTestRecord(height: 0)
         try db.insertHeader(genesis)
@@ -67,7 +67,7 @@ struct HeaderDatabaseTests {
     }
 
     @Test("Header not found returns nil")
-    func testHeaderNotFound() throws {
+    func headerNotFound() throws {
         let db = try HeaderDatabase()
 
         let byHash = try db.getHeader(hash: Data(repeating: 0xFF, count: 32))
@@ -78,7 +78,7 @@ struct HeaderDatabaseTests {
     }
 
     @Test("Header exists check")
-    func testHeaderExists() throws {
+    func headerExists() throws {
         let db = try HeaderDatabase()
         let record = makeTestRecord(height: 0)
 
@@ -92,7 +92,7 @@ struct HeaderDatabaseTests {
     // MARK: - Chain Tip
 
     @Test("Get chain tip")
-    func testGetTip() throws {
+    func getTip() throws {
         let db = try HeaderDatabase()
 
         for i: Int32 in 0..<3 {
@@ -106,7 +106,7 @@ struct HeaderDatabaseTests {
     }
 
     @Test("Get tip returns nil for empty database")
-    func testGetTipEmpty() throws {
+    func getTipEmpty() throws {
         let db = try HeaderDatabase()
 
         let tip = try db.getTip()
@@ -114,7 +114,7 @@ struct HeaderDatabaseTests {
     }
 
     @Test("Get tip only considers best chain")
-    func testGetTipBestChainOnly() throws {
+    func getTipBestChainOnly() throws {
         let db = try HeaderDatabase()
 
         // Insert best chain headers at heights 0, 1
@@ -135,7 +135,7 @@ struct HeaderDatabaseTests {
     // MARK: - Header Count
 
     @Test("Get header count")
-    func testGetHeaderCount() throws {
+    func getHeaderCount() throws {
         let db = try HeaderDatabase()
 
         #expect(try db.getHeaderCount() == 0)
@@ -151,7 +151,7 @@ struct HeaderDatabaseTests {
     // MARK: - Range Queries
 
     @Test("Get headers in range")
-    func testGetHeadersInRange() throws {
+    func getHeadersInRange() throws {
         let db = try HeaderDatabase()
 
         for i: Int32 in 0..<10 {
@@ -168,7 +168,7 @@ struct HeaderDatabaseTests {
     // MARK: - Batch Insert
 
     @Test("Batch insert headers")
-    func testBatchInsert() throws {
+    func batchInsert() throws {
         let db = try HeaderDatabase()
 
         var records: [HeaderRecord] = []
@@ -182,78 +182,177 @@ struct HeaderDatabaseTests {
         #expect(try db.getTip()?.height == 99)
     }
 
-    @Test("Batch insert with progress")
-    func testBatchInsertWithProgress() throws {
+    // MARK: - Extending the Best Chain
+
+    @Test("A run of headers is appended to the best chain together")
+    func appendToBestChain() throws {
         let db = try HeaderDatabase()
+        let genesis = makeTestRecord(height: 0)
+        try db.insertHeader(genesis)
 
-        var records: [HeaderRecord] = []
-        for i: Int32 in 0..<250 {
-            records.append(makeTestRecord(height: i, prevHeight: i > 0 ? i - 1 : nil))
+        let run = (1...250).map { makeTestRecord(height: Int32($0), prevHeight: Int32($0) - 1) }
+        try db.appendToBestChain(run, after: genesis.hash)
+
+        #expect(try db.getTip()?.height == 250)
+        #expect(try db.getHeader(height: 137)?.hash == run[136].hash)
+        #expect(try db.getHeaders(fromHeight: 249, toHeight: 300).map(\.height) == [249, 250])
+
+        // Nothing to append is nothing to check, either.
+        try db.appendToBestChain([], after: Data(repeating: 0xEE, count: 32))
+    }
+
+    @Test("Headers are not appended to a chain whose tip is no longer where the caller thinks")
+    func appendRefusesAfterTheTipMoved() throws {
+        let db = try HeaderDatabase()
+        let genesis = makeTestRecord(height: 0)
+        let one = makeTestRecord(height: 1, prevHeight: 0)
+        try db.insertHeaders([genesis, one])
+
+        // Another connection has added block 1; this one still builds on
+        // the genesis block.
+        var rival = makeTestRecord(height: 1, prevHeight: 0)
+        rival.hash = Data(repeating: 0xBB, count: 32)
+
+        #expect(throws: HeaderDatabaseError.chainChanged) {
+            try db.appendToBestChain([rival], after: genesis.hash)
         }
 
-        var progressCalls: [(Int, Int)] = []
-        try db.insertHeadersBatched(records, batchSize: 100) { inserted, total in
-            progressCalls.append((inserted, total))
-        }
-
-        #expect(try db.getHeaderCount() == 250)
-        #expect(progressCalls.count == 3) // 100, 200, 250
-        #expect(progressCalls.last?.0 == 250)
-        #expect(progressCalls.last?.1 == 250)
+        // Nothing was written: one block at height 1, and it is the first.
+        #expect(try db.getHeaderCount() == 2)
+        #expect(try db.getHeader(height: 1)?.hash == one.hash)
+        #expect(try db.getHeader(hash: rival.hash) == nil)
     }
 
     // MARK: - Best Chain Updates
 
-    @Test("Update best chain status")
-    func testUpdateBestChainStatus() throws {
+    @Test("Replacing the best chain above a height unflags what was there and flags the new branch")
+    func replaceBestChain() throws {
         let db = try HeaderDatabase()
+        for height: Int32 in 0..<10 {
+            try db.insertHeader(makeTestRecord(height: height, prevHeight: height > 0 ? height - 1 : nil))
+        }
+        var branch = makeTestRecord(height: 6, prevHeight: 5, isInBestChain: false)
+        branch.hash = Data(repeating: 0xB6, count: 32)
+        try db.insertHeader(branch)
 
-        let record = makeTestRecord(height: 0, isInBestChain: true)
-        try db.insertHeader(record)
+        try db.replaceBestChain(above: 5, with: [branch.hash])
 
-        // Verify it's in best chain
-        #expect(try db.getHeader(height: 0) != nil)
-
-        // Remove from best chain
-        try db.updateBestChainStatus(hash: record.hash, isInBestChain: false)
-
-        // Should no longer be found by height (height query only finds best chain)
-        #expect(try db.getHeader(height: 0) == nil)
-
-        // But should still be found by hash
-        #expect(try db.getHeader(hash: record.hash) != nil)
+        #expect(try db.getTip()?.hash == branch.hash)
+        #expect(try db.getHeader(height: 6)?.hash == branch.hash)
+        for height: Int32 in 7..<10 {
+            #expect(try db.getHeader(height: height) == nil)
+        }
+        // The blocks that lost are still there, by hash.
+        #expect(try db.getHeader(hash: makeTestRecord(height: 9).hash)?.isInBestChain == false)
+        #expect(try db.getHeaderCount() == 11)
     }
 
-    @Test("Clear best chain markers above height")
-    func testClearBestChainMarkers() throws {
+    @Test("The best chain is not replaced when its tip is no longer the one being replaced")
+    func replaceBestChainChecksTheTip() throws {
         let db = try HeaderDatabase()
+        for height: Int32 in 0..<4 {
+            try db.insertHeader(makeTestRecord(height: height, prevHeight: height > 0 ? height - 1 : nil))
+        }
+        var branch = makeTestRecord(height: 2, prevHeight: 1, isInBestChain: false)
+        branch.hash = Data(repeating: 0xB2, count: 32)
+        try db.insertHeader(branch)
 
-        for i: Int32 in 0..<10 {
-            let record = makeTestRecord(height: i, prevHeight: i > 0 ? i - 1 : nil)
-            try db.insertHeader(record)
+        // The caller believes the tip is still block 2.
+        #expect(throws: HeaderDatabaseError.chainChanged) {
+            try db.replaceBestChain(above: 1, with: [branch.hash], expectedTip: makeTestRecord(height: 2).hash)
+        }
+        #expect(try db.getTip()?.height == 3)
+        #expect(try db.getHeader(height: 2)?.hash == makeTestRecord(height: 2).hash)
+
+        try db.replaceBestChain(above: 1, with: [branch.hash], expectedTip: makeTestRecord(height: 3).hash)
+        #expect(try db.getTip()?.hash == branch.hash)
+    }
+
+    // MARK: - Repair
+
+    @Test("A sound chain needs no repair")
+    func repairLeavesASoundChainAlone() throws {
+        let db = try HeaderDatabase()
+        for height: Int32 in 0..<20 {
+            try db.insertHeader(makeTestRecord(height: height, prevHeight: height > 0 ? height - 1 : nil))
         }
 
-        // Clear best chain markers above height 5
-        try db.clearBestChainMarkers(aboveHeight: 5)
+        #expect(try db.repairBestChain(depth: 100) == 0)
+        #expect(try db.getTip()?.height == 19)
+        #expect(try HeaderDatabase().repairBestChain(depth: 100) == 0)
+    }
 
-        // Headers 0-5 should still be in best chain
-        for i: Int32 in 0...5 {
-            #expect(try db.getHeader(height: i) != nil)
+    @Test("Best-chain flags that disagree with the tip's ancestry are corrected")
+    func repairCorrectsFlags() throws {
+        let db = try HeaderDatabase()
+        for height: Int32 in 0..<10 {
+            // Block 6 has lost its flag, as an interrupted write could leave it.
+            try db.insertHeader(makeTestRecord(height: height, prevHeight: height > 0 ? height - 1 : nil, isInBestChain: height != 6))
+        }
+        // And a block the tip does not descend from carries one at height 4.
+        var stray = makeTestRecord(height: 4, prevHeight: 3)
+        stray.hash = Data(repeating: 0x5A, count: 32)
+        try db.insertHeader(stray)
+
+        #expect(try db.getHeader(height: 6) == nil)
+
+        #expect(try db.repairBestChain(depth: 100) == 2)
+
+        #expect(try db.getHeader(height: 6)?.hash == makeTestRecord(height: 6).hash)
+        #expect(try db.getHeader(height: 4)?.hash == makeTestRecord(height: 4).hash)
+        #expect(try db.getHeader(hash: stray.hash)?.isInBestChain == false)
+        #expect(try db.repairBestChain(depth: 100) == 0)
+    }
+
+    @Test("Repair only looks as deep as it is asked to")
+    func repairDepth() throws {
+        let db = try HeaderDatabase()
+        for height: Int32 in 0..<10 {
+            try db.insertHeader(makeTestRecord(height: height, prevHeight: height > 0 ? height - 1 : nil, isInBestChain: height != 2))
         }
 
-        // Headers 6-9 should no longer be in best chain (by height lookup)
-        for i: Int32 in 6..<10 {
-            #expect(try db.getHeader(height: i) == nil)
+        #expect(try db.repairBestChain(depth: 5) == 0)
+        #expect(try db.getHeader(height: 2) == nil)
+        #expect(try db.repairBestChain(depth: 7) == 1)
+        #expect(try db.getHeader(height: 2) != nil)
+    }
+
+    @Test("Repair stops where the stored chain does, and corrects what it could reach")
+    func repairStopsAtAMissingParent() throws {
+        let db = try HeaderDatabase()
+        // No block 3: the database starts, in effect, at block 4.
+        for height: Int32 in [0, 1, 2, 4, 5, 6] {
+            try db.insertHeader(makeTestRecord(height: height, prevHeight: height > 0 ? height - 1 : nil, isInBestChain: height != 5 && height != 1))
         }
 
-        // Tip should now be at height 5
-        #expect(try db.getTip()?.height == 5)
+        #expect(try db.repairBestChain(depth: 100) == 1)
+        #expect(try db.getHeader(height: 5) != nil)
+        // Beyond the gap nothing is known, and nothing is touched.
+        #expect(try db.getHeader(height: 1) == nil)
+        #expect(try db.getTip()?.height == 6)
+    }
+
+    // MARK: - Query Plans
+
+    @Test("Every lookup by height is answered from the best-chain index, never by reading the table", arguments: [
+        HeaderDatabase.Query.tip,
+        HeaderDatabase.Query.bestChainAtHeight,
+        HeaderDatabase.Query.bestChainRange,
+        HeaderDatabase.Query.unflagAbove,
+        HeaderDatabase.Query.unflagOthersAtHeight
+    ])
+    func heightQueriesUseTheIndex(sql: String) throws {
+        let plan = try HeaderDatabase().queryPlan(for: sql.replacingOccurrences(of: "?", with: "1"))
+
+        #expect(!plan.isEmpty)
+        #expect(plan.allSatisfy { $0.contains("idx_headers_best_chain_height") }, "\(plan)")
+        #expect(!plan.contains { $0.hasPrefix("SCAN") }, "\(plan)")
     }
 
     // MARK: - Block Locator
 
     @Test("Get block locator")
-    func testGetBlockLocator() throws {
+    func getBlockLocator() throws {
         let db = try HeaderDatabase()
 
         for i: Int32 in 0..<20 {
@@ -277,7 +376,7 @@ struct HeaderDatabaseTests {
     }
 
     @Test("Block locator empty for empty database")
-    func testBlockLocatorEmpty() throws {
+    func blockLocatorEmpty() throws {
         let db = try HeaderDatabase()
 
         let locator = try db.getBlockLocator()
@@ -287,17 +386,15 @@ struct HeaderDatabaseTests {
     // MARK: - Schema
 
     @Test("A new database carries only the indexes its queries use")
-    func testIndexes() throws {
+    func indexes() throws {
         let indexes = try HeaderDatabase().indexNames()
 
-        #expect(indexes.contains("idx_headers_best_chain_height"))
-        #expect(indexes.contains("headers_on_height"))
-        #expect(!indexes.contains("headers_on_prevBlockHash"))
-        #expect(!indexes.contains("idx_headers_merkle_root"))
+        // The primary key's own index, and the one every height lookup uses.
+        #expect(indexes == ["sqlite_autoindex_headers_1", "idx_headers_best_chain_height"])
     }
 
     @Test("Opening an older database drops the unused indexes and keeps its headers")
-    func testMigrationDropsUnusedIndexes() throws {
+    func migrationDropsUnusedIndexes() throws {
         let directory = TestDirectories.unique()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let path = directory.appendingPathComponent("headers.sqlite").path
@@ -308,22 +405,23 @@ struct HeaderDatabaseTests {
             try database.insertHeaders([makeTestRecord(height: 0), makeTestRecord(height: 1, prevHeight: 0)])
             try database.executeWithoutTransaction("CREATE INDEX headers_on_prevBlockHash ON headers(prevBlockHash)")
             try database.executeWithoutTransaction("CREATE INDEX idx_headers_merkle_root ON headers(merkleRoot)")
-            try database.executeWithoutTransaction("DELETE FROM grdb_migrations WHERE identifier = 'v2_drop_unused_indexes'")
+            try database.executeWithoutTransaction("CREATE INDEX headers_on_height ON headers(height)")
+            try database.executeWithoutTransaction("DELETE FROM grdb_migrations WHERE identifier IN ('v2_drop_unused_indexes', 'v3_drop_height_index')")
             #expect(try database.indexNames().contains("idx_headers_merkle_root"))
+            #expect(try database.indexNames().contains("headers_on_height"))
         }
 
         let reopened = try HeaderDatabase(path: path)
         let indexes = try reopened.indexNames()
 
-        #expect(!indexes.contains("headers_on_prevBlockHash"))
-        #expect(!indexes.contains("idx_headers_merkle_root"))
-        #expect(indexes.contains("idx_headers_best_chain_height"))
+        // The primary key's own index, and the one every height lookup uses.
+        #expect(indexes == ["sqlite_autoindex_headers_1", "idx_headers_best_chain_height"])
         #expect(try reopened.getHeaderCount() == 2)
         #expect(try reopened.getTip()?.height == 1)
     }
 
     @Test("A read-only database can be read but not changed")
-    func testReadOnlyOpen() throws {
+    func readOnlyOpen() throws {
         let directory = TestDirectories.unique()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let path = directory.appendingPathComponent("headers.sqlite").path
@@ -342,7 +440,7 @@ struct HeaderDatabaseTests {
     }
 
     @Test("Opening something that is not a database fails as unreadable")
-    func testUnreadableFile() throws {
+    func unreadableFile() throws {
         let directory = TestDirectories.unique()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let url = directory.appendingPathComponent("headers.sqlite")
@@ -359,7 +457,7 @@ struct HeaderDatabaseTests {
     // MARK: - Conversion Tests
 
     @Test("HeaderRecord to StoredHeader conversion")
-    func testRecordToStoredHeaderConversion() throws {
+    func recordToStoredHeaderConversion() throws {
         let record = makeTestRecord(height: 42)
         let stored = record.toStoredHeader()
 
@@ -374,7 +472,7 @@ struct HeaderDatabaseTests {
     }
 
     @Test("StoredHeader to HeaderRecord conversion")
-    func testStoredHeaderToRecordConversion() throws {
+    func storedHeaderToRecordConversion() throws {
         let header = BlockHeader(
             version: 1,
             prevBlock: Data(repeating: 0x11, count: 32),
@@ -397,5 +495,34 @@ struct HeaderDatabaseTests {
         #expect(record.merkleRoot == header.merkleRoot)
         #expect(record.chainWork == stored.chainWork)
         #expect(record.isInBestChain == true)
+    }
+
+    @Test("Chain work is stored without its padding and read back whole")
+    func chainWorkIsTrimmed() throws {
+        // Mainnet's total at height 6,341,590: ten significant bytes.
+        let work = try #require(Data(hexString: "87fa006fa856d853453300000000000000000000000000000000000000000000"))
+        let header = BlockHeader(version: 1, prevBlock: Data(count: 32), merkleRoot: Data(count: 32), timestamp: 1, bits: 0x1e0ffff0, nonce: 1)
+
+        let record = HeaderRecord(storedHeader: StoredHeader(header: header, height: 7, chainWork: work))
+        #expect(record.chainWork == work.prefix(10))
+
+        let db = try HeaderDatabase()
+        try db.insertHeader(record)
+        let read = try #require(try db.getHeader(height: 7))
+        #expect(read.chainWork.count == 10)
+        #expect(read.toStoredHeader().chainWork == work)
+
+        // Rows written before, at their full 32 bytes, read the same.
+        var padded = record
+        padded.hash = Data(repeating: 0x77, count: 32)
+        padded.height = 8
+        padded.chainWork = work
+        try db.insertHeader(padded)
+        #expect(try db.getHeader(height: 8)?.toStoredHeader().chainWork == work)
+
+        // No work at all — and nothing but zeros — is still a number.
+        #expect(HeaderRecord.trimmed(Data(count: 32)).isEmpty)
+        #expect(HeaderRecord.padded(Data()) == Data(count: 32))
+        #expect(UInt256(littleEndian: HeaderRecord.trimmed(work)) == UInt256(littleEndian: work))
     }
 }

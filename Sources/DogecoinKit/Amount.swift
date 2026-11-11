@@ -78,29 +78,6 @@ public struct DogecoinAmount: Sendable, Equatable, Hashable, Comparable {
         return "\(whole)." + String(repeating: "0", count: 8 - fraction.count) + fraction
     }
 
-    /// Format the amount with a specific number of decimal places
-    ///
-    /// Rounds half up, in integer arithmetic, so every koinu value formats
-    /// exactly — a `Double` cannot hold amounts above about 90 million DOGE
-    /// to the koinu.
-    /// - Parameter decimals: Number of decimal places (0-8)
-    /// - Returns: Formatted string
-    public func formatted(decimals: Int = 8) -> String {
-        let places = max(0, min(8, decimals))
-        let unit = Self.powerOfTen(8 - places)
-
-        // Rounded this way the sum cannot overflow, even at `UInt64.max`.
-        let quotient = koinu / unit
-        let rounded = (koinu % unit) * 2 >= unit ? quotient + 1 : quotient
-
-        let scale = Self.powerOfTen(places)
-        let whole = rounded / scale
-        guard places > 0 else { return "\(whole)" }
-
-        let fraction = String(rounded % scale)
-        return "\(whole)." + String(repeating: "0", count: places - fraction.count) + fraction
-    }
-
     // MARK: - Comparable
 
     public static func < (lhs: DogecoinAmount, rhs: DogecoinAmount) -> Bool {
@@ -146,23 +123,6 @@ extension DogecoinAmount: CustomStringConvertible {
     }
 }
 
-// MARK: - ExpressibleByIntegerLiteral
-
-extension DogecoinAmount: ExpressibleByIntegerLiteral {
-    public init(integerLiteral value: UInt64) {
-        let (scaled, overflow) = value.multipliedReportingOverflow(by: Self.koinuPerDoge)
-        self.init(koinu: overflow ? UInt64.max : scaled)
-    }
-}
-
-// MARK: - ExpressibleByFloatLiteral
-
-extension DogecoinAmount: ExpressibleByFloatLiteral {
-    public init(floatLiteral value: Double) {
-        self.init(doge: value)
-    }
-}
-
 // MARK: - Codable
 
 extension DogecoinAmount: Codable {
@@ -177,21 +137,6 @@ extension DogecoinAmount: Codable {
     }
 }
 
-// MARK: - Convenience Extensions
-
-extension DogecoinAmount {
-    /// Create amount from a number of whole Dogecoins
-    public static func doge(_ amount: UInt64) -> DogecoinAmount {
-        let (scaled, overflow) = amount.multipliedReportingOverflow(by: koinuPerDoge)
-        return DogecoinAmount(koinu: overflow ? UInt64.max : scaled)
-    }
-
-    /// Create amount from koinu
-    public static func koinu(_ amount: UInt64) -> DogecoinAmount {
-        DogecoinAmount(koinu: amount)
-    }
-}
-
 private extension DogecoinAmount {
     static let maxKoinuDecimal = Decimal(UInt64.max)
     /// ASCII digits only: `\d` also matches other scripts' digits, which
@@ -200,10 +145,6 @@ private extension DogecoinAmount {
         pattern: #"^(?:[0-9]+)(?:\.[0-9]{1,8})?$"#,
         options: []
     )
-
-    static func powerOfTen(_ exponent: Int) -> UInt64 {
-        (0..<exponent).reduce(1) { power, _ in power * 10 }
-    }
 
     static func koinuFromDecimal(_ value: Decimal) -> UInt64? {
         guard value >= 0 else { return nil }
@@ -218,21 +159,4 @@ private extension DogecoinAmount {
         guard number != NSDecimalNumber.notANumber else { return nil }
         return number.uint64Value
     }
-}
-
-// MARK: - Amount Utilities
-
-/// Convert koinu to Dogecoin string
-/// - Parameter koinu: Amount in koinu
-/// - Returns: String representation in Dogecoin
-public func koinuToDogeString(_ koinu: UInt64) -> String {
-    DogecoinAmount(koinu: koinu).dogeString
-}
-
-/// Convert Dogecoin string to koinu
-/// - Parameter dogeString: Amount as string in Dogecoin
-/// - Returns: Amount in koinu
-/// - Throws: `DogecoinError.amountConversionFailed` if conversion fails
-public func dogeStringToKoinu(_ dogeString: String) throws -> UInt64 {
-    try DogecoinAmount(dogeString: dogeString).koinu
 }

@@ -4,14 +4,14 @@ import os.log
 #endif
 
 /// Stored block header with additional metadata
-public struct StoredHeader: Sendable, Codable {
+public struct StoredHeader: Sendable {
     /// The block header
     public let header: BlockHeader
 
     /// The block height
     public let height: Int32
 
-    /// Cumulative chain work
+    /// Cumulative chain work: 32 bytes, least significant first
     public let chainWork: Data
 
     /// Create a stored header
@@ -19,33 +19,6 @@ public struct StoredHeader: Sendable, Codable {
         self.header = header
         self.height = height
         self.chainWork = chainWork
-    }
-}
-
-/// Codable conformance for BlockHeader
-extension BlockHeader: Codable {
-    enum CodingKeys: String, CodingKey {
-        case version, prevBlock, merkleRoot, timestamp, bits, nonce
-    }
-
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.version = try container.decode(Int32.self, forKey: .version)
-        self.prevBlock = try container.decode(Data.self, forKey: .prevBlock)
-        self.merkleRoot = try container.decode(Data.self, forKey: .merkleRoot)
-        self.timestamp = try container.decode(UInt32.self, forKey: .timestamp)
-        self.bits = try container.decode(UInt32.self, forKey: .bits)
-        self.nonce = try container.decode(UInt32.self, forKey: .nonce)
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(version, forKey: .version)
-        try container.encode(prevBlock, forKey: .prevBlock)
-        try container.encode(merkleRoot, forKey: .merkleRoot)
-        try container.encode(timestamp, forKey: .timestamp)
-        try container.encode(bits, forKey: .bits)
-        try container.encode(nonce, forKey: .nonce)
     }
 }
 
@@ -78,8 +51,16 @@ public actor HeaderChain {
     /// SQLite database for header storage
     private var database: HeaderDatabase?
 
-    /// LRU cache for recently accessed headers (by hash)
-    private let recentHeaders = LRUCache<Data, StoredHeader>(capacity: 1000)
+    /// Recently used headers, by hash. A `headers` message brings up to
+    /// 2000, each checked against the eleven before it and — before
+    /// DigiShield — the one 240 back, and none of a batch is in the database
+    /// until all of it is. The cache must hold a whole batch with room to
+    /// spare.
+    private let recentHeaders = LRUCache<Data, StoredHeader>(capacity: 4096)
+
+    /// How far below the tip the best-chain flags are checked when the
+    /// database is opened
+    private static let bestChainRepairDepth = 100
 
     /// Cached tip header
     private var tipCache: StoredHeader?
@@ -207,54 +188,44 @@ public actor HeaderChain {
     /// The bundled cache directory passed at init (used by setup)
     private let bundledCacheDirectory: URL?
 
-    /// Whether setup has been performed
-    private var isSetUp = false
-
     /// Perform post-init setup: create storage, open database, load state.
-    /// Must be called after init before using the chain. Safe to call multiple times.
-    public func setup() {
-        guard !isSetUp else { return }
-        isSetUp = true
-        createStorageDirectory()
+    /// Must be called after init before using the chain. Safe to call
+    /// multiple times; after a failure the next call tries again.
+    /// - Throws: Whatever kept the header database from opening — an
+    ///   unwritable directory, a full disk, a damaged file
+    public func setup() throws {
+        guard database == nil else { return }
+
+        try FileManager.default.createDirectory(at: storageURL, withIntermediateDirectories: true)
         installBundledCacheIfNeeded(from: bundledCacheDirectory)
-        openOrCreateDatabase()
-        loadTipFromDatabase()
-        initializeGenesisIfNeeded()
-    }
 
-    /// Whether the header database opened. When it did not — a full disk,
-    /// an unwritable directory — the chain can neither read nor store
-    /// headers, and a sync built on it could only stall.
-    public var isOpen: Bool {
-        database != nil
-    }
-
-    // MARK: - Database Setup
-
-    private func createStorageDirectory() {
-        try? FileManager.default.createDirectory(at: storageURL, withIntermediateDirectories: true)
-    }
-
-    private func openOrCreateDatabase() {
-        let dbPath = storageURL.appendingPathComponent(Self.databaseFileName).path
+        let path = storageURL.appendingPathComponent(Self.databaseFileName).path
+        let opened: HeaderDatabase
         do {
-            database = try HeaderDatabase(path: dbPath)
-            logger.info("Opened header database at \(dbPath)")
+            opened = try HeaderDatabase(path: path)
+
+            let repaired = try opened.repairBestChain(depth: Self.bestChainRepairDepth)
+            if repaired > 0 {
+                logger.warning("Corrected \(repaired) best-chain flags near the tip")
+            }
+
+            tipCache = try opened.getTip()?.toStoredHeader()
+            try insertGenesisIfNeeded(into: opened)
         } catch {
             logger.error("Failed to open header database: \(error.localizedDescription)")
+            tipCache = nil
+            recentHeaders.clear()
+            throw error
         }
+
+        database = opened
+        logger.info("Opened header database at \(path), height \(self.tipCache?.height ?? -1)")
     }
 
-    private func loadTipFromDatabase() {
-        guard let db = database else { return }
-        do {
-            if let tipRecord = try db.getTip() {
-                tipCache = tipRecord.toStoredHeader()
-                logger.info("Loaded tip from database at height \(self.tipCache?.height ?? -1)")
-            }
-        } catch {
-            logger.error("Failed to load tip from database: \(error.localizedDescription)")
-        }
+    /// Whether the header database is open. Until ``setup()`` has succeeded
+    /// the chain can neither read nor store headers.
+    public var isOpen: Bool {
+        database != nil
     }
 
     // MARK: - Bundled Cache
@@ -424,88 +395,53 @@ public actor HeaderChain {
         public let forkHeight: Int32?
     }
 
-    /// Add a header to the chain with full validation
-    /// - Parameter header: The block header to add
-    /// - Returns: true if the header was added successfully
-    @discardableResult
-    public func addHeader(_ header: BlockHeader) -> Bool {
-        addHeader(header, auxpow: nil)
-    }
-
-    /// Add a header with AuxPoW data for merged-mining validation
-    @discardableResult
-    public func addHeader(_ header: BlockHeader, auxpow: AuxPoW?) -> Bool {
-        do {
-            try addHeaderValidated(header, auxpow: auxpow)
-            return true
-        } catch {
-            logger.warning("Header validation failed: \(String(describing: error))")
-            return false
-        }
-    }
-
     /// Add a header with validation, throwing on errors
-    public func addHeaderValidated(_ header: BlockHeader) throws {
-        try addHeaderValidated(header, auxpow: nil)
-    }
-
-    /// Add a header with validation and optional AuxPoW data
-    public func addHeaderValidated(_ header: BlockHeader, auxpow: AuxPoW?) throws {
-        _ = try store(header, auxpow: auxpow)
-    }
-
-    private enum StoreOutcome {
-        case alreadyKnown
-        /// Stored, extending the best chain or a side branch
-        case stored
-        /// Stored, and its branch replaced the best chain above `forkHeight`
-        case reorganized(forkHeight: Int32)
-    }
-
-    /// Add multiple headers
-    public func addHeaders(_ headers: [BlockHeader]) -> Int {
-        addHeaders(headers.map { HeadersMessage.Entry(header: $0) }).added
+    public func addHeaderValidated(_ header: BlockHeader, auxpow: AuxPoW? = nil) throws {
+        let result = addHeaders([HeadersMessage.Entry(header: header, auxpow: auxpow)])
+        if let failure = result.failure {
+            throw failure
+        }
     }
 
     /// Add headers received from a peer, stopping at the first invalid one
+    ///
+    /// Headers that extend the tip — all of them, during a sync — are
+    /// validated in memory and written in a single transaction.
     public func addHeaders(_ entries: [HeadersMessage.Entry]) -> BatchResult {
-        var added = 0
-        var forkHeight: Int32?
-        for entry in entries {
-            do {
-                switch try store(entry.header, auxpow: entry.auxpow) {
-                case .alreadyKnown:
-                    break
-                case .stored:
-                    added += 1
-                case .reorganized(let height):
-                    added += 1
-                    forkHeight = min(forkHeight ?? height, height)
-                }
-            } catch let error as ValidationError {
-                logger.warning("Header validation failed: \(String(describing: error))")
-                return BatchResult(added: added, failure: error, forkHeight: forkHeight)
-            } catch {
-                return BatchResult(added: added, failure: .databaseError(error), forkHeight: forkHeight)
-            }
+        guard let db = database else {
+            return BatchResult(added: 0, failure: .databaseError(HeaderDatabaseError.databaseNotOpen), forkHeight: nil)
         }
-        return BatchResult(added: added, failure: nil, forkHeight: forkHeight)
-    }
 
-    /// Flush is a no-op with SQLite (writes are immediate)
-    public func flush() {
-        // SQLite writes are immediate, no pending buffer
+        do {
+            return try add(entries, to: db)
+        } catch HeaderDatabaseError.chainChanged {
+            // Another connection to this file moved the chain on. Look at
+            // it again and judge the headers against what is there now.
+            logger.notice("The header database changed underneath; reloading the tip")
+            do {
+                recentHeaders.clear()
+                tipCache = try db.getTip()?.toStoredHeader()
+                return try add(entries, to: db)
+            } catch {
+                return BatchResult(added: 0, failure: .databaseError(error), forkHeight: nil)
+            }
+        } catch {
+            return BatchResult(added: 0, failure: .databaseError(error), forkHeight: nil)
+        }
     }
 
     /// Get a header by hash
-    public func getHeader(hash: Data) -> StoredHeader? {
-        getCachedHeader(hash: hash)
+    /// - Throws: If the database cannot be read. `nil` means the header is
+    ///   not stored.
+    public func getHeader(hash: Data) throws -> StoredHeader? {
+        try cachedHeader(hash: hash)
     }
 
     /// Get a header by height (from best chain)
-    public func getHeader(height: Int32) -> StoredHeader? {
-        guard let db = database,
-              let record = try? db.getHeader(height: height) else {
+    /// - Throws: If the database cannot be read. `nil` means the best chain
+    ///   does not reach that height.
+    public func getHeader(height: Int32) throws -> StoredHeader? {
+        guard let record = try openDatabase().getHeader(height: height) else {
             return nil
         }
 
@@ -515,98 +451,168 @@ public actor HeaderChain {
     }
 
     /// Check if a header is part of the current best chain
-    public func isHeaderInBestChain(_ hash: Data) -> Bool {
-        guard let db = database,
-              let record = try? db.getHeader(hash: hash) else {
-            return false
-        }
-
-        return record.isInBestChain
+    /// - Throws: If the database cannot be read
+    public func isHeaderInBestChain(_ hash: Data) throws -> Bool {
+        try openDatabase().getHeader(hash: hash)?.isInBestChain ?? false
     }
 
     /// Get block locator hashes for getheaders message
-    public func getBlockLocator() -> [Data] {
-        guard let db = database else { return [] }
-
-        do {
-            return try db.getBlockLocator()
-        } catch {
-            logger.error("Failed to get block locator: \(error.localizedDescription)")
-            return []
-        }
+    /// - Throws: If the database cannot be read
+    public func getBlockLocator() throws -> [Data] {
+        try openDatabase().getBlockLocator()
     }
 
-    /// Get the underlying database (for advanced queries)
-    public var headerDatabase: HeaderDatabase? {
-        database
+    private func openDatabase() throws -> HeaderDatabase {
+        guard let database else {
+            throw HeaderDatabaseError.databaseNotOpen
+        }
+        return database
     }
 
     // MARK: - Storing
 
-    /// Validates and stores one header.
-    private func store(_ header: BlockHeader, auxpow: AuxPoW?) throws -> StoreOutcome {
-        guard let db = database else {
-            throw ValidationError.databaseError(HeaderDatabaseError.databaseNotOpen)
+    /// Validates `entries` in order and stores them.
+    /// - Throws: Only ``HeaderDatabaseError/chainChanged``; every other
+    ///   failure is reported in the result
+    private func add(_ entries: [HeadersMessage.Entry], to db: HeaderDatabase) throws -> BatchResult {
+        var added = 0
+        var forkHeight: Int32?
+
+        // Headers that extend the tip, validated and waiting to be written
+        // together, and the stored tip the first of them builds on.
+        var pending: [StoredHeader] = []
+        var base = tipCache
+
+        /// Writes the pending run. If that fails nothing of it was stored,
+        /// and the chain steps back to where the run began.
+        func flush() throws {
+            guard let stored = base, !pending.isEmpty else { return }
+            do {
+                try db.appendToBestChain(pending.map { HeaderRecord(storedHeader: $0, isInBestChain: true) }, after: stored.header.hash)
+            } catch {
+                for header in pending {
+                    recentHeaders.remove(header.header.hash)
+                }
+                pending.removeAll()
+                tipCache = stored
+                throw error
+            }
+            added += pending.count
+            pending.removeAll(keepingCapacity: true)
         }
 
+        func result(_ failure: ValidationError?) -> BatchResult {
+            BatchResult(added: added, failure: failure, forkHeight: forkHeight)
+        }
+
+        for entry in entries {
+            do {
+                if let tip = tipCache, entry.header.prevBlock == tip.header.hash {
+                    // Extends the tip, as nearly every header does. Held in
+                    // the cache — where the next header's checks find it —
+                    // until the whole run is written.
+                    let stored = try validated(entry.header, auxpow: entry.auxpow, onto: tip)
+                    if pending.isEmpty {
+                        base = tip
+                    }
+                    recentHeaders.set(stored.header.hash, stored)
+                    tipCache = stored
+                    pending.append(stored)
+                } else {
+                    try flush()
+                    switch try store(entry.header, auxpow: entry.auxpow, in: db) {
+                    case .alreadyKnown:
+                        break
+                    case .stored:
+                        added += 1
+                    case .reorganized(let height):
+                        added += 1
+                        forkHeight = min(forkHeight ?? height, height)
+                    }
+                }
+            } catch HeaderDatabaseError.chainChanged {
+                throw HeaderDatabaseError.chainChanged
+            } catch {
+                let failure = error as? ValidationError ?? .databaseError(error)
+                logger.warning("Header validation failed: \(String(describing: failure))")
+
+                // What came before the bad header is good, and is kept.
+                do {
+                    try flush()
+                } catch HeaderDatabaseError.chainChanged {
+                    throw HeaderDatabaseError.chainChanged
+                } catch {
+                    return result(.databaseError(error))
+                }
+                return result(failure)
+            }
+        }
+
+        do {
+            try flush()
+        } catch HeaderDatabaseError.chainChanged {
+            throw HeaderDatabaseError.chainChanged
+        } catch {
+            return result(.databaseError(error))
+        }
+        return result(nil)
+    }
+
+    private enum StoreOutcome {
+        case alreadyKnown
+        /// Stored on a side branch
+        case stored
+        /// Stored, and its branch replaced the best chain above `forkHeight`
+        case reorganized(forkHeight: Int32)
+    }
+
+    /// Runs every check on a header that builds on `parent`.
+    /// - Returns: The header with its height and cumulative chain work
+    private func validated(_ header: BlockHeader, auxpow: AuxPoW?, onto parent: StoredHeader) throws -> StoredHeader {
+        let height = parent.height + 1
+
+        try validateCheckpoint(header: header, height: height)
+        try rejectForkBelowCheckpoint(height: height)
+        try validateVersion(header, height: height)
+        let target = try validateProofOfWork(header, auxpow: auxpow, height: height)
+        try validateDifficulty(header, parent: parent, height: height)
+        try validateTimestamp(header: header, parent: parent)
+        try validateSoftForkVersion(header, height: height)
+
+        let chainWork = UInt256(littleEndian: parent.chainWork) &+ ProofOfWorkRules.work(forTarget: target)
+        return StoredHeader(header: header, height: height, chainWork: chainWork.littleEndianData)
+    }
+
+    /// Validates and stores one header that does not extend the tip: one
+    /// already known, or one on another branch — which it may make the best.
+    private func store(_ header: BlockHeader, auxpow: AuxPoW?, in db: HeaderDatabase) throws -> StoreOutcome {
         let hash = header.hash
 
-        // Check if we already have this header
-        if recentHeaders.contains(hash) {
+        if try recentHeaders.contains(hash) || db.headerExists(hash: hash) {
             return .alreadyKnown
         }
-        do {
-            if try db.headerExists(hash: hash) {
-                return .alreadyKnown
-            }
-        } catch {
-            throw ValidationError.databaseError(error)
-        }
 
-        guard let parent = getCachedHeader(hash: header.prevBlock) else {
+        guard let parent = try cachedHeader(hash: header.prevBlock) else {
             logger.warning("Parent not found for header \(header.hashHex)")
             throw ValidationError.invalidPreviousBlock
         }
 
-        let newHeight = parent.height + 1
+        let stored = try validated(header, auxpow: auxpow, onto: parent)
 
-        try validateCheckpoint(header: header, height: newHeight)
-        try rejectForkBelowCheckpoint(height: newHeight)
-        try validateVersion(header, height: newHeight)
-        let target = try validateProofOfWork(header, auxpow: auxpow, height: newHeight)
-        try validateDifficulty(header, parent: parent, height: newHeight)
-        try validateTimestamp(header: header, parent: parent)
-        try validateSoftForkVersion(header, height: newHeight)
-
-        let chainWork = UInt256(littleEndian: parent.chainWork) &+ ProofOfWorkRules.work(forTarget: target)
-        let stored = StoredHeader(header: header, height: newHeight, chainWork: chainWork.littleEndianData)
-
-        // Extends the best chain, or overtakes it with strictly more work.
-        // Equal work keeps the current tip (first seen wins, as in Core).
-        let currentTip = tipCache
-        let isNewTip = currentTip.map { stored.header.prevBlock == $0.header.hash } ?? true
-        let shouldReorg = !isNewTip && currentTip.map { chainWork > UInt256(littleEndian: $0.chainWork) } == true
-
-        // A header that overtakes the best chain is stored unflagged; the
-        // reorganization then flags its whole branch in one transaction. If
-        // that fails, the old chain is still the one, consistently, marked
-        // best — and the next header on the new branch tries again.
-        let record = HeaderRecord(storedHeader: stored, isInBestChain: isNewTip)
-        do {
-            try db.insertHeader(record)
-        } catch {
-            throw ValidationError.databaseError(error)
-        }
-
+        // Stored unflagged. If its branch now has strictly more work than
+        // the best chain, the reorganization flags the whole branch in one
+        // transaction; if that fails, the old chain is still the one,
+        // consistently, marked best — and the next header on the new branch
+        // tries again. Equal work keeps the current tip (first seen wins,
+        // as in Core).
+        try db.insertHeader(HeaderRecord(storedHeader: stored, isInBestChain: false))
         recentHeaders.set(hash, stored)
 
-        if isNewTip {
-            tipCache = stored
-        } else if shouldReorg, let currentTip {
-            return .reorganized(forkHeight: try reorganize(from: currentTip, to: stored, db: db))
+        guard let currentTip = tipCache,
+              UInt256(littleEndian: stored.chainWork) > UInt256(littleEndian: currentTip.chainWork) else {
+            return .stored
         }
-
-        return .stored
+        return .reorganized(forkHeight: try reorganize(from: currentTip, to: stored, db: db))
     }
 
     // MARK: - Validation Methods
@@ -705,7 +711,23 @@ public actor HeaderChain {
     private func validateDifficulty(_ header: BlockHeader, parent: StoredHeader, height: Int32) throws {
         guard rules.enforcesContextualRules else { return }
 
-        guard let expected = rules.requiredBits(after: parent, ancestor: { ancestor(of: parent, atHeight: $0) }) else {
+        // The rule asks for ancestors through a closure that cannot throw:
+        // a read that failed is carried out of it here, so that a database
+        // error is not mistaken for a missing block.
+        var readFailure: Error?
+        let expected = rules.requiredBits(after: parent) { height in
+            do {
+                return try ancestor(of: parent, atHeight: height)
+            } catch {
+                readFailure = error
+                return nil
+            }
+        }
+        if let readFailure {
+            throw readFailure
+        }
+
+        guard let expected else {
             throw ValidationError.invalidPreviousBlock
         }
 
@@ -715,7 +737,7 @@ public actor HeaderChain {
     }
 
     private func validateTimestamp(header: BlockHeader, parent: StoredHeader) throws {
-        let medianTime = medianTimePast(from: parent)
+        let medianTime = try medianTimePast(from: parent)
 
         guard header.timestamp > medianTime else {
             throw ValidationError.invalidTimestamp(timestamp: header.timestamp)
@@ -734,7 +756,7 @@ public actor HeaderChain {
     /// Makes `newTip`'s branch the best chain.
     /// - Returns: The height of the last block the two branches share
     private func reorganize(from currentTip: StoredHeader, to newTip: StoredHeader, db: HeaderDatabase) throws -> Int32 {
-        guard let commonAncestor = findCommonAncestor(between: currentTip, and: newTip) else {
+        guard let commonAncestor = try findCommonAncestor(between: currentTip, and: newTip) else {
             logger.error("Unable to find common ancestor for reorg")
             throw ValidationError.invalidPreviousBlock
         }
@@ -743,7 +765,7 @@ public actor HeaderChain {
         var newChainHashes: [Data] = []
         while let header = cursor, header.height > commonAncestor.height {
             newChainHashes.append(header.header.hash)
-            cursor = getCachedHeader(hash: header.header.prevBlock)
+            cursor = try cachedHeader(hash: header.header.prevBlock)
         }
 
         // Flagging a branch with a hole in it would leave heights where no
@@ -753,26 +775,24 @@ public actor HeaderChain {
             throw ValidationError.invalidPreviousBlock
         }
 
-        do {
-            try db.replaceBestChain(above: commonAncestor.height, with: newChainHashes)
-        } catch {
-            throw ValidationError.databaseError(error)
-        }
+        // Only if the tip being replaced is still the stored one: another
+        // connection may have built on it meanwhile.
+        try db.replaceBestChain(above: commonAncestor.height, with: newChainHashes, expectedTip: currentTip.header.hash)
 
         tipCache = newTip
         logger.info("Chain reorganized at height \(commonAncestor.height), new tip at \(newTip.height)")
         return commonAncestor.height
     }
 
-    private func findCommonAncestor(between first: StoredHeader, and second: StoredHeader) -> StoredHeader? {
+    private func findCommonAncestor(between first: StoredHeader, and second: StoredHeader) throws -> StoredHeader? {
         var a: StoredHeader? = first
         var b: StoredHeader? = second
 
         while let aHeader = a, let bHeader = b, aHeader.height != bHeader.height {
             if aHeader.height > bHeader.height {
-                a = getCachedHeader(hash: aHeader.header.prevBlock)
+                a = try cachedHeader(hash: aHeader.header.prevBlock)
             } else {
-                b = getCachedHeader(hash: bHeader.header.prevBlock)
+                b = try cachedHeader(hash: bHeader.header.prevBlock)
             }
         }
 
@@ -780,19 +800,21 @@ public actor HeaderChain {
             if aHeader.header.hash == bHeader.header.hash {
                 return aHeader
             }
-            a = getCachedHeader(hash: aHeader.header.prevBlock)
-            b = getCachedHeader(hash: bHeader.header.prevBlock)
+            a = try cachedHeader(hash: aHeader.header.prevBlock)
+            b = try cachedHeader(hash: bHeader.header.prevBlock)
         }
 
         return nil
     }
 
-    private func getCachedHeader(hash: Data) -> StoredHeader? {
+    /// The header with `hash`, from the cache or the database.
+    /// - Throws: If the database cannot be read — which is not the same as
+    ///   the header being absent
+    private func cachedHeader(hash: Data) throws -> StoredHeader? {
         if let cached = recentHeaders.get(hash) {
             return cached
         }
-        guard let db = database,
-              let record = try? db.getHeader(hash: hash) else {
+        guard let record = try openDatabase().getHeader(hash: hash) else {
             return nil
         }
         let stored = record.toStoredHeader()
@@ -802,11 +824,11 @@ public actor HeaderChain {
 
     /// The ancestor of `header` at `height`, following parent links so it
     /// works on any branch, not only the best chain.
-    private func ancestor(of header: StoredHeader, atHeight height: Int32) -> StoredHeader? {
+    private func ancestor(of header: StoredHeader, atHeight height: Int32) throws -> StoredHeader? {
         guard height >= 0, height <= header.height else { return nil }
         var cursor = header
         while cursor.height > height {
-            guard let previous = getCachedHeader(hash: cursor.header.prevBlock) else { return nil }
+            guard let previous = try cachedHeader(hash: cursor.header.prevBlock) else { return nil }
             cursor = previous
         }
         return cursor
@@ -814,22 +836,12 @@ public actor HeaderChain {
 
     // MARK: - Genesis Block
 
-    private func initializeGenesisIfNeeded() {
-        guard let db = database else { return }
-
-        // Check if genesis exists
-        do {
-            if let _ = try db.getHeader(height: 0) {
-                return
-            }
-        } catch {
-            // Continue to create genesis
-        }
+    private func insertGenesisIfNeeded(into db: HeaderDatabase) throws {
+        guard try db.getHeader(height: 0) == nil else { return }
 
         let genesisMerkleRootHex = "5b2a3f53f605d62c53e62932dac6925e3d74afa5a4b459745c36d42d0ed26a69"
         guard let merkleRootBigEndian = Data(hexString: genesisMerkleRootHex) else {
-            logger.error("Failed to decode genesis merkle root hex — skipping genesis insert")
-            return
+            throw HeaderDatabaseError.invalidCache("the genesis block could not be built")
         }
         let merkleRootInternal = Data(merkleRootBigEndian.reversed())
 
@@ -857,38 +869,33 @@ public actor HeaderChain {
         // Verify genesis hash matches expected checkpoint
         if let expectedHash = checkpoints[0], genesis.hashHex != expectedHash {
             logger.error("Genesis hash mismatch: expected \(expectedHash), got \(genesis.hashHex)")
-            return
+            throw HeaderDatabaseError.invalidCache("the genesis block does not match this network")
         }
 
         let genesisWork = rules.target(forBits: genesis.bits).map(ProofOfWorkRules.work(forTarget:)) ?? .zero
         let stored = StoredHeader(header: genesis, height: 0, chainWork: genesisWork.littleEndianData)
 
-        let record = HeaderRecord(storedHeader: stored, isInBestChain: true)
-        do {
-            try db.insertHeader(record)
-            recentHeaders.set(genesis.hash, stored)
+        try db.insertHeader(HeaderRecord(storedHeader: stored, isInBestChain: true))
+        recentHeaders.set(genesis.hash, stored)
 
-            if tipCache == nil {
-                tipCache = stored
-                logger.info("Initialized genesis block as tip with hash \(genesis.hashHex)")
-            } else {
-                logger.info("Added missing genesis block with hash \(genesis.hashHex)")
-            }
-        } catch {
-            logger.error("Failed to insert genesis: \(error.localizedDescription)")
+        if tipCache == nil {
+            tipCache = stored
+            logger.info("Initialized genesis block as tip with hash \(genesis.hashHex)")
+        } else {
+            logger.info("Added missing genesis block with hash \(genesis.hashHex)")
         }
     }
 
     // MARK: - Helpers
 
-    private func medianTimePast(from header: StoredHeader) -> UInt32 {
+    private func medianTimePast(from header: StoredHeader) throws -> UInt32 {
         var timestamps: [UInt32] = []
         var cursor: StoredHeader? = header
 
         for _ in 0..<11 {
             guard let current = cursor else { break }
             timestamps.append(current.header.timestamp)
-            cursor = getCachedHeader(hash: current.header.prevBlock)
+            cursor = try cachedHeader(hash: current.header.prevBlock)
         }
 
         timestamps.sort()

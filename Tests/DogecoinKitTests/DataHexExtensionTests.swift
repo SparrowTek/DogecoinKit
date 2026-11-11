@@ -8,13 +8,13 @@ struct DataHexExtensionTests {
     // MARK: - Valid input
 
     @Test("Empty string decodes to empty Data")
-    func testEmptyString() {
+    func emptyString() {
         let data = Data(hexString: "")
         #expect(data == Data())
     }
 
     @Test("Lowercase hex round-trips")
-    func testLowercaseRoundTrip() {
+    func lowercaseRoundTrip() {
         let hex = "deadbeef"
         let data = Data(hexString: hex)
         #expect(data == Data([0xde, 0xad, 0xbe, 0xef]))
@@ -22,27 +22,27 @@ struct DataHexExtensionTests {
     }
 
     @Test("Uppercase hex decodes identically")
-    func testUppercaseAccepted() {
+    func uppercaseAccepted() {
         let lower = Data(hexString: "deadbeef")
         let upper = Data(hexString: "DEADBEEF")
         #expect(upper == lower)
     }
 
     @Test("Mixed case hex decodes correctly")
-    func testMixedCase() {
+    func mixedCase() {
         let data = Data(hexString: "DeAdBeEf")
         #expect(data == Data([0xde, 0xad, 0xbe, 0xef]))
     }
 
     @Test("32-byte (txid-shaped) hex decodes to 32 bytes")
-    func testThirtyTwoByteHex() {
+    func thirtyTwoByteHex() {
         let txid = String(repeating: "ab", count: 32)
         let data = Data(hexString: txid)
         #expect(data?.count == 32)
     }
 
     @Test(".hexString emits lowercase two-digit bytes")
-    func testEncodeLowercasePadded() {
+    func encodeLowercasePadded() {
         // Leading-zero byte must still be two characters wide.
         let data = Data([0x00, 0x0f, 0xff, 0x01])
         #expect(data.hexString == "000fff01")
@@ -51,14 +51,14 @@ struct DataHexExtensionTests {
     // MARK: - Invalid input — every case must return nil, never crash
 
     @Test("Odd-length input returns nil")
-    func testOddLengthReturnsNil() {
+    func oddLengthReturnsNil() {
         #expect(Data(hexString: "a") == nil)
         #expect(Data(hexString: "abc") == nil)
         #expect(Data(hexString: "deadbee") == nil)
     }
 
     @Test("Non-hex characters return nil")
-    func testNonHexCharactersReturnNil() {
+    func nonHexCharactersReturnNil() {
         #expect(Data(hexString: "zz") == nil)
         #expect(Data(hexString: "ghij") == nil)
         #expect(Data(hexString: "de ad") == nil) // space is not hex
@@ -67,13 +67,13 @@ struct DataHexExtensionTests {
     }
 
     @Test("Valid prefix followed by invalid suffix returns nil")
-    func testInvalidSuffixRejected() {
+    func invalidSuffixRejected() {
         // Must reject the whole string, not return the parsed prefix.
         #expect(Data(hexString: "deadzz") == nil)
     }
 
     @Test("0x prefix is not stripped — leading 'x' is not hex")
-    func testZeroXPrefixNotSpecialCased() {
+    func zeroXPrefixNotSpecialCased() {
         // `0x...` input contains 'x', which is not a hex digit. The decoder
         // should reject it rather than silently accepting the prefix.
         #expect(Data(hexString: "0xdeadbeef") == nil)

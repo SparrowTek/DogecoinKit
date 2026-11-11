@@ -31,18 +31,8 @@ private final class LivePeerObserver: PeerDelegate, @unchecked Sendable {
 }
 
 /// Talks to the real Dogecoin network. Opt-in: `DOGECOINKIT_LIVE_P2P=1`.
-@Suite("Live P2P Network")
+@Suite("Live P2P Network", .timeLimit(.minutes(5)))
 struct LiveNetworkTests {
-
-    private func waitFor(_ timeout: Duration, _ condition: () -> Bool) async -> Bool {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while clock.now < deadline {
-            if condition() { return true }
-            try? await Task.sleep(for: .milliseconds(50))
-        }
-        return condition()
-    }
 
     @Test(
         "Headers from a live node pass full validation, AuxPoW and DigiShield included",
@@ -54,7 +44,7 @@ struct LiveNetworkTests {
         let database = try HeaderDatabase(path: directory.appendingPathComponent("headers.sqlite").path)
         try database.insertHeaders(RealChainFixtures.storedAncestors().map { HeaderRecord(storedHeader: $0, isInBestChain: true) })
         let chain = HeaderChain(network: .mainnet, storageDirectory: directory)
-        await chain.setup()
+        try await chain.setup()
         let tip = try #require(await chain.tip)
 
         let hosts = ["184.160.37.131"] + NetworkConstants.mainnetFallbackNodes.map(\.host)
@@ -65,13 +55,13 @@ struct LiveNetworkTests {
             await peer.configureTimeouts(connection: 8, handshake: 15)
             await peer.connect()
 
-            guard await waitFor(.seconds(20), { observer.isReady || observer.isClosed }), observer.isReady else {
+            guard await eventually(timeout: .seconds(20), { observer.isReady || observer.isClosed }), observer.isReady else {
                 await peer.disconnect()
                 continue
             }
 
             await peer.sendGetHeaders(locatorHashes: [tip.header.hash])
-            guard await waitFor(.seconds(60), { observer.headers != nil || observer.isClosed }),
+            guard await eventually(timeout: .seconds(60), { observer.headers != nil || observer.isClosed }),
                   let payload = observer.headers else {
                 await peer.disconnect()
                 continue

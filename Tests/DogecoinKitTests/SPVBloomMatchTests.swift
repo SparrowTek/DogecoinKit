@@ -72,7 +72,7 @@ struct SPVBloomMatchTests {
     // MARK: - transactionMatchesBloomFilter
 
     @Test("Filter matching the output pubkey hash accepts the tx")
-    func testMatchesOnPubkeyHashPush() {
+    func matchesOnPubkeyHashPush() {
         let pubkeyHash = Data((0..<20).map { _ in UInt8.random(in: 0...255) })
         let prevTxid = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
 
@@ -83,7 +83,7 @@ struct SPVBloomMatchTests {
     }
 
     @Test("Filter matching the full output scriptPubKey accepts the tx")
-    func testMatchesOnFullScriptPubKey() {
+    func matchesOnFullScriptPubKey() {
         let pubkeyHash = Data(repeating: 0xAB, count: 20)
         let prevTxid = Data(repeating: 0x01, count: 32)
         let tx = makeP2PKHTx(prevTxid: prevTxid, vout: 0, pubkeyHash: pubkeyHash)
@@ -102,7 +102,7 @@ struct SPVBloomMatchTests {
     }
 
     @Test("Filter matching the input outpoint accepts the tx")
-    func testMatchesOnOutpoint() {
+    func matchesOnOutpoint() {
         let pubkeyHash = Data(repeating: 0xCD, count: 20)
         let prevTxid = Data(repeating: 0x42, count: 32)
         let vout: UInt32 = 5
@@ -119,7 +119,7 @@ struct SPVBloomMatchTests {
     }
 
     @Test("Unrelated filter rejects the tx")
-    func testRejectsUnrelatedFilter() {
+    func rejectsUnrelatedFilter() {
         let txPubkeyHash = Data(repeating: 0x11, count: 20)
         let tx = makeP2PKHTx(
             prevTxid: Data(repeating: 0x22, count: 32),
@@ -135,7 +135,7 @@ struct SPVBloomMatchTests {
     }
 
     @Test("Malformed raw tx is rejected rather than crashing")
-    func testMalformedTxRejected() {
+    func malformedTxRejected() {
         let filter = makeBloomFilter(inserting: [Data(repeating: 0xAA, count: 20)])
 
         // Version byte only — nothing else — any parse must bail out as false.
@@ -229,26 +229,26 @@ struct SPVBloomMatchTests {
     // MARK: - computeProgress
 
     @Test("Progress is zero when target height is zero")
-    func testProgressZeroTarget() {
+    func progressZeroTarget() {
         #expect(SPVSyncManager.computeProgress(height: 0, target: 0) == 0)
         #expect(SPVSyncManager.computeProgress(height: 500, target: 0) == 0)
     }
 
     @Test("Progress is ratio in the normal range")
-    func testProgressRatio() {
+    func progressRatio() {
         let value = SPVSyncManager.computeProgress(height: 500, target: 1000)
         #expect(value == 0.5)
     }
 
     @Test("Progress clamps at 1.0 when height overshoots the snapshot target")
-    func testProgressClampsHigh() {
+    func progressClampsHigh() {
         // A snapshot where chain height has moved past target between reads.
         let value = SPVSyncManager.computeProgress(height: 1500, target: 1000)
         #expect(value == 1.0)
     }
 
     @Test("Progress clamps at 0.0 for negative height")
-    func testProgressClampsLow() {
+    func progressClampsLow() {
         let value = SPVSyncManager.computeProgress(height: -10, target: 1000)
         #expect(value == 0.0)
     }

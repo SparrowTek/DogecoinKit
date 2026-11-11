@@ -1,17 +1,20 @@
 import Foundation
 
-public enum ElectrumError: Error, Sendable {
+public enum ElectrumError: Error, Sendable, Equatable {
     case connectionFailed(String)
     case connectionTimeout
     case serverDisconnected
     case invalidResponse(String)
     case requestFailed(code: Int, message: String)
-    case serializationError(String)
-    case sslError(String)
     case noServersAvailable
-    case subscriptionFailed(String)
-    case transactionBroadcastFailed(String)
     case invalidAddress(String)
+
+    /// The connection was lost after a transaction was sent for broadcast
+    /// and before the server said what it made of it. The transaction may
+    /// have been accepted. Nothing that spends the same coins should be
+    /// sent until ``ElectrumSyncManager/isTransactionKnown(txid:)`` has
+    /// settled the question.
+    case broadcastOutcomeUnknown(txid: String)
 }
 
 extension ElectrumError {
@@ -40,18 +43,12 @@ extension ElectrumError: LocalizedError {
             return "Invalid response: \(reason)"
         case .requestFailed(let code, let message):
             return "Request failed (\(code)): \(message)"
-        case .serializationError(let reason):
-            return "Serialization error: \(reason)"
-        case .sslError(let reason):
-            return "SSL error: \(reason)"
         case .noServersAvailable:
             return "No Electrum servers available"
-        case .subscriptionFailed(let reason):
-            return "Subscription failed: \(reason)"
-        case .transactionBroadcastFailed(let reason):
-            return "Transaction broadcast failed: \(reason)"
         case .invalidAddress(let address):
             return "Invalid address: \(address)"
+        case .broadcastOutcomeUnknown:
+            return "The connection was lost before the server confirmed the transaction"
         }
     }
 }

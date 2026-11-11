@@ -42,9 +42,11 @@ public struct MerkleBlockMessage: Sendable {
         var offset = BlockHeader.size
 
         // Merge-mined blocks carry their AuxPoW between header and tree.
+        // The header chain has already checked that proof; here it is only
+        // stepped over.
         if header.isAuxPoW {
-            guard let (_, newOffset) = AuxPoW.parse(from: data, at: offset) else { return nil }
-            offset = newOffset
+            guard let treeOffset = AuxPoW.endOffset(in: data, at: offset) else { return nil }
+            offset = treeOffset
         }
         guard let totalRaw: UInt32 = data.readInteger(at: offset) else { return nil }
         let totalTransactions = UInt32(littleEndian: totalRaw)

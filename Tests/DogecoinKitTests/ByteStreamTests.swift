@@ -7,7 +7,7 @@ import Android
 
 /// The `ByteStream` contract, checked against the platform's own transport:
 /// Network.framework on Apple platforms, SwiftNIO on Android.
-@Suite("Byte Stream")
+@Suite("Byte Stream", .timeLimit(.minutes(1)))
 struct ByteStreamTests {
 
     @Test("Bytes flow both ways, and the remote close ends the stream")

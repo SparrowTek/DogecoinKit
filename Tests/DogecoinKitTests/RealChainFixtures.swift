@@ -58,7 +58,7 @@ enum RealChainFixtures {
         try database.insertHeaders(storedAncestors().map { HeaderRecord(storedHeader: $0, isInBestChain: true) })
 
         let chain = HeaderChain(network: .mainnet, storageDirectory: directory)
-        await chain.setup()
+        try await chain.setup()
         return chain
     }
 

@@ -15,11 +15,8 @@ import Testing
 @Suite("Concurrent Derivation")
 struct ConcurrentDerivationTests {
 
-    private let testMnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+    private let testMnemonic = testPhrase
 
-    init() async {
-        await Dogecoin.initialize()
-    }
 
     @Test("Parallel derivations agree with serial derivations")
     func parallelMatchesSerial() async throws {

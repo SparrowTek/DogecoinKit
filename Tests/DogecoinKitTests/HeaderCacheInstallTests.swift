@@ -7,9 +7,6 @@ import Testing
 /// been checked, and never at the cost of a working local database.
 @Suite("Header Cache Install")
 struct HeaderCacheInstallTests {
-    init() async {
-        await Dogecoin.initialize()
-    }
 
     // MARK: - Fixtures
 
@@ -48,7 +45,7 @@ struct HeaderCacheInstallTests {
 
         do {
             let chain = HeaderChain(network: network, storageDirectory: directory)
-            await chain.setup()
+            try await chain.setup()
             #expect(await chain.height == 0)
         }
 
@@ -82,9 +79,9 @@ struct HeaderCacheInstallTests {
         try encoder.encode(metadata).write(to: directory.appendingPathComponent("metadata.json"))
     }
 
-    private func chain(_ network: DogecoinNetwork, storage: URL, cache: URL?) async -> HeaderChain {
+    private func chain(_ network: DogecoinNetwork, storage: URL, cache: URL?) async throws -> HeaderChain {
         let chain = HeaderChain(network: network, storageDirectory: storage, bundledCacheDirectory: cache)
-        await chain.setup()
+        try await chain.setup()
         return chain
     }
 
@@ -99,11 +96,11 @@ struct HeaderCacheInstallTests {
         let cache = try await makeCache(network: .mainnet, extraHeaders: 3)
         let storage = TestDirectories.unique()
 
-        let chain = await chain(.mainnet, storage: storage, cache: cache)
+        let chain = try await chain(.mainnet, storage: storage, cache: cache)
 
         #expect(await chain.isOpen)
         #expect(await chain.height == 3)
-        #expect(await chain.getHeader(height: 0)?.header.hashHex == "1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691")
+        #expect(try await chain.getHeader(height: 0)?.header.hashHex == "1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691")
         #expect(leftovers(in: storage).isEmpty)
     }
 
@@ -112,7 +109,7 @@ struct HeaderCacheInstallTests {
         let storage = try await makeCache(network: .mainnet, extraHeaders: 1)
         let cache = try await makeCache(network: .mainnet, extraHeaders: 3)
 
-        let chain = await chain(.mainnet, storage: storage, cache: cache)
+        let chain = try await chain(.mainnet, storage: storage, cache: cache)
 
         #expect(await chain.height == 3)
         #expect(leftovers(in: storage).isEmpty)
@@ -123,7 +120,7 @@ struct HeaderCacheInstallTests {
         let storage = try await makeCache(network: .mainnet, extraHeaders: 5)
         let cache = try await makeCache(network: .mainnet, extraHeaders: 3)
 
-        let chain = await chain(.mainnet, storage: storage, cache: cache)
+        let chain = try await chain(.mainnet, storage: storage, cache: cache)
 
         #expect(await chain.height == 5)
     }
@@ -135,11 +132,11 @@ struct HeaderCacheInstallTests {
         let cache = try await makeCache(network: .mainnet, extraHeaders: 3)
         let storage = TestDirectories.unique()
 
-        let chain = await chain(.testnet, storage: storage, cache: cache)
+        let chain = try await chain(.testnet, storage: storage, cache: cache)
 
         // Only testnet's own genesis block, created fresh.
         #expect(await chain.height == 0)
-        #expect(await chain.getHeader(height: 0)?.header.hashHex == "bb0a78264637406b6360aad926284d544d7049f45189db5664f3c4d07350559e")
+        #expect(try await chain.getHeader(height: 0)?.header.hashHex == "bb0a78264637406b6360aad926284d544d7049f45189db5664f3c4d07350559e")
     }
 
     @Test("A cache whose blocks are not this chain's is not installed, whatever its metadata says")
@@ -147,10 +144,10 @@ struct HeaderCacheInstallTests {
         let cache = try await makeCache(network: .testnet, extraHeaders: 3, claimedNetwork: "mainnet")
         let storage = try await makeCache(network: .mainnet, extraHeaders: 1)
 
-        let chain = await chain(.mainnet, storage: storage, cache: cache)
+        let chain = try await chain(.mainnet, storage: storage, cache: cache)
 
         #expect(await chain.height == 1)
-        #expect(await chain.getHeader(height: 0)?.header.hashHex == "1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691")
+        #expect(try await chain.getHeader(height: 0)?.header.hashHex == "1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691")
         #expect(leftovers(in: storage).isEmpty)
     }
 
@@ -159,7 +156,7 @@ struct HeaderCacheInstallTests {
         let cache = try await makeCache(network: .mainnet, extraHeaders: 3, claimedTipHeight: 9)
         let storage = try await makeCache(network: .mainnet, extraHeaders: 1)
 
-        let chain = await chain(.mainnet, storage: storage, cache: cache)
+        let chain = try await chain(.mainnet, storage: storage, cache: cache)
 
         #expect(await chain.height == 1)
         #expect(leftovers(in: storage).isEmpty)
@@ -174,7 +171,7 @@ struct HeaderCacheInstallTests {
         try writeMetadata(to: cache, network: "mainnet", tipHeight: 6_341_590)
         let storage = try await makeCache(network: .mainnet, extraHeaders: 2)
 
-        let chain = await chain(.mainnet, storage: storage, cache: cache)
+        let chain = try await chain(.mainnet, storage: storage, cache: cache)
 
         #expect(await chain.height == 2)
         #expect(leftovers(in: storage).isEmpty)
@@ -192,17 +189,17 @@ struct HeaderCacheInstallTests {
 
         let clock = ContinuousClock()
         let start = clock.now
-        let chain = await chain(.mainnet, storage: storage, cache: cache)
+        let chain = try await chain(.mainnet, storage: storage, cache: cache)
         print("Installed and opened the cache in \(clock.now - start)")
 
         #expect(await chain.isOpen)
         #expect(await chain.height > 6_000_000)
-        #expect(await chain.getHeader(height: 5_400_000)?.header.hashHex == "cbb1f4ae807da83e13bdf9c28188982938c9ee6bf560c1023f51adac229eef87")
+        #expect(try await chain.getHeader(height: 5_400_000)?.header.hashHex == "cbb1f4ae807da83e13bdf9c28188982938c9ee6bf560c1023f51adac229eef87")
         #expect(leftovers(in: storage).isEmpty)
 
-        let indexes = try #require(await chain.headerDatabase).indexNames()
-        #expect(!indexes.contains("headers_on_prevBlockHash"))
-        #expect(!indexes.contains("idx_headers_merkle_root"))
+        // Opened read-only beside the chain's own connection.
+        let indexes = try HeaderDatabase(readOnlyPath: storage.appendingPathComponent("headers.sqlite").path).indexNames()
+        #expect(indexes == ["idx_headers_best_chain_height", "sqlite_autoindex_headers_1"])
     }
 
     // MARK: - Recovering
@@ -213,7 +210,7 @@ struct HeaderCacheInstallTests {
         let storage = try makeDirectory()
         try Data(repeating: 0x5A, count: 4096).write(to: storage.appendingPathComponent("headers.sqlite"))
 
-        let chain = await chain(.mainnet, storage: storage, cache: cache)
+        let chain = try await chain(.mainnet, storage: storage, cache: cache)
 
         #expect(await chain.isOpen)
         #expect(await chain.height == 3)
@@ -224,7 +221,7 @@ struct HeaderCacheInstallTests {
         let storage = try makeDirectory()
         try Data(repeating: 0x5A, count: 4096).write(to: storage.appendingPathComponent("headers.sqlite"))
 
-        let chain = await chain(.mainnet, storage: storage, cache: nil)
+        let chain = try await chain(.mainnet, storage: storage, cache: nil)
 
         #expect(await chain.isOpen)
         #expect(await chain.height == 0)

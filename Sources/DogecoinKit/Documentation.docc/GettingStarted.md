@@ -22,10 +22,10 @@ This guide walks you through integrating DogecoinKit into your iOS or macOS proj
 
 ### Using Package.swift
 
-If you're building a Swift package, add DogecoinKit as a dependency:
+If you're building a Swift package, add DogecoinKit as a dependency. DogecoinKit needs Swift 6.1 or later:
 
 ```swift
-// swift-tools-version: 6.0
+// swift-tools-version: 6.1
 import PackageDescription
 
 let package = Package(
@@ -46,52 +46,18 @@ let package = Package(
 )
 ```
 
-## Initializing the Library
+## Nothing to Initialize
 
-DogecoinKit requires one-time initialization before using cryptographic functions. The best place to do this is at app launch.
+DogecoinKit needs no start-up call. Each operation prepares the thread it runs on, and throws ``DogecoinError/initializationFailed`` if the secp256k1 context it needs can't be created.
 
-### SwiftUI App
-
-```swift
-import SwiftUI
-import DogecoinKit
-
-@main
-struct MyWalletApp: App {
-    init() {
-        // Initialize DogecoinKit's cryptographic context
-        Task { await Dogecoin.initialize() }
-    }
-
-    var body: some Scene {
-        WindowGroup {
-            ContentView()
-        }
-    }
-}
-```
-
-### UIKit App
+``Dogecoin/initialize()`` is optional. It checks that the library's cryptography can start and returns the answer, so an app can find out at launch instead of at its first wallet operation:
 
 ```swift
-import UIKit
-import DogecoinKit
-
-@main
-class AppDelegate: UIResponder, UIApplicationDelegate {
-
-    func application(
-        _ application: UIApplication,
-        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
-    ) -> Bool {
-        // Initialize DogecoinKit's cryptographic context
-        Task { await Dogecoin.initialize() }
-        return true
-    }
+if await !Dogecoin.initialize() {
+    // The cryptography did not start: expect wallet operations to throw
+    // DogecoinError.initializationFailed
 }
 ```
-
-> Important: ``Dogecoin/initialize()`` is `async`, and wallet, key, and transaction functions throw ``DogecoinError/initializationFailed`` until it has finished. A `Task` started at launch may still be running when your first view appears. It's safe to call multiple times—subsequent calls are no-ops—so `await` it again before your first wallet call.
 
 ## Your First Wallet
 
@@ -108,9 +74,7 @@ func createWallet() async throws -> (wallet: HDWallet, address: String) {
     )
 
     // The mnemonic is the user's recovery phrase - store it securely!
-    if let mnemonic = wallet.mnemonic {
-        print("Recovery phrase: \(mnemonic)")
-    }
+    print("Recovery phrase: \(wallet.mnemonic)")
 
     // Derive the first receiving address
     let address = try await wallet.deriveAddress(account: 0, index: 0)
@@ -143,7 +107,7 @@ m / 44' / coin' / account' / change / index
 
 ### Deriving Multiple Addresses
 
-A wallet can generate unlimited addresses from a single mnemonic:
+A wallet can derive as many addresses as it needs from a single mnemonic:
 
 ```swift
 // Generate 10 receiving addresses
@@ -187,7 +151,8 @@ Now that you have the basics, explore these guides:
 - <doc:WorkingWithAddresses> — Address validation and management
 - <doc:HandlingAmounts> — Working with Dogecoin amounts safely
 - <doc:SendingTransactions> — Build and broadcast transactions
-- <doc:SPVSynchronization> — Sync with the Dogecoin network
+- <doc:ElectrumSynchronization> — Follow your addresses through an Electrum server
+- <doc:SPVSynchronization> — Follow them on the peer-to-peer network, validating block headers yourself
 
 ## See Also
 

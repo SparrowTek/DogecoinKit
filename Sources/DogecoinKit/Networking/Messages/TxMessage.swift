@@ -12,6 +12,13 @@ public struct TxMessage: Sendable {
         self.rawData = data
     }
 
+    /// Whether the bytes are one whole transaction in the plain
+    /// serialization: the only kind whose hash is its txid, and the only
+    /// kind worth announcing to a peer.
+    var isWellFormed: Bool {
+        RawTransaction(data: rawData).map { $0.strippedData == rawData } ?? false
+    }
+
     /// Create a TxMessage from raw transaction data
     /// - Parameter rawData: Raw transaction bytes
     public init(rawData: Data) {

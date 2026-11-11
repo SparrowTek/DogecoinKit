@@ -7,10 +7,6 @@ import Testing
 @Suite("libdogecoin Boundary")
 struct LibdogecoinBoundaryTests {
 
-    init() async {
-        await Dogecoin.initialize()
-    }
-
     /// The secp256k1 generator — the public key of private key 1.
     private let generatorCompressed = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
     private let generatorUncompressed = "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8"
@@ -54,10 +50,10 @@ struct LibdogecoinBoundaryTests {
         let script = try Address.toPubkeyHash(address)
         let hash = String(script.dropFirst(6).dropLast(4))
 
-        #expect(try await Address.fromPubkeyHash(script) == address)
-        #expect(try await Address.fromPubkeyHash(hash) == address)
+        #expect(try Address.fromPubkeyHash(script) == address)
+        #expect(try Address.fromPubkeyHash(hash) == address)
 
-        let testnetAddress = try await Address.fromPubkeyHash(hash, network: .testnet)
+        let testnetAddress = try Address.fromPubkeyHash(hash, network: .testnet)
         #expect(Address.isTestnet(testnetAddress))
     }
 
@@ -68,9 +64,9 @@ struct LibdogecoinBoundaryTests {
         "76a914" + String(repeating: "ab", count: 20) + "88ad",      // wrong last opcode
         "zz" + String(repeating: "ab", count: 19),
     ])
-    func invalidPubkeyHashes(pubkeyHash: String) async {
-        await #expect(throws: DogecoinError.invalidPublicKey) {
-            _ = try await Address.fromPubkeyHash(pubkeyHash)
+    func invalidPubkeyHashes(pubkeyHash: String) {
+        #expect(throws: DogecoinError.invalidAddress(pubkeyHash)) {
+            _ = try Address.fromPubkeyHash(pubkeyHash)
         }
     }
 
@@ -86,16 +82,56 @@ struct LibdogecoinBoundaryTests {
 
         #expect(KeyPair.network(ofPrivateKey: wif) == nil)
         #expect(!KeyPair.verify(privateKeyWIF: wif, address: "DD8sGWjLS7KodzdhWFA63G2Ryn1Ku1qjQ5"))
-        await #expect(throws: DogecoinError.invalidPrivateKey) {
-            _ = try await KeyPair.publicKeyHex(from: wif)
+        #expect(throws: DogecoinError.invalidPrivateKey) {
+            _ = try KeyPair.publicKeyHex(from: wif)
         }
+    }
+
+    @Test("A key exported for an uncompressed public key is refused, on either network", arguments: [UInt8(0x9E), 0xF1])
+    func uncompressedWIFIsRefused(prefix: UInt8) async throws {
+        // The same secret, with and without the flag that says its public
+        // key is compressed. Everything here works with the compressed key,
+        // so the other form would be taken — and then never match the
+        // address its funds are at.
+        let secret = try #require(Data(hexString: String(repeating: "00", count: 31) + "01"))
+        let compressed = Base58Check.encode(Data([prefix]) + secret + Data([0x01]))
+        let uncompressed = Base58Check.encode(Data([prefix]) + secret)
+        let network: DogecoinNetwork = prefix == 0x9E ? .mainnet : .testnet
+
+        #expect(KeyPair.network(ofPrivateKey: compressed) == network)
+        #expect(KeyPair.network(ofPrivateKey: uncompressed) == nil)
+
+        let address = try await Address.fromPublicKey(generatorCompressed, network: network)
+        #expect(KeyPair.verify(privateKeyWIF: compressed, address: address, network: network))
+        #expect(!KeyPair.verify(privateKeyWIF: uncompressed, address: address, network: network))
+        #expect(throws: DogecoinError.invalidPrivateKey) {
+            _ = try KeyPair.publicKeyHex(from: uncompressed, network: network)
+        }
+
+        // Nor does it sign: it must not reach libdogecoin at all.
+        let builder = TransactionBuilder()
+        try await builder.addInput(txid: String(repeating: "ab", count: 32), vout: 0)
+        try await builder.addOutput(address: address, amount: DogecoinAmount(koinu: 100_000_000))
+        _ = try await builder.finalize(fee: DogecoinAmount(koinu: 1_000_000), totalAmount: DogecoinAmount(koinu: 101_000_000))
+        await #expect(throws: DogecoinError.invalidPrivateKey) {
+            try await builder.signInput(index: 0, privateKeyWIF: uncompressed)
+        }
+    }
+
+    @Test("A WIF with the wrong payload length or flag is refused", arguments: [
+        Data(repeating: 0x01, count: 31) + Data([0x01]),            // 31-byte key, flagged
+        Data(repeating: 0x01, count: 32) + Data([0x02]),            // unknown flag
+        Data(repeating: 0x01, count: 32) + Data([0x01, 0x01])       // trailing byte
+    ])
+    func malformedWIFPayloads(body: Data) {
+        #expect(KeyPair.network(ofPrivateKey: Base58Check.encode(Data([0x9E]) + body)) == nil)
     }
 
     @Test("The largest valid private key is accepted")
     func largestPrivateKey() async throws {
         let wif = try mainnetWIF(secretHex: "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140")
         #expect(KeyPair.network(ofPrivateKey: wif) == .mainnet)
-        #expect(try await KeyPair.publicKeyHex(from: wif).count == 66)
+        #expect(try KeyPair.publicKeyHex(from: wif).count == 66)
     }
 
     @Test("Private key 1 controls the generator's address")
@@ -103,26 +139,48 @@ struct LibdogecoinBoundaryTests {
         let wif = try mainnetWIF(secretHex: String(repeating: "00", count: 31) + "01")
         let address = try await Address.fromPublicKey(generatorCompressed)
 
-        #expect(try await KeyPair.publicKeyHex(from: wif) == generatorCompressed)
+        #expect(try KeyPair.publicKeyHex(from: wif) == generatorCompressed)
         #expect(KeyPair.verify(privateKeyWIF: wif, address: address))
         #expect(!KeyPair.verify(privateKeyWIF: wif, address: address, network: .testnet))
     }
 
     @Test("Generated keys report their network")
     func generatedKeyNetworks() async throws {
-        let mainnet = try await KeyPair.generate(network: .mainnet)
-        let testnet = try await KeyPair.generate(network: .testnet)
+        let mainnet = try KeyPair.generate(network: .mainnet)
+        let testnet = try KeyPair.generate(network: .testnet)
 
         #expect(KeyPair.network(ofPrivateKey: mainnet.privateKeyWIF) == .mainnet)
         #expect(KeyPair.network(ofPrivateKey: testnet.privateKeyWIF) == .testnet)
         #expect(KeyPair.network(ofPrivateKey: "DD8sGWjLS7KodzdhWFA63G2Ryn1Ku1qjQ5") == nil)
     }
 
+    @Test("A generated key controls the address it comes with, on its own network only", arguments: [
+        (DogecoinNetwork.mainnet, DogecoinNetwork.testnet),
+        (.testnet, .mainnet),
+    ])
+    func generatedKeyControlsItsAddress(network: DogecoinNetwork, other: DogecoinNetwork) throws {
+        let keyPair = try KeyPair.generate(network: network)
+
+        #expect(keyPair.network == network)
+        #expect(Address.kind(keyPair.address) == .p2pkh)
+        #expect(Address.detectNetwork(keyPair.address) == network)
+        #expect(KeyPair.verify(privateKeyWIF: keyPair.privateKeyWIF, address: keyPair.address, network: network))
+        #expect(!KeyPair.verify(privateKeyWIF: keyPair.privateKeyWIF, address: keyPair.address, network: other))
+        #expect(try KeyPair.generate(network: network).privateKeyWIF != keyPair.privateKeyWIF)
+    }
+
+    @Test("Nothing has to be initialized first, and asking for it anyway succeeds")
+    func initialization() async {
+        // No suite calls `initialize()`: every operation prepares the
+        // thread it runs on.
+        #expect(await Dogecoin.initialize())
+    }
+
     // MARK: - Derivation paths
 
     @Test("Derivation paths too long for libdogecoin throw instead of aborting")
     func overlongPaths() async throws {
-        let wallet = try await HDWallet(mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
+        let wallet = try await HDWallet(mnemonic: testPhrase)
         let path = "m/" + Array(repeating: "0", count: 600).joined(separator: "/")
 
         await #expect(throws: DogecoinError.derivationFailed) {

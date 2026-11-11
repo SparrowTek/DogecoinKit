@@ -26,21 +26,49 @@ protocol ByteStream: AnyObject, Sendable {
 typealias ByteStreamFactory = @Sendable (_ host: String, _ port: UInt16, _ useTLS: Bool) -> any ByteStream
 
 enum ByteStreamError: Error, Sendable, Equatable {
-    case invalidEndpoint
     case closed
     case timedOut
+    /// The remote side stopped reading and what waits to be sent has
+    /// outgrown its limit
+    case backlogged
+    /// The device has no network to reach the host over
+    case offline
+}
+
+extension ByteStreamError: LocalizedError {
+    /// These reach people inside the errors that wrap them.
+    var errorDescription: String? {
+        switch self {
+        case .closed: "The connection was closed"
+        case .timedOut: "The connection timed out"
+        case .backlogged: "The other side stopped reading"
+        case .offline: "There is no network connection"
+        }
+    }
 }
 
 /// Writes to one stream strictly in submission order, without making the
 /// caller wait. A `Task` per write would let two messages overtake each
 /// other on the wire — fatal for handshakes, where order is the protocol.
+///
+/// What a remote side does not read piles up here. Past
+/// ``maximumBacklog`` the connection is treated as failed instead: nothing
+/// this library sends comes near that size, so only a peer that has stopped
+/// reading gets there.
 final class OrderedStreamWriter: Sendable {
+    /// Most bytes that may wait to be sent
+    static let maximumBacklog = 4 * 1024 * 1024
+
     private let queue: SerialEventQueue<Data>
+    private let backlog = Backlog()
+    private let onFailure: @Sendable (Error) async -> Void
 
     /// - Parameter onFailure: Called once per failed write; the stream is
     ///   unusable from then on.
     init(stream: any ByteStream, onFailure: @escaping @Sendable (Error) async -> Void) {
-        queue = SerialEventQueue { data in
+        self.onFailure = onFailure
+        queue = SerialEventQueue { [backlog] data in
+            defer { backlog.remove(data.count) }
             do {
                 try await stream.write(data)
             } catch {
@@ -50,7 +78,32 @@ final class OrderedStreamWriter: Sendable {
     }
 
     func write(_ data: Data) {
+        guard backlog.add(data.count, limit: Self.maximumBacklog) else {
+            Task { [onFailure] in
+                await onFailure(ByteStreamError.backlogged)
+            }
+            return
+        }
         queue.yield(data)
+    }
+
+    /// Bytes handed to `write` that the stream has not taken yet.
+    private final class Backlog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var bytes = 0
+
+        /// - Returns: Whether `count` more bytes fit
+        func add(_ count: Int, limit: Int) -> Bool {
+            lock.withLock {
+                guard bytes + count <= limit else { return false }
+                bytes += count
+                return true
+            }
+        }
+
+        func remove(_ count: Int) {
+            lock.withLock { bytes -= count }
+        }
     }
 }
 
@@ -91,7 +144,7 @@ import Network
 
 /// `ByteStream` over Network.framework.
 final class NetworkFrameworkStream: ByteStream, @unchecked Sendable {
-    private let connection: NWConnection?
+    private let connection: NWConnection
     private let queue = DispatchQueue(label: "com.sparrowtek.DogecoinKit.stream", qos: .utility)
 
     /// Set once the remote side has finished sending; guarded by `lock`.
@@ -102,11 +155,6 @@ final class NetworkFrameworkStream: ByteStream, @unchecked Sendable {
     private static let maximumReadLength = 64 * 1024
 
     init(host: String, port: UInt16, useTLS: Bool) {
-        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
-            connection = nil
-            return
-        }
-
         let parameters: NWParameters
         if useTLS {
             parameters = NWParameters(tls: Self.makeTLSOptions(serverHost: host))
@@ -116,16 +164,17 @@ final class NetworkFrameworkStream: ByteStream, @unchecked Sendable {
         parameters.prohibitExpensivePaths = false
         parameters.prohibitConstrainedPaths = false
 
-        connection = NWConnection(to: .hostPort(host: NWEndpoint.Host(host), port: nwPort), using: parameters)
+        connection = NWConnection(
+            to: .hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(integerLiteral: port)),
+            using: parameters
+        )
     }
 
     deinit {
-        connection?.cancel()
+        connection.cancel()
     }
 
     func open() async throws {
-        guard let connection else { throw ByteStreamError.invalidEndpoint }
-
         let gate = ResumeGate()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -143,12 +192,22 @@ final class NetworkFrameworkStream: ByteStream, @unchecked Sendable {
                         // change won't help.
                         once.resume(throwing: error)
                         connection?.cancel()
+                    case .waiting where connection?.currentPath?.status == .unsatisfied:
+                        // No network at all. Network.framework would wait
+                        // for one; every caller here has a retry of its own,
+                        // and would rather know now than after its timeout —
+                        // with a list of servers to get through, a timeout
+                        // each.
+                        once.resume(throwing: ByteStreamError.offline)
+                        connection?.cancel()
                     case .cancelled:
                         once.resume(throwing: CancellationError())
                     default:
-                        // `.waiting` without a usable network: Network.framework
-                        // retries once one appears, until it connects or the
-                        // caller gives up.
+                        // Including `.waiting` on a path that starting the
+                        // connection may yet bring up — cellular data that
+                        // was idle, a VPN on demand: Network.framework goes
+                        // on as soon as it is there, until the caller's
+                        // timeout.
                         break
                     }
                 }
@@ -161,8 +220,6 @@ final class NetworkFrameworkStream: ByteStream, @unchecked Sendable {
     }
 
     func write(_ data: Data) async throws {
-        guard let connection else { throw ByteStreamError.invalidEndpoint }
-
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             connection.send(content: data, completion: .contentProcessed { error in
                 if let error {
@@ -175,7 +232,6 @@ final class NetworkFrameworkStream: ByteStream, @unchecked Sendable {
     }
 
     func read() async throws -> Data? {
-        guard let connection else { throw ByteStreamError.invalidEndpoint }
         if lock.withLock({ receivedEnd }) { return nil }
 
         return try await withTaskCancellationHandler {
@@ -201,7 +257,7 @@ final class NetworkFrameworkStream: ByteStream, @unchecked Sendable {
     }
 
     func close() {
-        connection?.cancel()
+        connection.cancel()
     }
 
     /// Hardened TLS options for Electrum connections.

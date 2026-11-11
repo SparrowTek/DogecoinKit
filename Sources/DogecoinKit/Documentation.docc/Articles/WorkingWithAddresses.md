@@ -112,6 +112,8 @@ let input = "D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD"  // e.g. text the user entered
 let validAddress = try DogecoinAddress(input)
 print("Network: \(validAddress.network)")
 print("Value: \(validAddress.value)")
+print("Kind: \(validAddress.kind)")  // "Kind: p2pkh"
+print("Script: \(validAddress.scriptPubKey.count) bytes")  // "Script: 25 bytes"
 
 // Specify expected network
 let mainnetAddress = try DogecoinAddress(input, network: .mainnet)
@@ -150,7 +152,7 @@ let address = try DogecoinAddress(input)
 print(address)  // "D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD"
 ```
 
-``DogecoinAddress`` is not `ExpressibleByStringLiteral`: every address, even one fixed in source, goes through the throwing initializer, so a typo surfaces as an error instead of a crash.
+``DogecoinAddress`` is not `ExpressibleByStringLiteral`: every address, even one fixed in source, goes through the throwing initializer, so a typo surfaces as an error instead of a crash. Decoding validates too: an invalid address in JSON fails the decode.
 
 ## Address Components
 
@@ -182,15 +184,29 @@ if let script = Address.scriptPubKey(for: "A9rmPAxPNGTojaWevb571EYNmCiRLpXzcM") 
 
 ### Public Key Hash to Address
 
-``Address/fromPubkeyHash(_:network:)`` accepts either the bare 20-byte hash160 or the P2PKH script hex that ``Address/toPubkeyHash(_:)`` returns, so the two round-trip. Anything else throws ``DogecoinError/invalidPublicKey``:
+``Address/fromPubkeyHash(_:network:)`` accepts either the bare 20-byte hash160 or the P2PKH script hex that ``Address/toPubkeyHash(_:)`` returns, so the two round-trip. Anything else throws ``DogecoinError/invalidAddress(_:)``:
 
 ```swift
 let scriptHex = "76a9141a489a9364888ba3e81b61d16f59899bdca5badd88ac"
-let address = try await Address.fromPubkeyHash(scriptHex, network: .mainnet)
+let address = try Address.fromPubkeyHash(scriptHex, network: .mainnet)
 print(address)  // "D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD"
 
 // The bare hash gives the same address
-let sameAddress = try await Address.fromPubkeyHash("1a489a9364888ba3e81b61d16f59899bdca5badd", network: .mainnet)
+let sameAddress = try Address.fromPubkeyHash("1a489a9364888ba3e81b61d16f59899bdca5badd", network: .mainnet)
+```
+
+### Script to Address
+
+``Address/fromScriptPubKey(_:network:)`` is the inverse of ``Address/scriptPubKey(for:)``: it names the address an output script pays, P2PKH or P2SH, and returns `nil` for any other script. Use it with ``RawTransaction`` to read where a transaction's outputs go:
+
+```swift
+// `rawHex` is a transaction from a server or a peer
+if let transaction = RawTransaction(hex: rawHex) {
+    for output in transaction.outputs {
+        let recipient = Address.fromScriptPubKey(output.script, network: .mainnet) ?? "(no address)"
+        print("\(DogecoinAmount(koinu: output.value)) to \(recipient)")
+    }
+}
 ```
 
 ## Generating Addresses
@@ -210,24 +226,16 @@ let receiving1 = try await wallet.deriveAddress(account: 0, index: 1)
 let change0 = try await wallet.deriveAddress(account: 0, index: 0, change: true)
 ```
 
-### From Simple Key Pair
-
-For simpler use cases without HD derivation:
-
-```swift
-let keyPair = try await KeyPair.generate(network: .mainnet)
-print("Address: \(keyPair.address)")
-print("Private Key (WIF): \(keyPair.privateKeyWIF)")
-```
-
-> Warning: Simple key pairs don't benefit from mnemonic backup. Use HD wallets for production applications.
-
 ## Address Gap Limit
 
 When scanning for used addresses (e.g., during wallet restoration), use a gap limit:
 
 ```swift
-func scanForUsedAddresses(wallet: HDWallet, gapLimit: Int = 20) async throws -> [String] {
+func scanForUsedAddresses(
+    wallet: HDWallet,
+    gapLimit: Int = 20,
+    hasTransactions: (String) async throws -> Bool
+) async throws -> [String] {
     var usedAddresses: [String] = []
     var consecutiveUnused = 0
     var index: UInt32 = 0
@@ -235,7 +243,7 @@ func scanForUsedAddresses(wallet: HDWallet, gapLimit: Int = 20) async throws -> 
     while consecutiveUnused < gapLimit {
         let address = try await wallet.deriveAddress(account: 0, index: index)
 
-        if await checkAddressHasTransactions(address) {
+        if try await hasTransactions(address) {
             usedAddresses.append(address)
             consecutiveUnused = 0
         } else {
@@ -247,35 +255,31 @@ func scanForUsedAddresses(wallet: HDWallet, gapLimit: Int = 20) async throws -> 
 
     return usedAddresses
 }
+
+// In Electrum mode, an address is used once it has any history
+let usedAddresses = try await scanForUsedAddresses(wallet: wallet) { address in
+    try await !electrum.fetchTransactionHistory(for: [address]).isEmpty
+}
 ```
 
 The gap limit (typically 20) determines how many consecutive unused addresses to check before stopping the scan.
 
 ## QR Code Integration
 
-Addresses are commonly shared via QR codes. Here's how to integrate with a QR scanner:
+Addresses are commonly shared via QR codes. Here's how to read one from a QR scanner's result:
 
 ```swift
-func handleScannedQRCode(_ content: String) {
-    // Handle dogecoin: URI scheme
-    if content.lowercased().hasPrefix("dogecoin:") {
-        let addressPart = String(content.dropFirst(9))
-        let address = addressPart.components(separatedBy: "?").first ?? addressPart
-        processScannedAddress(address)
-    } else {
-        // Plain address
-        processScannedAddress(content)
-    }
-}
+/// The Dogecoin address in a scanned QR code, or nil if it holds none
+func address(fromQRCode content: String) -> String? {
+    var candidate = content.trimmingCharacters(in: .whitespacesAndNewlines)
 
-func processScannedAddress(_ address: String) {
-    guard Address.isValid(address) else {
-        showError("Invalid QR code - not a valid Dogecoin address")
-        return
+    // Handle the dogecoin: URI scheme, dropping parameters such as ?amount=
+    if candidate.lowercased().hasPrefix("dogecoin:") {
+        candidate = String(candidate.dropFirst("dogecoin:".count))
+        candidate = candidate.components(separatedBy: "?").first ?? candidate
     }
 
-    // Use the validated address
-    recipientAddressField.text = address
+    return Address.isValid(candidate) ? candidate : nil
 }
 ```
 
@@ -347,5 +351,5 @@ func copyAddressToClipboard(_ address: String) {
 - ``Address``
 - ``DogecoinAddress``
 - ``HDWallet``
-- ``KeyPair``
+- ``RawTransaction``
 - <doc:CreatingAWallet>

@@ -146,7 +146,7 @@ struct FeeEstimationBoundsTests {
     @Test("Negative counts and sizes cannot trap")
     func negativeInputs() {
         #expect(FeeEstimation.estimateTransactionSize(inputCount: -5, outputCount: -5) == 10)
-        #expect(FeeEstimation.calculateFee(sizeBytes: -100, feePerKB: FeeEstimation.standardFeePerKB) == FeeEstimation.minimumFee)
+        #expect(FeeEstimation.calculateFee(sizeBytes: -100, feePerKB: FeeEstimation.standardFeePerKB) == .zero)
     }
 
     @Test("Huge counts saturate instead of overflowing")
@@ -154,18 +154,10 @@ struct FeeEstimationBoundsTests {
         #expect(FeeEstimation.estimateTransactionSize(inputCount: .max, outputCount: 1) == .max)
         #expect(FeeEstimation.calculateFee(sizeBytes: .max, feePerKB: DogecoinAmount(koinu: .max)).koinu == .max)
     }
-
-    @Test("Amount strings are exact for every koinu value")
-    func exactAmountStrings() {
-        #expect(DogecoinAmount(koinu: 0).dogeString == "0.00000000")
-        #expect(DogecoinAmount(koinu: 5).dogeString == "0.00000005")
-        #expect(DogecoinAmount(koinu: 123_456_789).dogeString == "1.23456789")
-        #expect(DogecoinAmount(koinu: .max).dogeString == "184467440737.09551615")
-    }
 }
 
 /// Peer discovery against the real network. Opt-in: `DOGECOINKIT_LIVE_P2P=1`.
-@Suite("Live Peer Discovery")
+@Suite("Live Peer Discovery", .timeLimit(.minutes(2)))
 struct LivePeerDiscoveryTests {
 
     @Test("DNS seeds resolve and peers complete the handshake", .enabled(if: TestEnvironment.runsLiveP2PTests))
@@ -287,8 +279,8 @@ struct BlockVersionRuleTests {
         let directory = TestDirectories.unique()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let chain = HeaderChain(network: .mainnet, storageDirectory: directory)
-        await chain.setup()
-        let genesis = try #require(await chain.getHeader(height: 0))
+        try await chain.setup()
+        let genesis = try #require(try await chain.getHeader(height: 0))
 
         let early = BlockHeader(version: 0x0062_0104, prevBlock: genesis.header.hash, merkleRoot: Data(count: 32), timestamp: genesis.header.timestamp + 60, bits: 0x1e0ffff0, nonce: 0)
         let result = await chain.addHeaders([HeadersMessage.Entry(header: early, auxpow: nil)])

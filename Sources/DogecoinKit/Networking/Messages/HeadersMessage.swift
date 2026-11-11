@@ -80,13 +80,6 @@ public struct BlockHeader: Sendable, Equatable {
         return data
     }
 
-    /// Serialize for headers message (with transaction count = 0)
-    public func serialize() -> Data {
-        var data = serializeCore()
-        data.append(0) // Transaction count is always 0 in headers message
-        return data
-    }
-
     /// Parse from Data
     public static func parse(from data: Data) -> BlockHeader? {
         guard let versionRaw: Int32 = data.readInteger(at: 0),
@@ -171,17 +164,7 @@ public struct HeadersMessage: Sendable {
     /// The headers in the order received, with their proofs
     public let entries: [Entry]
 
-    /// The headers in the order received
-    public var headers: [BlockHeader] {
-        entries.map(\.header)
-    }
-
     /// Create a headers message
-    public init(headers: [BlockHeader]) {
-        self.entries = headers.map { Entry(header: $0) }
-    }
-
-    /// Create a headers message with AuxPoW proofs
     public init(entries: [Entry]) {
         self.entries = entries
     }
@@ -241,45 +224,5 @@ public struct HeadersMessage: Sendable {
         }
 
         return HeadersMessage(entries: entries)
-    }
-}
-
-/// Get blocks message
-public struct GetBlocksMessage: Sendable {
-    /// Protocol version
-    public let version: UInt32
-
-    /// Block locator hashes (newest to oldest)
-    public let locatorHashes: [Data]
-
-    /// Hash to stop at (zeros for no limit)
-    public let hashStop: Data
-
-    /// Create a getblocks message
-    public init(
-        version: UInt32 = NetworkConstants.protocolVersion,
-        locatorHashes: [Data],
-        hashStop: Data = Data(count: 32)
-    ) {
-        self.version = version
-        self.locatorHashes = locatorHashes
-        self.hashStop = hashStop
-    }
-
-    /// Serialize to Data
-    public func serialize() -> Data {
-        var data = Data()
-
-        var version = self.version.littleEndian
-        data.append(Data(bytes: &version, count: 4))
-
-        data.append(VarInt(UInt64(locatorHashes.count)).serialize())
-        for hash in locatorHashes {
-            data.append(hash)
-        }
-
-        data.append(hashStop)
-
-        return data
     }
 }

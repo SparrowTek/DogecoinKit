@@ -2,12 +2,8 @@ import Testing
 @testable import DogecoinKit
 import Foundation
 
-@Suite("Electrum Client Tests")
+@Suite("Electrum Client Tests", .timeLimit(.minutes(2)))
 struct ElectrumClientTests {
-
-    init() async {
-        await Dogecoin.initialize()
-    }
 
     /// Connects to the first mainnet server that answers; any one of them
     /// may be down at a given moment.
@@ -25,7 +21,7 @@ struct ElectrumClientTests {
     }
 
     @Test("Connect to mainnet server", .enabled(if: TestEnvironment.runsLiveElectrumTests))
-    func testConnect() async throws {
+    func connect() async throws {
         let client = try await connectToAnyServer()
 
         // Should be connected now
@@ -35,7 +31,7 @@ struct ElectrumClientTests {
     }
 
     @Test("Get balance for known address", .enabled(if: TestEnvironment.runsLiveElectrumTests))
-    func testGetBalance() async throws {
+    func getBalance() async throws {
         let client = try await connectToAnyServer()
 
         // Use a known Dogecoin address
@@ -53,7 +49,7 @@ struct ElectrumClientTests {
     }
 
     @Test("Subscribe to headers", .enabled(if: TestEnvironment.runsLiveElectrumTests))
-    func testHeaderSubscription() async throws {
+    func headerSubscription() async throws {
         let client = try await connectToAnyServer()
 
         let header = try await client.subscribeHeaders()
@@ -65,7 +61,7 @@ struct ElectrumClientTests {
     }
 
     @Test("Script hash uses P2PKH scriptPubKey format")
-    func testScriptHashComputation() throws {
+    func scriptHashComputation() throws {
         let address = "D7Y55r6Yoc1G8EECxkQ6SuSjTgGJJ7M6yD"
         // toPubkeyHash already returns the full P2PKH scriptPubKey hex (76a914...88ac)
         #expect(try Address.toPubkeyHash(address) == "76a9141a489a9364888ba3e81b61d16f59899bdca5badd88ac")
@@ -81,11 +77,11 @@ struct ElectrumClientTests {
     }
 }
 
-@Suite("Electrum Sync Manager Tests")
+@Suite("Electrum Sync Manager Tests", .timeLimit(.minutes(2)))
 struct ElectrumSyncManagerTests {
 
     @Test("Start and stop sync", .enabled(if: TestEnvironment.runsLiveElectrumTests))
-    func testStartStop() async throws {
+    func startStop() async throws {
         let manager = ElectrumSyncManager(network: .mainnet)
 
         try await manager.start()
@@ -100,7 +96,7 @@ struct ElectrumSyncManagerTests {
     }
 
     @Test("Live UTXOs verify against their funding transactions", .enabled(if: TestEnvironment.runsLiveElectrumTests))
-    func testLiveUTXOVerification() async throws {
+    func liveUTXOVerification() async throws {
         await Dogecoin.initialize()
 
         let manager = ElectrumSyncManager(network: .mainnet)
@@ -125,7 +121,7 @@ struct ElectrumSyncManagerTests {
                     let transaction = try #require(RawTransaction(hex: try await manager.getTransaction(txid: item.txHash)))
                     for output in transaction.outputs {
                         // P2PKH outputs only; anything else has no address to query.
-                        if let payee = try? await Address.fromPubkeyHash(output.script.hexString) {
+                        if let payee = try? Address.fromPubkeyHash(output.script.hexString) {
                             next.insert(payee)
                         }
                     }
@@ -147,14 +143,14 @@ struct ElectrumSyncManagerTests {
     }
 
     @Test("Failed start allows retry")
-    func testFailedStartAllowsRetry() async {
+    func failedStartAllowsRetry() async {
         let manager = ElectrumSyncManager(network: .mainnet, serverList: [])
 
-        await #expect(throws: ElectrumError.self) {
+        await #expect(throws: ElectrumError.noServersAvailable) {
             try await manager.start()
         }
 
-        await #expect(throws: ElectrumError.self) {
+        await #expect(throws: ElectrumError.noServersAvailable) {
             try await manager.start()
         }
     }
